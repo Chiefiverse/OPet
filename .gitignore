@@ -1,0 +1,12 @@
+# 设计文档与项目笔记不入库（用户决定：docs 内容不上传 GitHub）
+/docs/
+/AGENTS.md
+
+# 构建产物
+/target/
+
+# Phase B 真机报告（脚本输出，非代码）
+/phase_b_report.txt
+
+# 内容包构建产物，与代码仓库分开发布
+/packs/*.petpack

@@ -1,0 +1,14 @@
+[package]
+name = "opet-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OPet 命令行入口（M1: headless 模拟与吞吐基准）"
+
+[[bin]]
+name = "opet"
+path = "src/main.rs"
+
+[dependencies]
+petcore = { workspace = true }

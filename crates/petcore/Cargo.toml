@@ -1,0 +1,12 @@
+[package]
+name = "petcore"
+description = "OPet 行为内核：状态机、物理、世界模型、资产调度（无窗口依赖）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
