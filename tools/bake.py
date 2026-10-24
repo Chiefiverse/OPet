@@ -31,7 +31,7 @@ FEET = Vector((0.0, 0.0, 0.0))
 
 CAM_RADIUS = 6.0
 CAM_ELEV_DEG = 15.0
-ORTHO_SCALE = 1.45
+ORTHO_SCALE = 1.55
 TARGET_Z = 0.52
 
 # Facing::index() 顺时针：E=0 SE=1 S=2 SW=3 W=4 NW=5 N=6 NE=7
@@ -53,6 +53,14 @@ def parse_args():
     p.add_argument("--force", action="store_true", help="重烘已存在的帧")
     p.add_argument(
         "--skip-facing-check", action="store_true", help="跳过朝向断言（调试用）"
+    )
+    p.add_argument(
+        "--skip-framing-check", action="store_true", help="跳过构图/可见性断言（调试用）"
+    )
+    p.add_argument(
+        "--check-only",
+        action="store_true",
+        help="只跑朝向/构图自检就退出（换模型调边距时不用等渲染）",
     )
     return p.parse_args(argv)
 
@@ -94,7 +102,8 @@ def flat_material(name, rgb):
 def add_part(name, kind, loc, scale, mat, parent, rot=(0.0, 0.0, 0.0)):
     ops = {
         "sphere": lambda: bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=16),
-        "cone": lambda: bpy.ops.mesh.primitive_cone_add(radius1=1.0, depth=2.0, vertices=20),
+        # radius2 必须显式给：primitive_cone_add 的 radius2 默认也是 1.0，不写就是个圆柱
+        "cone": lambda: bpy.ops.mesh.primitive_cone_add(radius1=1.0, radius2=0.06, depth=2.0, vertices=20),
         "cyl": lambda: bpy.ops.mesh.primitive_cylinder_add(radius=1.0, depth=2.0, vertices=20),
     }
     ops[kind]()
@@ -109,10 +118,33 @@ def add_part(name, kind, loc, scale, mat, parent, rot=(0.0, 0.0, 0.0)):
     return ob
 
 
+# 头球中心与半轴：脸上所有部件都由它算出来，不再靠肉眼猜坐标
+HEAD_C = (0.06, 0.0, 0.80)
+HEAD_R = (0.25, 0.23, 0.22)
+
+
+def head_surface(dx, dy, dz, push=0.0):
+    """头球面上（或向外 push 一点）的点。方向向量任意长度，内部归一。"""
+    n = math.sqrt(dx * dx + dy * dy + dz * dz)
+    ux, uy, uz = dx / n, dy / n, dz / n
+    return (
+        HEAD_C[0] + HEAD_R[0] * ux + push * ux,
+        HEAD_C[1] + HEAD_R[1] * uy + push * uy,
+        HEAD_C[2] + HEAD_R[2] * uz + push * uz,
+    )
+
+
 def build_cat():
-    """脚底贴世界 z=0；body/head/tail/ears/legs 挂在 root Empty 上做纯 transform 动画。"""
+    """脚底贴世界 z=0；body/head/tail/ears/legs 挂在 root Empty 上做纯 transform 动画。
+
+    脸部件（眼/鼻/耳内）**一律挂 root 而不是挂头球**：`ob.parent = head` 之后
+    `matrix_world = head_matrix @ ob_matrix`，父级的 scale (0.25,0.23,0.22) 会把子级
+    的偏移和自身尺寸一起缩掉 —— 上一版的眼球因此只剩 0.0075 世界单位、还被挤回心头，
+    耳内缩成一个点，等于整张脸不存在（帧里看不见，validate 也看不见）。改成挂 root
+    后局部坐标就是世界坐标，动画里由 HEAD_PARTS/EAR_PARTS 把父级位移显式带上。
+    """
     white = flat_material("shiro_body", (0.93, 0.93, 0.96))
-    dark = flat_material("shiro_dark", (0.12, 0.12, 0.14))
+    dark = flat_material("shiro_dark", (0.10, 0.10, 0.12))
     pink = flat_material("shiro_inner", (0.85, 0.55, 0.60))
 
     bpy.ops.object.empty_add(location=(0.0, 0.0, 0.0))
@@ -132,16 +164,17 @@ def build_cat():
             "squash": squash,
         }
 
+    reg("root", root)
     reg("body", add_part("body", "sphere", (0.0, 0.0, 0.40), (0.30, 0.26, 0.30), white, root), bob=0.030, squash=0.020)
-    reg("head", add_part("head", "sphere", (0.06, 0.0, 0.80), (0.25, 0.23, 0.22), white, root), bob=0.045)
-    reg("ear_l", add_part("ear_l", "cone", (0.14, 0.14, 1.00), (0.07, 0.07, 0.08), white, root), bob=0.050)
-    reg("ear_r", add_part("ear_r", "cone", (0.14, -0.14, 1.00), (0.07, 0.07, 0.08), white, root), bob=0.050)
-    reg("ear_l_in", add_part("ear_l_in", "cone", (0.15, 0.14, 0.99), (0.04, 0.04, 0.05), pink, parts["ear_l"]["ob"]))
-    reg("ear_r_in", add_part("ear_r_in", "cone", (0.15, -0.14, 0.99), (0.04, 0.04, 0.05), pink, parts["ear_r"]["ob"]))
-    reg("eye_l", add_part("eye_l", "sphere", (0.30, 0.10, 0.84), (0.030, 0.030, 0.042), dark, parts["head"]["ob"]))
-    reg("eye_r", add_part("eye_r", "sphere", (0.30, -0.10, 0.84), (0.030, 0.030, 0.042), dark, parts["head"]["ob"]))
-    reg("nose", add_part("nose", "sphere", (0.33, 0.0, 0.77), (0.028, 0.028, 0.022), pink, parts["head"]["ob"]))
-    reg("tail", add_part("tail", "cyl", (-0.30, 0.0, 0.52), (0.045, 0.045, 0.22), white, root), sway=0.35, bob=0.015)
+    reg("head", add_part("head", "sphere", HEAD_C, (0.25, 0.23, 0.22), white, root), bob=0.045)
+    reg("ear_l", add_part("ear_l", "cone", (0.10, 0.15, 0.985), (0.075, 0.075, 0.088), white, root), bob=0.050)
+    reg("ear_r", add_part("ear_r", "cone", (0.10, -0.15, 0.985), (0.075, 0.075, 0.088), white, root), bob=0.050)
+    reg("ear_l_in", add_part("ear_l_in", "cone", (0.145, 0.150, 0.955), (0.040, 0.040, 0.050), pink, root), bob=0.050)
+    reg("ear_r_in", add_part("ear_r_in", "cone", (0.145, -0.150, 0.955), (0.040, 0.040, 0.050), pink, root), bob=0.050)
+    reg("eye_l", add_part("eye_l", "sphere", head_surface(0.78, 0.44, 0.50, 0.010), (0.030, 0.030, 0.044), dark, root), bob=0.045)
+    reg("eye_r", add_part("eye_r", "sphere", head_surface(0.78, -0.44, 0.50, 0.010), (0.030, 0.030, 0.044), dark, root), bob=0.045)
+    reg("nose", add_part("nose", "sphere", head_surface(0.95, 0.0, -0.28, 0.012), (0.032, 0.026, 0.022), pink, root), bob=0.045)
+    reg("tail", add_part("tail", "cone", (-0.33, 0.0, 0.56), (0.050, 0.050, 0.17), white, root, rot=(0.0, -0.55, 0.0)), sway=0.35, bob=0.015)
 
     # 腿不参与上下浮：脚底 z=0 是"逐帧最底不透明行"的唯一来源，一动 validate 就报抖动
     legs = {
@@ -157,36 +190,136 @@ def build_cat():
     return parts
 
 
-def apply_pose(parts, state, frame, frames):
-    """参数化动作。循环状态第 frames 帧回到第 0 帧，所以用 f/frames 而非 f/(frames-1)。"""
+# 部件分组：脸部件挂 root（见 build_cat 的注释），所以父级位移要显式带上
+HEAD_CORE = ("head", "eye_l", "eye_r", "nose")
+EARS_L = ("ear_l", "ear_l_in")
+EARS_R = ("ear_r", "ear_r_in")
+EAR_ALL = EARS_L + EARS_R
+FRONT_LEGS = ("leg_fl", "leg_fr")
+REAR_LEGS = ("leg_bl", "leg_br")
+LEG_ALL = FRONT_LEGS + REAR_LEGS
+AIRBORNE_DZ_MAX = 0.04  # 离地靠内核移 surface，序列帧只给姿态；再高就顶到格子上边
+
+
+def apply_pose(parts, state, frame, frames, loop=True):
+    """参数化动作：9 个状态全靠这里，模型本身不动。
+
+    时间轴分两种：循环态用 `f/frames`（末帧要接得回第 0 帧），一次性动画用
+    `f/(frames-1)`（否则末帧停在 3/4 处，看着像被截断）。
+    """
     phase = frame / max(frames, 1)
+    u = frame / max(frames - 1, 1)
     wave = math.sin(2.0 * math.pi * phase)
+
     for part in parts.values():
         ob = part["ob"]
         ob.location = part["loc"]
         ob.rotation_euler = part["rot"]
         ob.scale = part["scl"]
-        if state == "idle":
-            ob.location.z += part["bob"] * wave
-            sy = 1.0 + part["squash"] * wave
-            ob.scale = (part["scl"][0], part["scl"][1], part["scl"][2] * sy)
+
+    def move(key, dz=0.0, dx=0.0, rot=None, scl=None):
+        """增量叠加（base 已在函数开头还原），所以同一部件调多次也安全。"""
+        ob = parts[key]["ob"]
+        ob.location = (ob.location.x + dx, ob.location.y, ob.location.z + dz)
+        if rot is not None:
+            ob.rotation_euler = tuple(a + b for a, b in zip(ob.rotation_euler, rot))
+        if scl is not None:
+            ob.scale = tuple(a * b for a, b in zip(ob.scale, scl))
+
+    def group(keys, **kw):
+        for key in keys:
+            move(key, **kw)
+
+    if state == "idle":
+        for key, part in parts.items():
+            if part["bob"]:
+                move(key, dz=part["bob"] * wave)
             if part["sway"]:
-                ob.rotation_euler = (
-                    part["rot"][0],
-                    part["rot"][1] + part["sway"] * wave,
-                    part["rot"][2],
-                )
-        elif state in ("walk", "run"):
-            gain = 0.06 if state == "walk" else 0.10
-            ob.location.z += part["bob"] * wave
+                move(key, rot=(0.0, part["sway"] * wave, 0.0))
+            if part["squash"]:
+                move(key, scl=(1.0, 1.0, 1.0 + part["squash"] * wave))
+
+    elif state in ("walk", "run"):
+        stride = {"walk": 0.10, "run": 0.20}[state]
+        bob_gain = {"walk": 1.0, "run": 1.7}[state]
+        move("root", rot=(0.0, {"walk": 0.05, "run": 0.13}[state], 0.0))
+        for key, part in parts.items():
+            if part["bob"]:
+                move(key, dz=part["bob"] * wave * bob_gain)
             if part["sway"]:
-                ob.rotation_euler = (part["rot"][0], part["rot"][1] + part["sway"] * wave, part["rot"][2])
-            if part.get("swing_phase") is not None:
-                ob.rotation_euler = (
-                    0.0,
-                    gain * math.sin(2.0 * math.pi * (phase + part["swing_phase"])),
-                    0.0,
-                )
+                move(key, rot=(0.0, part["sway"] * wave * bob_gain, 0.0))
+        # 前后腿反相靠 swing_phase（前 0.0 / 后 0.5），这里只加步幅
+        for key in LEG_ALL:
+            move(key, rot=(0.0, stride * math.sin(2.0 * math.pi * (phase + parts[key]["swing_phase"])), 0.0))
+
+    elif state == "stop":
+        # 惯性前冲 → 回弹 → 站稳：只有 3 帧，靠身体俯仰和压缩读动作
+        lean = (0.18, -0.07, 0.0)[frame]
+        brace = 1.0 - u
+        squash = (0.90, 1.07, 1.0)[frame]
+        move("root", rot=(0.0, lean, 0.0))
+        move("body", scl=(2.0 - squash, 1.0, squash))
+        group(HEAD_CORE, dx=-0.05 * lean * 3.0)  # 头滞后 = 重量感
+        move("tail", rot=(0.0, 0.30 * brace, 0.0))
+        group(FRONT_LEGS, rot=(0.0, -0.26 * brace, 0.0))  # 前爪撑地
+        group(REAR_LEGS, rot=(0.0, 0.22 * brace, 0.0))
+
+    elif state == "jump":
+        # 蹲 → 蹬 → 空中收 → 落地预备。离地只有几 px，真正的抛物线由内核移 surface
+        body_z = (0.84, 1.16, 1.05, 0.92)[frame]
+        bend = (0.30, -0.26, -0.44, 0.22)[frame]
+        move("root", dz=(0.0, 0.01, AIRBORNE_DZ_MAX, 0.01)[frame], rot=(0.0, (-0.08, 0.16, 0.05, -0.10)[frame], 0.0))
+        move("body", scl=(1.0 + 0.08 * (1.0 - body_z), 1.0, body_z))
+        group(HEAD_CORE, dz=(-0.05, 0.07, 0.05, 0.0)[frame])
+        group(EAR_ALL, dz=(-0.05, 0.07, 0.05, 0.0)[frame])
+        group(FRONT_LEGS, rot=(0.0, bend, 0.0))
+        group(REAR_LEGS, rot=(0.0, bend * 0.7, 0.0))
+        move("tail", rot=(0.0, (-0.20, 0.35, 0.50, 0.25)[frame], 0.0))
+
+    elif state == "climb":
+        # 贴墙向上：整个身体后仰"扒"在墙上，前后爪交替够/蹬。循环态 ⇒ 用 phase
+        alt = wave  # 4 帧 → 0, 1, 0, −1
+        move("root", dz=0.012 * alt, rot=(0.0, -0.30, 0.0))
+        move("body", scl=(0.94, 1.0, 1.10 + 0.03 * alt))
+        group(HEAD_CORE, dz=0.055, dx=-0.02)
+        group(EAR_ALL, dz=0.055, dx=-0.02)
+        group(FRONT_LEGS, rot=(0.0, -0.58 + 0.22 * alt, 0.0))  # 前爪向上够
+        group(REAR_LEGS, rot=(0.0, 0.40 - 0.22 * alt, 0.0))  # 后爪蹬墙
+        move("tail", rot=(0.0, -0.30, 0.0))
+
+    elif state == "sleep":
+        # 趴成一坨 + 呼吸：2 帧 @4fps，只靠 body 的压缩和耳朵的垂度
+        breath = (1.00, 1.06)[frame]
+        move("body", dz=-0.06, scl=(1.07, 1.07, 0.76 * breath))
+        group(HEAD_CORE, dz=-0.14, dx=0.03)
+        group(EARS_L, dz=-0.10, rot=(0.35, 0.0, 0.0))  # 耷拉到两边
+        group(EARS_R, dz=-0.10, rot=(-0.35, 0.0, 0.0))
+        for key in LEG_ALL:
+            move(key, dz=-0.02, rot=(0.0, 0.20 if key in FRONT_LEGS else -0.20, 0.0))
+        move("tail", dz=-0.06, rot=(0.0, 0.62, 0.0))  # 卷到身前
+
+    elif state == "turn":
+        # 原地枢轴：绕 Z 扫过 ±17°，转到接近侧面时身体收窄、尾巴滞后
+        yaw = -0.30 + 0.60 * u
+        pinch = math.sin(math.pi * u)
+        move("root", rot=(0.0, 0.0, yaw))
+        move("body", scl=(1.0 - 0.06 * pinch, 1.0, 1.0 + 0.05 * pinch))
+        move("tail", rot=(0.0, 0.0, -0.45 * yaw))
+        step = (0.10, 0.0, -0.10, 0.0)[frame]
+        group(LEG_ALL, rot=(0.0, step, 0.0))
+
+    elif state == "react":
+        # 被吓到：弹起一丁点 + 炸毛（尾巴变粗、耳朵外张、瞳孔那对眼睛放大）
+        pop = (0.0, 1.0, 0.45)[frame]
+        move("root", dz=0.02 * pop)
+        move("body", scl=(1.0 + 0.04 * pop, 1.0 + 0.12 * pop, 1.0 + 0.07 * pop))
+        group(HEAD_CORE, dz=0.06 * pop)
+        group(EARS_L, dz=0.09 * pop, rot=(0.0, 0.0, 0.22 * pop))
+        group(EARS_R, dz=0.09 * pop, rot=(0.0, 0.0, -0.22 * pop))
+        move("eye_l", scl=(1.0 + 0.15 * pop, 1.0 + 0.15 * pop, 1.0 + 0.15 * pop))
+        move("eye_r", scl=(1.0 + 0.15 * pop, 1.0 + 0.15 * pop, 1.0 + 0.15 * pop))
+        move("tail", dz=0.03 * pop, rot=(0.0, -0.35 * pop, 0.0), scl=(1.0 + 0.35 * pop, 1.0 + 0.35 * pop, 1.0))
+        group(LEG_ALL, rot=(0.0, 0.12 * pop, 0.0))
 
 
 def setup_render(scene, cell, samples):
@@ -243,6 +376,50 @@ def check_facing(cam):
         elif delta * expect <= 0.02:
             problems.append("col %d 期望鼻尖在%s侧，实测偏移 %.3f" % (index, "右" if expect > 0 else "左", delta))
     return problems
+
+
+def check_framing(cam, cell, parts, spec, states, columns):
+    """把两种静默故障变成响亮失败：零件被父级 scale 缩到看不见、姿态超出格子。
+
+    这两种情况在像素里都只是"少了一块"，validate 数不透明像素是查不出来的（上一版的眼球
+    实际只剩 0.0075 世界单位、耳内退化成一个点，全套门禁当时全绿）。这里不渲染，只做投影，
+    所以每一帧姿态都能查。
+    """
+    tiny, clipped, tight = {}, {}, {}
+    for state in states:
+        frames = len(spec["states"][state]["rows"])
+        loop = spec["states"][state].get("loop", True)
+        for index in columns:
+            place_camera(cam, index)
+            for frame in range(frames):
+                apply_pose(parts, state, frame, frames, loop)
+                bpy.context.view_layer.update()
+                for key, part in parts.items():
+                    ob = part["ob"]
+                    if not isinstance(ob.data, bpy.types.Mesh):
+                        continue  # root 是 Empty
+                    xs, ys = [], []
+                    for corner in ob.bound_box:
+                        co = world_to_camera_view(bpy.context.scene, cam, ob.matrix_world @ Vector(corner))
+                        xs.append(co.x)
+                        ys.append(co.y)
+                    size = max((max(xs) - min(xs)) * cell, (max(ys) - min(ys)) * cell)
+                    tiny[key] = min(tiny.get(key, 9e9), size)
+                    # 留边 = 部件投影到最近格边的距离；负数表示已经裁掉
+                    over = max(-min(xs), max(xs) - 1.0, -min(ys), max(ys) - 1.0)
+                    clearance = (-over * cell) if over > 0.005 else min(
+                        min(xs), 1.0 - max(xs), min(ys), 1.0 - max(ys)
+                    ) * cell
+                    if clearance < 1.0:
+                        clipped[key] = min(clipped.get(key, 9e9), clearance)
+                    tight[key] = min(tight.get(key, 9e9), clearance)
+    problems = []
+    for key, size in sorted(tiny.items()):
+        if size < 2.0:
+            problems.append("%s 整组姿态里投影最大只有 %.1f px ⇒ 基本看不见" % (key, size))
+    for key, px in sorted(clipped.items()):
+        problems.append("%s 离格边只剩 %.1f px（会被裁或已经裁掉）" % (key, px))
+    return problems, tiny, tight
 
 
 def feet_anchor_px(cam, cell):
@@ -308,19 +485,35 @@ def main():
             sys.exit("朝向自检失败：\n  " + "\n  ".join(problems))
         print("BAKE 朝向自检通过（8 列的鼻尖屏幕侧与 Facing::index 一致）")
 
+    if not args.skip_framing_check:
+        problems, tiny, tight = check_framing(cam, cell, parts, spec, states, columns)
+        # 把留边余量也打出来，换正式模型时重定 ORTHO_SCALE 就靠这两个数
+        print("BAKE 部件投影最小尺寸：" + " ".join("%s=%.1f" % (k, v) for k, v in sorted(tiny.items())))
+        worst = sorted(tight.items(), key=lambda kv: kv[1])[:4]
+        print("BAKE 格边留边最紧的零件：" + " ".join("%s=%.1fpx" % (k, v) for k, v in worst))
+        if problems:
+            sys.exit("构图自检失败：\n  " + "\n  ".join(problems))
+        print("BAKE 构图自检通过（%d 个零件在全部姿态下都可见且没裁到格边）" % len(tiny))
+
+    if args.check_only:
+        print("BAKE --check-only：自检跑完，不渲染")
+        return
+
     place_camera(cam, columns[0])
     ax, ay = feet_anchor_px(cam, cell)
     print("BAKE anchor.feet = [%s, %s]（cell=%d, ortho_scale=%.2f, view_transform=%s）" % (ax, ay, cell, ORTHO_SCALE, used_transform))
 
     baked, skipped = 0, 0
     for state in states:
-        frames = len(spec["states"][state]["rows"])
+        track = spec["states"][state]
+        frames = len(track["rows"])
+        loop = track.get("loop", True)
         out_dir = os.path.join(args.out, state)
         os.makedirs(out_dir, exist_ok=True)
         for index in columns:
             place_camera(cam, index)
             for frame in range(frames):
-                apply_pose(parts, state, frame, frames)
+                apply_pose(parts, state, frame, frames, loop)
                 bpy.context.view_layer.update()
                 path = os.path.join(out_dir, "f%02d_%02d.png" % (index, frame))
                 if os.path.exists(path) and not args.force:
