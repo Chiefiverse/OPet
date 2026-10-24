@@ -10,3 +10,10 @@
 
 # 内容包构建产物，与代码仓库分开发布
 /packs/*.petpack
+
+# M2 烘焙产物：可由 tools/bake.py + tools/pack.py 完整重现，且官方美术走专有 EULA
+# 的 .petpack 分发渠道，不进这个 AGPL 公开仓库（D8/D9）
+/assets/pets/*/frames/
+/assets/pets/*/sheet.webp
+/assets/pets/*/pet.json
+/assets/pets/*/polygon.json
