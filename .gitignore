@@ -17,3 +17,6 @@
 /assets/pets/*/sheet.webp
 /assets/pets/*/pet.json
 /assets/pets/*/polygon.json
+
+# CLI 会话在本项目目录里落的工作产物，与代码无关
+/.qoder/
