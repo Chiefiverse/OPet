@@ -10,7 +10,9 @@
 #   bash scripts/phase_b_checklist.sh --soak 30    # B4 的 RSS/CPU 采样改为 30 分钟
 #
 # 判定标准来源：设计书 §1.3（性能目标）与 §6.1 验收门禁。
-# ⚠️ 本脚本未在真实 Hyprland 上执行过（B4–B6 依赖尚未存在的二进制）。首次真机运行请按输出逐条核对。
+# ⚠️ B0–B3 已于 2026-10-24 在 Omarchy 真机（Hyprland 0.56.2）实跑：9 PASS / 1 WARN / 0 FAIL / 4 SKIP。
+#    B4–B6 **仍未跑**：B4 的 `--with-pet` 会在用户正在用的桌面上起 surface（M4 的边界是**必须带 `--seconds` 限时自毁**，
+#    且"点身体/点空白/连打 30s 键盘"三项只能人工判 ⇒ 跑之前先问用户），B5 需要 `opet.service`（M7 才装），B6 需要 Quickshell widget。
 
 set -uo pipefail
 
@@ -73,14 +75,44 @@ say "  WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset}  XDG_RUNTIME_DIR=${XDG_RUNTIME_
 hdr "B1 协议能力探测（zwlr_layer_shell_v1 / viewporter / fractional scale）"
 say "  预期：Hyprland 自 0.2 起实现 wlr-layer-shell，正常情况下三者都在"
 
-if need wayland-info; then
+# 探测优先级：**客户端自带的 --probe 优先**，外部工具只当兜底。
+# 理由（2026-10-24 真机实测）：Arch/Omarchy 上 `wayland-info` 与 `weston-info` 都不存在，
+# 靠外部工具的这条路本来就是死的；而 `opet overlay --probe` 只读 registry、
+# 不映射任何 surface，所以在用户正在用的 live 会话上跑也安全。
+probe_bin=""
+for c in "${OPET_BIN:-}" opet-overlay-wayland ./target/release/opet-overlay-wayland opet ./target/release/opet; do
+  [ -n "$c" ] || continue
+  if command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; then probe_bin="$c"; break; fi
+done
+
+if [ -n "$probe_bin" ]; then
+  case "$probe_bin" in
+    *opet) probe_out="$("$probe_bin" overlay --probe 2>&1)" ;;
+    *)     probe_out="$("$probe_bin" --probe 2>&1)" ;;
+  esac
+  say "  用客户端自带诊断：$probe_bin（输出已存报告）"
+  printf '%s\n' "$probe_out" >> "$REPORT"
+  for proto in zwlr_layer_shell_v1 wp_viewporter wp_fractional_scale_manager_v1 wl_shm wl_seat; do
+    if printf '%s\n' "$probe_out" | grep -q "  $proto  *v"; then
+      ok "$proto 可用（$(printf '%s\n' "$probe_out" | grep -m1 "  $proto" | tr -s ' ')）"
+    else
+      bad "$proto 未出现在 registry（客户端必须走降级路径，见设计书 §4）"
+    fi
+  done
+  # `zwp_linux_dmabuf_v1` 是 GPU 零拷贝路径的前提，M4 的 CPU blit 不用它，但 R5 要
+  if printf '%s\n' "$probe_out" | grep -q "zwp_linux_dmabuf_v1"; then
+    ok "zwp_linux_dmabuf_v1 可用（未来 GPU 零拷贝路径的前提）"
+  else
+    warn "无 zwp_linux_dmabuf_v1：只能走 shm"
+  fi
+elif need wayland-info; then
   wi="$(wayland-info 2>/dev/null)"
   for proto in zwlr_layer_shell_v1 wp_viewporter wp_fractional_scale_manager_v1 zwp_linux_dmabuf_v1; do
     if printf '%s\n' "$wi" | grep -q "$proto"; then ok "$proto 可用"; else bad "$proto 未出现在 registry（客户端必须走降级路径，见设计书 §4）"; fi
   done
   printf '%s\n' "$wi" | grep -i "subcompositor\|layer" >> "$REPORT" 2>/dev/null || true
 else
-  skip "wayland-info 不存在。三条替代路径（按顺序试）：① 装工具（Fedora 有 wayland-utils 包；Arch 侧包名请以 repo 查询为准，可能只有 AUR 的 wayland-info-git）② 用 weston-info（装 weston 即可得到）③ 等 M4 完成后用 \`opet-overlay-wayland --probe\` 打印 registry globals —— 这条本来就是我们该自带的诊断能力"
+  skip "既没有编译好的客户端（`cargo build --release` 后有 opet / opet-overlay-wayland），也没有 wayland-info/weston-info ⇒ 本步无法判定协议能力。客户端的 \`overlay --probe\` 就是为此存在的交付项"
 fi
 
 # --------------------------------------------------------- B2 GPU / 驱动（R5）
@@ -147,9 +179,22 @@ else
   say "  使用二进制: $OPET_BIN"
 
   # (1) 焦点不被抢占：启动前后活动窗口必须一致
+  # 起宠物**必须给参数**：没 `--manifest` 客户端直接拒绝（内置 fixture 没有像素），
+  # 没 `--seconds` 就会赖在用户正在用的桌面上 —— 两条都是红线，所以这里显式拼参数，
+  # 而不是裸跑二进制（原先正是那样，B4 必然报"3s 内已退出"）。
+  # `--panel-top` 是 layer-shell 的可用区补偿（本机顶栏 20 逻辑像素），别的机器可覆盖。
+  pet_secs=$(( SOAK_MIN * 60 + 30 ))
+  case "$OPET_BIN" in
+    *opet) pet_cmd=("$OPET_BIN" overlay) ;;
+    *)     pet_cmd=("$OPET_BIN") ;;
+  esac
+  pet_cmd+=(--manifest "${OPET_MANIFEST:-assets/pets/cat_shiro/pet.json}"
+            --seconds "$pet_secs"
+            ${OPET_OVERLAY_ARGS:---panel-top 20})
+  say "  启动命令: ${pet_cmd[*]}"
   before=""
   [ "$COMPOSITOR" = hyprland ] && before="$(hyprctl activewindow 2>/dev/null | sed -n 's/^.*ID: \([0-9A-Fa-f]*\).*/\1/p' | head -1)"
-  "$OPET_BIN" >/tmp/opet.log 2>&1 &
+  "${pet_cmd[@]}" >/tmp/opet.log 2>&1 &
   petpid=$!
   sleep 3
   if ! kill -0 "$petpid" 2>/dev/null; then
