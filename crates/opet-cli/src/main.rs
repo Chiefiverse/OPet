@@ -1,5 +1,6 @@
-//! `opet` 命令行入口。M1 只有 headless 模拟与吞吐基准，
-//! overlay/IPC/资产子命令在 M3/M4 补（§10.2）。
+//! `opet` 命令行入口。M1 = headless 模拟与吞吐基准；
+//! M4 起加 `overlay`（Wayland 宠物客户端，与 `opet-overlay-wayland` 共用参数口径）。
+//! IPC/资产子命令在 M3 之后补（§10.2）。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,6 +21,16 @@ M1 可用：
       纯逻辑吞吐（§6.1 验收：≥ 1_000_000 tick/s，release 构建）
   opet sim table
       打印 §3.3 迁移表的 Markdown（改状态机后用它回写设计书）
+
+M4 可用（完整参数：`opet overlay --help`）：
+  opet overlay --probe
+      只读打印 Wayland registry 与显示器几何，不映射任何 surface
+  opet overlay --manifest FILE [--seconds N] [--monitor NAME] [--panel-top N]
+      前台起宠物 overlay。默认 3 秒自动退出 ⇒ live 桌面上安全。
+      --panel-top = 顶部栏高度（逻辑像素）：layer-shell 的 margin 从可用区量起，
+      不给这个值整只宠物会被下推一个栏高、脚掉到屏幕外
+  opet overlay --test-rect
+      不接内核，画纯色矩形，只验 surface 映射与点击穿透
 
   opet --help
 ";
@@ -163,8 +174,32 @@ fn bench(o: &Opts) -> Result<(), String> {
     Ok(())
 }
 
+/// `opet overlay`：解析与运行环都取自 [`overlay_wayland::cli`]，与独立二进制
+/// `opet-overlay-wayland` 一字不差（D3 要的是"宠物不在常驻 shell 进程里"，
+/// 前台命令本身就是一个独立进程，systemd 服务则直接起那个二进制）。
+fn overlay(args: &[String]) -> ExitCode {
+    use overlay_wayland::cli::{Outcome, USAGE};
+    match overlay_wayland::cli::dispatch(args) {
+        Ok(Outcome::Help(usage)) => {
+            print!("{usage}");
+            ExitCode::SUCCESS
+        }
+        Ok(Outcome::Ran) | Ok(Outcome::Probed(true)) => ExitCode::SUCCESS,
+        // 探测没通过：报告已经打出来了，非零退出给 Phase B 脚本判定用
+        Ok(Outcome::Probed(false)) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("错误: {e}\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // overlay 的退出码自成一套，不进下面的 Ok/Err 通道
+    if args.first().map(String::as_str) == Some("overlay") {
+        return overlay(&args[1..]);
+    }
     let result = match args.first().map(String::as_str) {
         Some("sim") => {
             let sub = args.get(1).map(String::as_str).unwrap_or("");

@@ -1,0 +1,27 @@
+[package]
+name = "overlay-wayland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OPet 的 Wayland 适配层：wlr-layer-shell overlay 客户端（§3.7）"
+
+[dependencies]
+petcore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+image-webp = "0.2.4"
+wayland-client = "0.31.15"
+# viewporter（stable）解耦 buffer 物理尺寸与 surface 逻辑尺寸；
+# staging 里有 `wp_fractional_scale`——本机实测 eDP-1 是 **1.5×**（物理 1920x1080 / 逻辑 1280x720），
+# 只按 `wl_output.scale=2` 出图会被合成器再缩 0.75×，宠物边缘发糊。
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+# Smithay 的官方封装：layer-shell / shm slot pool / seat+光标 / output 几何 / calloop 事件环。
+# §3.7 说"依赖 wayland-client + wayland-protocols"，sctk 就是这两个之上的纯 Rust 封装，
+# 不引入 GTK/Qt 运行时；用它换掉手写 memfd/mmap/cursor 三整块易错代码。
+smithay-client-toolkit = "0.19.2"
+
+[[bin]]
+name = "opet-overlay-wayland"
+path = "src/main.rs"

@@ -12,3 +12,5 @@ path = "src/main.rs"
 
 [dependencies]
 petcore = { workspace = true }
+# `opet overlay` 复用 Wayland 客户端的解析与运行环（同一份参数口径）
+overlay-wayland = { workspace = true }
