@@ -1,0 +1,289 @@
+{
+  "format": 1,
+  "scale": 1000000,
+  "banner_id": "cat_series",
+  "catalog_id": "cat_series_01",
+  "basis_pulls": 1000000,
+  "method": "markov_expectation_over_pity_and_batch(no dice rolled)",
+  "params": {
+    "soft_start": 40,
+    "soft_step": 60000,
+    "hard_pity": 80,
+    "ssr_cap": 620000,
+    "ten_pull_sr_floor": true,
+    "batch_size": 10,
+    "dup_shards": [
+      2,
+      8,
+      25,
+      100
+    ],
+    "ssr_redeem_cost": 120
+  },
+  "base": {
+    "N": 600000,
+    "R": 280000,
+    "SR": 100000,
+    "SSR": 20000
+  },
+  "effective": {
+    "N": 570145,
+    "R": 272424,
+    "SR": 123327,
+    "SSR": 34104
+  },
+  "base_percent": {
+    "N": "60.0000",
+    "R": "28.0000",
+    "SR": "10.0000",
+    "SSR": "2.0000"
+  },
+  "effective_percent": {
+    "N": "57.0145",
+    "R": "27.2424",
+    "SR": "12.3327",
+    "SSR": "3.4104"
+  },
+  "items": [
+    {
+      "id": "cat_shiro",
+      "kind": "pet",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "cat_mochi",
+      "kind": "pet",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "slime_mint",
+      "kind": "pet",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "cap_blue",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "bow_pink",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "whisker_stars",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "face_blush",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "bell_gold",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "neckerchief_ink",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "backpack_tiny",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51831,
+      "percent": "5.1831"
+    },
+    {
+      "id": "paw_wraps",
+      "kind": "accessory",
+      "rarity": "N",
+      "weight": 1000,
+      "prob_millionths": 51835,
+      "percent": "5.1835"
+    },
+    {
+      "id": "cat_ui",
+      "kind": "pet",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "capy_barley",
+      "kind": "pet",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "owl_nori",
+      "kind": "pet",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "slime_slate",
+      "kind": "pet",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "hood_night",
+      "kind": "accessory",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "glasses_round",
+      "kind": "accessory",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "mask_moon",
+      "kind": "accessory",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "scarf_red",
+      "kind": "accessory",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "wing_mini",
+      "kind": "accessory",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27242,
+      "percent": "2.7242"
+    },
+    {
+      "id": "lantern_mini",
+      "kind": "accessory",
+      "rarity": "R",
+      "weight": 600,
+      "prob_millionths": 27246,
+      "percent": "2.7246"
+    },
+    {
+      "id": "penguin_bolt",
+      "kind": "pet",
+      "rarity": "SR",
+      "weight": 200,
+      "prob_millionths": 20555,
+      "percent": "2.0555"
+    },
+    {
+      "id": "fox_ember",
+      "kind": "pet",
+      "rarity": "SR",
+      "weight": 200,
+      "prob_millionths": 20555,
+      "percent": "2.0555"
+    },
+    {
+      "id": "crown_leaf",
+      "kind": "accessory",
+      "rarity": "SR",
+      "weight": 200,
+      "prob_millionths": 20555,
+      "percent": "2.0555"
+    },
+    {
+      "id": "headband_leaf",
+      "kind": "accessory",
+      "rarity": "SR",
+      "weight": 200,
+      "prob_millionths": 20555,
+      "percent": "2.0555"
+    },
+    {
+      "id": "pendant_dew",
+      "kind": "accessory",
+      "rarity": "SR",
+      "weight": 200,
+      "prob_millionths": 20555,
+      "percent": "2.0555"
+    },
+    {
+      "id": "cape_dusk",
+      "kind": "accessory",
+      "rarity": "SR",
+      "weight": 200,
+      "prob_millionths": 20552,
+      "percent": "2.0552"
+    },
+    {
+      "id": "dragon_pip",
+      "kind": "pet",
+      "rarity": "SSR",
+      "weight": 50,
+      "prob_millionths": 11368,
+      "percent": "1.1368"
+    },
+    {
+      "id": "hat_straw",
+      "kind": "accessory",
+      "rarity": "SSR",
+      "weight": 50,
+      "prob_millionths": 11368,
+      "percent": "1.1368"
+    },
+    {
+      "id": "muffler_cloud",
+      "kind": "accessory",
+      "rarity": "SSR",
+      "weight": 50,
+      "prob_millionths": 11368,
+      "percent": "1.1368"
+    }
+  ]
+}

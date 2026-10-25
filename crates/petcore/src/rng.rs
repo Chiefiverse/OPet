@@ -1,7 +1,9 @@
 //! 确定性随机数。内核内所有随机都来自这里，保证"同样的 seed ⇒ 同样的行为序列"（§2.4 可复现、可审计）。
 //!
 //! 采用 splitmix64：状态 64 bit、无分支、统计性质足够支撑行为决策与 M3 的加权抽样。
-//! `counter` 与 `state` 会被 M3 写进 `rng_state_hash = sha256(seed || counter)` 审计链。
+//! `counter` 只服务行为内核。**M3 的审计哈希不从这里取**：`rng_state_hash` 的唯一定义是
+//! `gacha::audit::rng_state_hash` = `sha256(b"OPET-GACHA-RNG-1\n" ‖ u64be(seed) ‖ u64be(seq))`，
+//! 每抽一条独立派生的骰子流（见 `gacha::stream`）。写在这里是为了防止再出现第二个定义。
 
 #[derive(Clone, Debug)]
 pub struct Rng {

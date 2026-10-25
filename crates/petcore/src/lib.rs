@@ -24,6 +24,7 @@
 
 pub mod assets;
 pub mod behavior;
+pub mod gacha;
 pub mod geom;
 pub mod intent;
 pub mod physics;

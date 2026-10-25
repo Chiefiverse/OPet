@@ -12,6 +12,13 @@ rust-version = "1.86"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 钉死 0.11.0：0.11.1 要求 rustc 1.88，而本仓库声明的 MSRV 是 1.86。
+# resolver=2 不会自动按 MSRV 选版，所以只能显式钉（升级时连同 rust-version 一起改）。
+sha2 = "=0.11.0"
+# ⚠️ 下面三个都**不进** petcore（硬约束 #8：内核无 IO、无墙钟）。
+# `cargo tree -p petcore -e normal` 里出现任何一个就说明分层被破坏了。
+rusqlite = { version = "0.37", features = ["bundled"] }
+getrandom = "0.3"
 
 petcore = { path = "crates/petcore" }
 overlay-wayland = { path = "crates/overlay-wayland" }
