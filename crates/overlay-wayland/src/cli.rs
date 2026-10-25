@@ -15,6 +15,9 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
   --panel-top N      顶边栏高度（逻辑像素，默认 0）。layer-shell 的 margin 从可用区量起，
                      顶部有栏时不给这个值 ⇒ 宠物整体下移一个栏高、脚掉到屏幕外
   --seed N           内核随机种子（默认 1）
+  --db PATH          抽取落库的 sqlite 存档（绝对路径）。**不给就是内存库**：菜单与结果卡
+                     一律打 DRYRUN 标、不产生任何文件 —— 与 `opet pull` 的默认存档红线同族，
+                     别让一条随手起的 overlay 写脏用户真存档
   --test-rect        不接内核，画一块纯色矩形（验证 surface 映射与点击穿透）
   --no-cursor        不设光标表面（调试用；代价是鼠标在宠物上方可能隐形）
 ";
@@ -28,6 +31,8 @@ pub struct Args {
     pub panel_bottom: Option<f32>,
     pub panel_top: Option<f32>,
     pub seed: Option<u64>,
+    /// sqlite 存档路径；`None` = 内存库（UI 打 DRYRUN 标，不写盘）
+    pub db: Option<String>,
     pub test_rect: bool,
     pub no_cursor: bool,
 }
@@ -57,6 +62,12 @@ impl Args {
         if pt < 0.0 {
             return Err(format!("--panel-top 不能是负数（给了 {pt}）"));
         }
+        // `--db=` 空值：既不是"不给"（内存库）也不是路径，语义上是最坏的一种"看起来开了档"。
+        if self.db.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return Err(
+                "--db 给了空路径；不写真存档就别给 --db（默认是内存库 + DRYRUN 标）".to_string(),
+            );
+        }
         Ok(Options {
             manifest: self.manifest.clone(),
             seconds: match self.seconds {
@@ -67,6 +78,7 @@ impl Args {
             panel_bottom: pb,
             panel_top: pt,
             seed: self.seed.unwrap_or(1),
+            db: self.db.clone(),
             test_rect: self.test_rect,
             no_cursor: self.no_cursor,
         })
@@ -114,6 +126,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--seed" => a.seed = Some(num(&next_val(&mut i)?, key)?),
             "--manifest" => a.manifest = Some(next_val(&mut i)?),
             "--monitor" => a.monitor = Some(next_val(&mut i)?),
+            "--db" => a.db = Some(next_val(&mut i)?),
             "--probe" => a.probe = true,
             "--test-rect" => a.test_rect = true,
             "--no-cursor" => a.no_cursor = true,
@@ -236,6 +249,33 @@ mod tests {
         assert_eq!(
             parse(&v(&["--monitor=-L1"])).unwrap().monitor,
             Some("-L1".to_string())
+        );
+    }
+
+    #[test]
+    fn writing_to_disk_is_opt_in() {
+        // 不给 `--db` ⇒ `None`，走内存库 + DRYRUN 标，**不产生任何文件**。
+        // 这条和 `opet pull` 的默认存档门禁同族：一条随手起的 overlay 不该写脏真存档。
+        assert_eq!(
+            parse(&v(&["--test-rect"])).unwrap().options().unwrap().db,
+            None
+        );
+        let eq = parse(&v(&["--test-rect", "--db=/tmp/opet_m3b.db"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        let sp = parse(&v(&["--test-rect", "--db", "/tmp/opet_m3b.db"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(eq.db.as_deref(), Some("/tmp/opet_m3b.db"));
+        assert_eq!(eq.db, sp.db, "两种写法必须同义");
+        // 空值是第三种"看起来开了档"：既不是内存库也不是路径 ⇒ 必须报错
+        assert!(
+            parse(&v(&["--test-rect", "--db="]))
+                .unwrap()
+                .options()
+                .is_err()
         );
     }
 }

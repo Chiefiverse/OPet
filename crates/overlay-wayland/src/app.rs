@@ -42,7 +42,7 @@ use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-    LayerSurfaceConfigure,
+    LayerSurfaceConfigure, SurfaceKind,
 };
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
@@ -65,6 +65,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::atlas::Atlas;
+use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
 use crate::region::{CellRect, Regions};
 
 /// `wp_fractional_scale` 的 scale 单位是 1/120（180 = 1.5×，本机 eDP-1 实测值）。
@@ -91,6 +92,9 @@ pub struct Options {
     /// 屏幕外（本机实测 200 → 渲染在 220）。协议读不到栏高，只能由启动参数给。
     pub panel_top: f32,
     pub seed: u64,
+    /// 抽取存档的 sqlite 路径（`--db`）。`None` = **内存库**：不建文件、不写盘，菜单与
+    /// 结果卡一律打 `DRYRUN` 标。显式给路径才写真存档，与 `opet pull` 的默认存档门禁同族。
+    pub db: Option<String>,
     /// 不接内核、不读资产，画一块纯色矩形（M4 第 3 步：只验 surface 能否映射 + 穿透）
     pub test_rect: bool,
     /// 不设光标（主题加载失败时的退路，代价是"鼠标在宠物上隐形"）
@@ -106,6 +110,7 @@ impl Default for Options {
             panel_bottom: 0.0,
             panel_top: 0.0,
             seed: 1,
+            db: None,
             test_rect: false,
             no_cursor: false,
         }
@@ -127,6 +132,10 @@ pub struct Counters {
     pub buffer_errors: u64,
     /// 帧回调迟迟没回来 ⇒ 看门狗强制解锁（不解锁会永远不再附新 buffer，宠物视觉上冻住）
     pub watchdogs: u64,
+    /// 菜单那块 surface 的提交数。**不并进上面三档** —— §4 的省电口径是宠物的，
+    /// 第二块 surface 混进去就会让"宠物三档不劣化"这条门禁变成读不出来的混合数。
+    pub menu_commits: u64,
+    pub menu_watchdogs: u64,
 }
 
 /// 客户端侧的呈现器。`present` 的语义与 [`petcore::render::OverlayBackend`] 一致，但所有权方向
@@ -144,6 +153,12 @@ pub struct App {
     viewport: Option<WpViewport>,
     /// 留着不只为不丢引用：`None` 时整数 scale 走 `wl_output` 那条路
     fractional: Option<WpFractionalScaleV1>,
+    /// 建第二块 layer surface（右键菜单）要用，`run()` 里的局部量活不到回调里
+    layer_shell: Arc<LayerShell>,
+    /// 菜单复用宠物的 `scale_num`，但每块 surface 要自己的 `wp_viewport` ⇒ 这个对象得活着
+    viewporter: Option<WpViewporter>,
+    /// 右键菜单那块 surface；`None` = 没开
+    menu: Option<MenuState>,
     pointer: Option<ThemedPointer>,
     raw_pointer: Option<WlPointer>,
     qh: Option<QueueHandle<App>>,
@@ -279,6 +294,9 @@ pub fn run(opts: Options) -> Result<(), String> {
         layer,
         viewport,
         fractional,
+        layer_shell,
+        viewporter,
+        menu: None,
         pointer: None,
         raw_pointer: None,
         qh: Some(qh),
@@ -390,26 +408,49 @@ fn load_asset(
 
 // ───────────────────────────── 几何换算 ─────────────────────────────
 
+/// **生效**的缩放（1/120 单位）。`wp_viewport` 缺席时只能用整数档：`wl_surface
+/// .set_buffer_scale` 只吃整数，而分数档（1.5×）若照样出 1.5× 的 buffer 却不带
+/// `buffer_scale`，合成器会按 1× 把它当成逻辑尺寸 ⇒ 宠物整体大 1.5 倍且坐标错位。
+/// 所以这里向下取整（1.5 ⇒ 1.0），宁可略糊也不让尺寸/位置双错。
+///
+/// 自由函数而不是 `App` 的方法：菜单那块 surface 拿不到 `&App`（`App` 正被可变借用），
+/// 但**必须**用同一套口径 —— 两处各写一份"1.5 还是 2"迟早漂移，而漂移的表现是菜单发糊
+/// 或错位，只有肉眼能看出来。
+fn eff_units(scale_num: u32, has_viewport: bool) -> u32 {
+    if has_viewport {
+        scale_num
+    } else {
+        (scale_num / SCALE_UNIT).max(1) * SCALE_UNIT
+    }
+}
+
+fn scale_of(scale_num: u32, has_viewport: bool) -> f32 {
+    eff_units(scale_num, has_viewport).max(SCALE_UNIT) as f32 / SCALE_UNIT as f32
+}
+
+/// 逻辑像素 → 物理像素（四舍五入；margin 与格子各自取整，保证像素与区域边界自洽）。
+fn to_phys_of(logical: f32, scale_num: u32, has_viewport: bool) -> i32 {
+    (logical * scale_of(scale_num, has_viewport)).round() as i32
+}
+
+/// viewport 缺席时才退回 `set_buffer_scale`（它只能整数）；有 viewport 时
+/// `buffer_scale` 必须是 1，否则和 `wp_viewport` 一起用就是协议错误。
+fn buffer_scale_of(scale_num: u32, has_viewport: bool) -> Option<i32> {
+    let s = scale_of(scale_num, has_viewport);
+    if !has_viewport && s >= 2.0 {
+        Some(s as i32)
+    } else {
+        None
+    }
+}
+
 impl App {
-    /// **生效**的缩放（1/120 单位）。`wp_viewport` 缺席时只能用整数档：`wl_surface
-    /// .set_buffer_scale` 只吃整数，而分数档（1.5×）若照样出 1.5× 的 buffer 却不带
-    /// `buffer_scale`，合成器会按 1× 把它当成逻辑尺寸 ⇒ 宠物整体大 1.5 倍且坐标错位。
-    /// 所以这里向下取整（1.5 ⇒ 1.0），宁可略糊也不让尺寸/位置双错。
-    fn eff_scale_units(&self) -> u32 {
-        if self.viewport.is_some() {
-            self.scale_num
-        } else {
-            (self.scale_num / SCALE_UNIT).max(1) * SCALE_UNIT
-        }
-    }
-
     fn scale_f(&self) -> f32 {
-        self.eff_scale_units().max(SCALE_UNIT) as f32 / SCALE_UNIT as f32
+        scale_of(self.scale_num, self.viewport.is_some())
     }
 
-    /// 逻辑像素 → 物理像素（四舍五入；margin 与格子各自取整，保证像素与区域边界自洽）。
     fn to_phys(&self, logical: f32) -> i32 {
-        (logical * self.scale_f()).round() as i32
+        to_phys_of(logical, self.scale_num, self.viewport.is_some())
     }
 
     /// 附了一个新 buffer ⇒ 开始等它的帧回调（同时给看门狗上表）。
@@ -424,14 +465,8 @@ impl App {
         self.pending_since = None;
     }
 
-    /// viewport 缺席时才退回 `set_buffer_scale`（它只能整数）；有 viewport 时
-    /// `buffer_scale` 必须是 1，否则和 `wp_viewport` 一起用就是协议错误。
     fn buffer_scale(&self) -> Option<i32> {
-        if self.viewport.is_none() && self.scale_f() >= 2.0 {
-            Some(self.scale_f() as i32)
-        } else {
-            None
-        }
+        buffer_scale_of(self.scale_num, self.viewport.is_some())
     }
 
     /// 我们这块 surface **实际所在**的 output：优先用 `wl_surface.enter` 报的那台，其次
@@ -604,6 +639,323 @@ impl App {
     }
 }
 
+// ───────────────────────────── 菜单 surface（M3-b）─────────────────────────────
+
+/// 右键宠物开出的第二块 layer surface。
+///
+/// **为什么什么都要自己一套**：同层两块 surface 若共用 `SlotPool`/`frame_pending`，宠物那
+/// 三档提交计数会被菜单污染（§4 的省电门禁就没法读），而且一块 surface 的帧回调没回来会把
+/// 另一块也锁死。所以 pool、在途标记、看门狗、`wl_region` 全部分开，共享的只有 `qh`、
+/// `wl_compositor`、`wl_shm`、layer-shell、viewporter 和**宠物的 `scale_num`**（不建第二个
+/// `wp_fractional_scale`：那块对象的回调只会多一个漂移源）。
+struct MenuState {
+    layer: LayerSurface,
+    /// `frame` / 指针事件按**对象身份**分流，这块要能被认出来
+    surface: WlSurface,
+    viewport: Option<WpViewport>,
+    pool: SlotPool,
+    /// 宠物 scale 的镜像（开菜单时取一次，之后每 tick 同步）
+    scale_num: u32,
+    logical: (i32, i32),
+    /// 布局表只算一次：`hit_test` 与 draw 共用同一份矩形
+    items: Vec<ItemRect>,
+    anim: MenuAnim,
+    /// 上一次 commit 的内容签名 ⇒ 静止时"什么都不发"
+    last_sig: Option<u64>,
+    frame_pending: bool,
+    pending_since: Option<Instant>,
+    active_region: Option<WlRegion>,
+    configured: bool,
+    force_draw: bool,
+}
+
+impl MenuState {
+    fn has_viewport(&self) -> bool {
+        self.viewport.is_some()
+    }
+
+    fn to_phys(&self, logical: f32) -> i32 {
+        to_phys_of(logical, self.scale_num, self.has_viewport())
+    }
+
+    fn buffer_scale(&self) -> Option<i32> {
+        buffer_scale_of(self.scale_num, self.has_viewport())
+    }
+
+    /// 宠物 scale 变了要跟着重画（菜单自己不发 `preferred_scale`，只能镜像）。
+    fn mirror_scale(&mut self, scale_num: u32) {
+        if self.scale_num != scale_num {
+            self.scale_num = scale_num;
+            self.force_draw = true;
+        }
+    }
+
+    /// 推进一格动画。返回 `true` = 相位变了（像素必然不同）。
+    fn step(&mut self) -> bool {
+        if !self.anim.is_busy() {
+            return false;
+        }
+        let next = menu::advance(&self.anim);
+        let changed = next != self.anim;
+        self.anim = next;
+        changed
+    }
+
+    fn arm(&mut self) {
+        self.frame_pending = true;
+        self.pending_since = Some(Instant::now());
+    }
+
+    fn clear_wait(&mut self) {
+        self.frame_pending = false;
+        self.pending_since = None;
+    }
+
+    /// 看门狗同构（合成器只对可见 surface 发帧回调）；返回是否触发。
+    fn tick_watchdog(&mut self, now: Instant) -> bool {
+        let overdue = self
+            .pending_since
+            .is_some_and(|t| now.duration_since(t) > Duration::from_secs_f64(3.0 / TICK_HZ as f64));
+        if overdue {
+            self.clear_wait();
+            self.force_draw = true;
+        }
+        overdue
+    }
+
+    /// 收回协议对象。顺序：region → viewport → layer_surface → wl_surface
+    /// （`zwlr_layer_surface_v1.destroy` 之后再碰它就是协议错误）。
+    fn teardown(self) {
+        if let Some(r) = &self.active_region {
+            r.destroy();
+        }
+        if let Some(v) = &self.viewport {
+            v.destroy();
+        }
+        if let SurfaceKind::Wlr(l) = self.layer.kind() {
+            l.destroy();
+        }
+        self.surface.destroy();
+    }
+
+    /// 出一帧卡片。返回是否真的 commit 了。
+    fn draw(
+        &mut self,
+        compositor: &CompositorState,
+        qh: &QueueHandle<App>,
+        balance: i64,
+        error: &str,
+    ) -> bool {
+        if !self.configured || self.frame_pending {
+            return false;
+        }
+        let sig = menu::content_sig(&self.anim, balance, error);
+        if self.last_sig == Some(sig) && !self.force_draw {
+            return false;
+        }
+        let bw = self.to_phys(self.logical.0 as f32).max(1);
+        let bh = self.to_phys(self.logical.1 as f32).max(1);
+        let stride = bw * 4;
+        let created = self
+            .pool
+            .create_buffer(bw, bh, stride, wl_shm::Format::Argb8888);
+        let (buffer, canvas) = match created {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("菜单 create_buffer 失败: {e:?}");
+                return false;
+            }
+        };
+        // Step 3 先只验"能不能映射 + 落点对不对"：整卡不透明深灰。
+        // 文字/扩散/结果卡在 draw_menu 那一步替掉这里的填充。
+        // 卡片色 0x1B1E23（RRGGBB）⇒ `wl_shm` 的 Argb8888 是小端 B,G,R,A，且不透明 ⇒ 预乘不变。
+        for px in canvas.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0x23, 0x1E, 0x1B, 0xFF]);
+        }
+        // 句柄克隆（不是对象克隆）：下面的 `self.arm()` 要可变借 self，不能同时留引用
+        let surface = self.surface.clone();
+        if let Some(s) = self.buffer_scale() {
+            surface.set_buffer_scale(s);
+        }
+        surface.damage_buffer(0, 0, bw, bh);
+        self.arm();
+        surface.frame(qh, surface.clone());
+        if buffer.attach_to(&surface).is_err() {
+            self.clear_wait();
+            return false;
+        }
+        // 菜单整块都该吃掉点击（它就是来接收点击的），region = 卡片矩形，**逻辑**坐标
+        let region = compositor.wl_compositor().create_region(qh, ());
+        region.add(0, 0, self.logical.0, self.logical.1);
+        surface.set_input_region(Some(&region));
+        if let Some(old) = self.active_region.replace(region) {
+            old.destroy();
+        }
+        self.layer.commit();
+        self.last_sig = Some(sig);
+        self.force_draw = false;
+        true
+    }
+}
+
+impl App {
+    /// 可用区尺寸（output 逻辑尺寸减掉顶栏）：菜单 clamp 的边界必须和 margin 同口径，
+    /// 否则菜单会"合规地"贴进顶栏底下。
+    fn output_available(&self) -> (i32, i32) {
+        let info = self
+            .pick_output()
+            .and_then(|o| self.output_state.info(&o))
+            .or_else(|| {
+                self.output_state
+                    .outputs()
+                    .find_map(|o| self.output_state.info(&o))
+            });
+        let (w, h) = info
+            .and_then(|i| i.logical_size)
+            .unwrap_or((CARD_W.max(self.logical.0), CARD_H.max(self.logical.1)));
+        (
+            w.max(self.logical.0),
+            (h - self.opts.panel_top.round() as i32).max(self.logical.1),
+        )
+    }
+
+    fn toggle_menu(&mut self) {
+        if self.menu.is_some() {
+            self.close_menu();
+        } else {
+            self.open_menu();
+        }
+    }
+
+    fn open_menu(&mut self) {
+        let qh = self.qh();
+        // 几何先算完（下面的建 surface 全是不可变借用，别和 `self.menu =` 的可变借用打架）
+        let (mx, my) = self.margin;
+        let pet = RectI::new(mx, my, self.logical.0, self.logical.1);
+        let (aw, ah) = self.output_available();
+        let at = menu::placement(pet, RectI::new(0, 0, aw, ah));
+        let scale_num = self.scale_num;
+        let has_viewport = self.viewporter.is_some();
+        let target = self.on_output.clone();
+        let logical = (CARD_W, CARD_H);
+        let phys = (
+            to_phys_of(logical.0 as f32, scale_num, has_viewport).max(1),
+            to_phys_of(logical.1 as f32, scale_num, has_viewport).max(1),
+        );
+
+        let surface = self.compositor.create_surface(&qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &qh,
+            surface.clone(),
+            Layer::Overlay,
+            // 独立 namespace：`hyprctl layers` 要能分别认出两块，同层堆叠序不稳定 ⇒
+            // 摆位靠 `placement` 保证矩形不相交
+            Some("opet-menu"),
+            target.as_ref(),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_exclusive_zone(0);
+        layer.set_size(logical.0 as u32, logical.1 as u32);
+        // margin 顺序 = top,right,bottom,left
+        layer.set_margin(at.1, 0, 0, at.0);
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(&surface, &qh, ()));
+        if let Some(vp) = &viewport {
+            vp.set_destination(logical.0, logical.1);
+        }
+        layer.commit();
+
+        let initial = (phys.0 * phys.1 * 4 * 2) as usize;
+        let pool = match SlotPool::new(initial, &self.shm) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("菜单 shm 池建不起来: {e:?}");
+                if let Some(v) = &viewport {
+                    v.destroy();
+                }
+                surface.destroy();
+                return;
+            }
+        };
+        self.menu = Some(MenuState {
+            layer,
+            surface,
+            viewport,
+            pool,
+            scale_num,
+            logical,
+            items: menu::layout(),
+            anim: MenuAnim::Menu,
+            last_sig: None,
+            frame_pending: false,
+            pending_since: None,
+            active_region: None,
+            configured: false,
+            force_draw: true,
+        });
+        eprintln!(
+            "menu: 打开于 margin {}x{}（宠物 {mx},{my} {}x{}，可用区 {aw}x{ah}）",
+            at.0, at.1, self.logical.0, self.logical.1
+        );
+    }
+
+    fn close_menu(&mut self) {
+        if let Some(m) = self.menu.take() {
+            m.teardown();
+        }
+    }
+
+    /// 每 tick 走一遍：同步 scale、跑看门狗、推进相位、按签名决定要不要提交。
+    /// 静止的菜单**一次 commit 都不发**（`counters.menu_commits` 必须不随 tick 增长）。
+    fn update_menu(&mut self, now: Instant) {
+        if self.menu.is_none() {
+            return;
+        }
+        let scale_num = self.scale_num;
+        let (balance, error) = (self.menu_balance(), self.menu_error_line());
+        let mut m = self.menu.take().expect("上面查过 is_some");
+        m.mirror_scale(scale_num);
+        if m.tick_watchdog(now) {
+            self.counters.menu_watchdogs += 1;
+            eprintln!("警告：菜单帧回调超时 ⇒ 强制解锁提交");
+        }
+        m.step();
+        let qh = self.qh();
+        if m.draw(&self.compositor, &qh, balance, &error) {
+            self.counters.menu_commits += 1;
+        }
+        self.menu = Some(m);
+    }
+
+    /// 菜单被点：命中哪一项。`at` 是菜单 surface 的**逻辑**局部坐标。
+    fn on_menu_press(&mut self, at: (f32, f32)) {
+        let Some(item) = self
+            .menu
+            .as_ref()
+            .and_then(|m| menu::hit_test(&m.items, at))
+        else {
+            return;
+        };
+        match item {
+            menu::MenuItem::Close => self.close_menu(),
+            // 真抽取在下一步接：`MenuAnim` 还没东西可放时点它只会静默吞掉，不给假反馈
+            menu::MenuItem::Pull1 | menu::MenuItem::Pull10 => {}
+        }
+    }
+
+    /// 余额与错误行：Step 5 接 `petstore` 之前恒为 `(0, "")`。
+    fn menu_balance(&self) -> i64 {
+        0
+    }
+
+    fn menu_error_line(&self) -> String {
+        String::new()
+    }
+}
+
 // ───────────────────────────── 定时与呈现 ─────────────────────────────
 
 impl App {
@@ -649,6 +1001,10 @@ impl App {
                 self.counters.watchdogs
             );
         }
+
+        // 菜单自己走一遍（独立 pool / 独立看门狗）。放在宠物 `!configured` 早退之前：
+        // 宠物的映射状态和菜单该不该动帧毫无关系。
+        self.update_menu(now);
 
         // 第一次 configure 之前 surface 还没映射，`present` 会直接早退 ⇒ 这期间推进内核就等于
         // **把"内容变了"的 intent 扔掉**（宠物可能一直不显形）。所以这里干脆不推进。
@@ -958,6 +1314,16 @@ impl App {
                 "无，退 set_buffer_scale"
             },
         );
+        println!(
+            "  菜单: {}（{} 提交 / {} 看门狗，静止时应当恒 0 增长）",
+            if self.menu.is_some() {
+                "开着"
+            } else {
+                "没开"
+            },
+            self.counters.menu_commits,
+            self.counters.menu_watchdogs,
+        );
         if let Some(sim) = self.sim.as_ref() {
             println!(
                 "  内核: state={:?} 指纹={:016x}",
@@ -1023,7 +1389,27 @@ impl CompositorHandler for App {
     ) {
     }
 
-    fn frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _s: &WlSurface, _t: u32) {
+    fn frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, s: &WlSurface, _t: u32) {
+        // 按**对象身份**分流：宠物 / 菜单 / 别人的（光标 surface 也走这条路）。
+        // 不分流的话，菜单的帧回调会把宠物的 `frame_pending` 解开（反之亦然），
+        // 两块 surface 互相"替对方"放行 ⇒ 提交计数和延后补投全都读不出真相。
+        if self.menu.as_ref().is_some_and(|m| &m.surface == s) {
+            if let Some(mut m) = self.menu.take() {
+                m.clear_wait();
+                if m.force_draw {
+                    let qh = self.qh();
+                    let (b, e) = (self.menu_balance(), self.menu_error_line());
+                    if m.draw(&self.compositor, &qh, b, &e) {
+                        self.counters.menu_commits += 1;
+                    }
+                }
+                self.menu = Some(m);
+            }
+            return;
+        }
+        if s != self.layer.wl_surface() {
+            return;
+        }
         self.clear_frame_wait();
         if !self.force_draw {
             return;
@@ -1039,9 +1425,14 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _s: &WlSurface,
+        s: &WlSurface,
         o: &wl_output::WlOutput,
     ) {
+        // 只认宠物那块：光标 surface 和菜单也会报 enter，拿它们写 `on_output`
+        // 等于"谁最后进屏谁定义舞台"，热插拔时会飘。
+        if s != self.layer.wl_surface() {
+            return;
+        }
         // layer surface 建的时候 output 传的是 None ⇒ **由合成器决定它落在哪台**。
         // margin 是相对那台的锚边算的，所以必须用它上报的这台，不能猜第一个。
         self.on_output = Some(o.clone());
@@ -1052,10 +1443,10 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _s: &WlSurface,
+        s: &WlSurface,
         o: &wl_output::WlOutput,
     ) {
-        if self.on_output.as_ref() == Some(o) {
+        if s == self.layer.wl_surface() && self.on_output.as_ref() == Some(o) {
             self.on_output = None;
         }
     }
@@ -1085,18 +1476,45 @@ impl OutputHandler for App {
 }
 
 impl LayerShellHandler for App {
-    fn closed(&mut self, _c: &Connection, _q: &QueueHandle<Self>, _l: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _c: &Connection, _q: &QueueHandle<Self>, l: &LayerSurface) {
+        // **只有宠物那块被关才停整个环**（R3）。合成器收回菜单 surface（我们主动 destroy、
+        // 或者它自己把这块回收了）时，若照旧无条件 `exit = true`，"关个菜单"就会把宠物
+        // 一起带走 —— 而这条在 `--seconds 0` 的场景里表现为"宠物自己消失了"。
+        if self.menu.as_ref().is_some_and(|m| &m.layer == l) {
+            self.menu = None;
+            eprintln!("menu: 合成器收回菜单 surface（宠物继续跑）");
+            return;
+        }
+        if &self.layer == l {
+            self.exit = true;
+        }
     }
 
     fn configure(
         &mut self,
         _c: &Connection,
         _q: &QueueHandle<Self>,
-        _l: &LayerSurface,
+        l: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        if self.menu.as_ref().is_some_and(|m| &m.layer == l) {
+            if let Some(mut m) = self.menu.take() {
+                m.configured = true;
+                m.force_draw = true;
+                m.clear_wait();
+                let qh = self.qh();
+                let (b, e) = (self.menu_balance(), self.menu_error_line());
+                if m.draw(&self.compositor, &qh, b, &e) {
+                    self.counters.menu_commits += 1;
+                }
+                self.menu = Some(m);
+            }
+            return;
+        }
+        if l != &self.layer {
+            return;
+        }
         if !self.configured {
             // scale 此刻通常还没到（`preferred_scale` 在第一次 dispatch 之后），所以不打这里
             eprintln!(
@@ -1165,10 +1583,13 @@ impl SeatHandler for App {
         if capability == Capability::Pointer {
             self.pointer = None;
             self.raw_pointer = None;
-            // 指针能力没了（热插拔/_seat 被移除）同样等不到 Release ⇒ 结束拖拽
+            // 指针能力没了（热插拔 / 别的客户端 grab / 锁屏）同样等不到 Release ⇒ 结束拖拽
             if self.drag {
                 self.on_release(conn);
             }
+            // **菜单连带丢掉**：它整块 input region 都吃点击，而没有指针就再也点不到
+            // CLOSE —— 留着一块永久吞点击的不透明方块，正是 M4 那条 P0 的同一个形状。
+            self.close_menu();
         }
     }
 
@@ -1184,7 +1605,25 @@ impl PointerHandler for App {
         events: &[SeatPointerEvent],
     ) {
         for e in events {
-            if &e.surface != self.layer.wl_surface() {
+            // 三路分流：菜单 / 宠物 / 别的 surface（光标那块的事件也在这里被丢掉）
+            let on_menu = self.menu.as_ref().is_some_and(|m| m.surface == e.surface);
+            if !on_menu && e.surface != *self.layer.wl_surface() {
+                continue;
+            }
+            if on_menu {
+                let local = (e.position.0 as f32, e.position.1 as f32);
+                match e.kind {
+                    PointerEventKind::Enter { .. } => self.set_cursor(conn),
+                    PointerEventKind::Press { button, .. } => {
+                        if menu::button_from_raw(button).is_some() {
+                            self.on_menu_press(local);
+                        }
+                    }
+                    // 菜单被点完可能当场关闭（CLOSE 项）⇒ Leave/Release 拿不到那块 surface，
+                    // 这里只用来收尾光标，不参与状态机。
+                    PointerEventKind::Motion { .. } | PointerEventKind::Leave { .. } => {}
+                    PointerEventKind::Release { .. } | PointerEventKind::Axis { .. } => {}
+                }
                 continue;
             }
             let local = Vec2::new(e.position.0 as f32, e.position.1 as f32);
@@ -1208,8 +1647,12 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
-                    if button == BTN_LEFT {
-                        self.on_press(conn);
+                    // 左键 = 拖拽/双击（原逻辑），右键 = 开/关菜单，中键 = 忽略。
+                    // 右键**不进** `last_press` 计时，否则"右键两下"会被认成双击宠物。
+                    match menu::pet_press_disposition(button) {
+                        menu::PetPressAction::StartDragOrDoubleTap => self.on_press(conn),
+                        menu::PetPressAction::ToggleMenu => self.toggle_menu(),
+                        menu::PetPressAction::Ignore => {}
                     }
                 }
                 PointerEventKind::Release { button, .. } => {
