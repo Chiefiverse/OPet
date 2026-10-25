@@ -17,10 +17,26 @@ pub struct OverlayConfig {
     pub wants_passthrough: bool,
 }
 
+/// 指针按键。跨平台契约：Win32/macOS/Wayland 的后端实现都要能把原始按键折成这三档，
+/// 其余侧键/扩展键一律不上报（折成"无事发生"，别让契约长出一个映射不完的整数域）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PointerEvent {
-    Press { at: crate::geom::Vec2 },
-    Release { at: crate::geom::Vec2 },
+    Press {
+        at: crate::geom::Vec2,
+        button: Button,
+    },
+    Release {
+        at: crate::geom::Vec2,
+        button: Button,
+    },
+    /// 派生手势：双击只对左键判定（右键的"开/关菜单"翻转不需要计时），所以不带 button。
     DoubleTap { at: crate::geom::Vec2 },
 }
 

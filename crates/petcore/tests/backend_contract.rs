@@ -4,7 +4,7 @@
 use petcore::assets::Manifest;
 use petcore::behavior::{BehaviorConfig, Command, EnabledActions, State};
 use petcore::geom::Vec2;
-use petcore::render::{NullBackend, OverlayBackend, OverlayConfig};
+use petcore::render::{Button, NullBackend, OverlayBackend, OverlayConfig, PointerEvent};
 use petcore::sim::{Sim, TICK_HZ};
 use petcore::world::World;
 
@@ -47,6 +47,51 @@ fn pointer_hits_the_pet_but_not_the_surface_margin() {
     );
     let above = Vec2::new(intent.anchor.x, intent.anchor.y - 200.0);
     assert!(!intent.hit_test_world(above), "宠物头顶上方不应命中");
+}
+
+/// M3-b：按钮维度必须能穿过契约。三个平台后端各自有原始按键码
+/// （Wayland `wl_pointer.button` 0x110/0x111/0x112、Win32 `MK_*`、macOS `NSEvent number`），
+/// 折成同一枚举后不得丢失 —— 丢了就回到"左右键分不开"那个阻塞点上。
+/// `DoubleTap` 是客户端派生的左键专属手势，不带 button 字段（右键菜单靠它自己的
+/// Press/Release 翻转，不需要计时）。
+#[test]
+fn pointer_events_carry_the_button_through_the_contract() {
+    let at = Vec2::new(10.0, 20.0);
+    for b in [Button::Left, Button::Right, Button::Middle] {
+        assert_eq!(
+            PointerEvent::Press { at, button: b },
+            PointerEvent::Press { at, button: b }
+        );
+        let ev = PointerEvent::Release { at, button: b };
+        match ev {
+            PointerEvent::Release { button, .. } => assert_eq!(button, b),
+            _ => unreachable!("构造即匹配：Release 必须原样带出按钮"),
+        }
+    }
+    let p = PointerEvent::Press {
+        at,
+        button: Button::Left,
+    };
+    assert_ne!(
+        p,
+        PointerEvent::Press {
+            at,
+            button: Button::Right
+        },
+        "左键与右键事件必须可比但不相等"
+    );
+    assert_eq!(
+        p,
+        PointerEvent::Press {
+            at,
+            button: Button::Left
+        }
+    );
+    let dt = PointerEvent::DoubleTap { at };
+    assert!(
+        matches!(dt, PointerEvent::DoubleTap { .. }),
+        "DoubleTap 是派生手势，不应携带按钮"
+    );
 }
 
 /// 硬约束 5：Sleep 期间不再提交新 buffer，但 tick 照常推进。

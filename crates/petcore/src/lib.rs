@@ -39,7 +39,9 @@ pub use behavior::{
 pub use geom::{Facing, Rect, Vec2};
 pub use intent::{InputRegion, PresentationIntent};
 pub use physics::Body;
-pub use render::{BackendError, BackendResult, OverlayBackend, OverlayConfig, PointerEvent};
+pub use render::{
+    BackendError, BackendResult, Button, OverlayBackend, OverlayConfig, PointerEvent,
+};
 pub use rng::Rng;
 pub use sim::{DT, Sim, SimStats, TICK_HZ};
 pub use world::{Monitor, Platform, PlatformSpec, Support, World, WorldEvent};
