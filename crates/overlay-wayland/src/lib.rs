@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod atlas;
+pub mod card;
 pub mod cli;
 pub mod font;
 pub mod menu;

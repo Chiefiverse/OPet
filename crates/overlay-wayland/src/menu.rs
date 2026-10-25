@@ -49,8 +49,20 @@ impl ItemRect {
 }
 
 /// 卡片尺寸（logical px）。取菜单态与结果卡两者的最大需求，动画期不重建 surface。
-pub const CARD_W: i32 = 180;
+///
+/// 宽度由**排版契约**定，不是拍的：结果卡一行最宽的形状是 `"{rarity} {item_id} NEW"`
+/// （实测形如 `SSR cat_shiro_01 NEW` = 19 字符），而字号必须是"逻辑 2 px/字模像素"
+/// 才在 96 px 宠物旁边读得清（见 [`TEXT_PX`]）。`2*PAD + 18*STEP*TEXT_PX = 232 ≤ CARD_W`
+/// 这条算术由 `report_budget_fits_the_card` 钉住。
+/// ⚠️ 上一版这里写的是 180 + 20 字符，证明用的是"物理 scale 2"，也就是**只在 1.5× 屏上**
+/// 成立（270 物理像素刚好够）；换到 1× 屏就是 240 > 180 直接切字。排版预算必须和显示器
+/// 缩放无关，否则门禁绿着、字却被裁了 —— 又是"看起来对、其实说谎"那一族。
+pub const CARD_W: i32 = 240;
 pub const CARD_H: i32 = 150;
+
+/// 字号：**逻辑**像素/字模像素。`draw` 层乘上生效缩放得到物理字号 ⇒ 同一份排版
+/// 在 1× 和 1.5× 上占的 logical 宽度一模一样，预算也就只需要证一次。
+pub const TEXT_PX: i32 = 2;
 
 /// 行几何：左右留边 8，顶部信息行占 22，行高 26，**行步进 30**（26 高 + 4 缝）。
 /// 步进必须大于行高，否则相邻行矩形相交 ⇒ `hit_test` 的"缝隙不命中"与"两处重叠"全塌。
@@ -375,7 +387,7 @@ pub fn best_rarity(counts: &[u32; 4]) -> Option<Rarity> {
 /// 结果卡排版预算。十连全列 = 13 行，卡片（180×150 logical、字模 scale 2 一行约 21 字符）
 /// 装不下，`font` 的逐点裁剪又会把词切一半 ⇒ **行数和行宽必须在拼行时就定死**，
 /// 而不是留给渲染层兜底。这三条常量是 draw 层的排版契约。
-pub const MAX_LINE_CHARS: usize = 20;
+pub const MAX_LINE_CHARS: usize = 18;
 /// 结果卡最多 7 行：`标题 + 档位计数 + TOP_ITEMS 明细 + MORE + 碎片 + DRYRUN`。
 /// 与 [`LINE_STEP`] 一起构成"卡片装得下"的算术证明（见测试 `report_budget_fits_the_card`）。
 pub const MAX_REPORT_LINES: usize = 7;
@@ -720,13 +732,18 @@ mod tests {
             "结果卡装不下 {} 行",
             MAX_REPORT_LINES
         );
-        // 1.5× ⇒ 缓冲 270 物理像素宽；字模 scale 2 ⇒ 20 字符 = 240 物理像素；
-        // 左右各 PAD(8 logical)×1.5 = 12 物理像素 ⇒ 264 ≤ 270，只差 6 px，所以这条必须钉住。
-        let buf_w = CARD_W * 3 / 2;
-        let text_w = MAX_LINE_CHARS as i32 * crate::font::STEP * 2;
+        // 行宽预算：全用 **logical** 口径（字号 [`TEXT_PX`] 也是 logical），所以这条证明
+        // 与显示器缩放无关 —— 物理像素只是同步乘 scale，不存在"1.5× 才够宽"。
+        let text_w = MAX_LINE_CHARS as i32 * crate::font::STEP * TEXT_PX;
         assert!(
-            text_w + 2 * (PAD * 3 / 2) <= buf_w,
-            "20 字符在 scale 2 下要 {text_w} 物理像素，卡片只有 {buf_w}"
+            2 * PAD + text_w <= CARD_W,
+            "{MAX_LINE_CHARS} 字符在字号 {TEXT_PX} 下要 {} logical 像素，卡片只有 {CARD_W}",
+            2 * PAD + text_w
+        );
+        assert_eq!(
+            2 * PAD + text_w,
+            232,
+            "排版预算算的是这个数，改了常量要看得见"
         );
     }
 
@@ -792,13 +809,16 @@ mod tests {
 
     #[test]
     fn fit_truncates_by_chars_not_bytes() {
-        assert_eq!(fit("0123456789012345678"), "0123456789012345678");
-        assert_eq!(fit("01234567890123456789"), "01234567890123456789");
-        let long = fit("012345678901234567890123456789");
+        // 字符串按预算生成而不是写死长度：卡片宽度是个会被排版契约改动的量，写死的
+        // "19 个字符"下次改常量就变成假失败（失败得没错但原因离谱）。
+        let digits =
+            |n: usize| -> String { (0..n).map(|i| (b'0' + (i % 10) as u8) as char).collect() };
+        assert_eq!(fit(&digits(MAX_LINE_CHARS)), digits(MAX_LINE_CHARS));
+        let long = fit(&digits(MAX_LINE_CHARS + 6));
         assert_eq!(long.chars().count(), MAX_LINE_CHARS);
         assert!(long.ends_with('.'), "截断要留下可见痕迹");
         // 非 ASCII 按 char 切，绝不切在字节中间（`is_char_boundary` 恒真）。
-        let cjk = fit("啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊啊");
+        let cjk = fit(&"啊".repeat(MAX_LINE_CHARS + 5));
         assert!(cjk.is_char_boundary(cjk.len()) && cjk.chars().count() == MAX_LINE_CHARS);
     }
 }

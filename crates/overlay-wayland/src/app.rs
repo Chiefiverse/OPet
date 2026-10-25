@@ -65,6 +65,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::atlas::Atlas;
+use crate::card;
 use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
 use crate::region::{CellRect, Regions};
 
@@ -209,6 +210,9 @@ pub struct App {
     last_press: Option<(Instant, Vec2)>,
     /// 世界坐标下的指针位置
     pointer_world: Vec2,
+    /// `--db` 没给 ⇒ 菜单与结果卡一律打 DRYRUN 标，且**不产生任何文件**。
+    /// 从 `Options.db` 一次定死（每进程恒定，所以 `content_sig` 不含它也够精确）。
+    dry_run: bool,
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -283,6 +287,8 @@ pub fn run(opts: Options) -> Result<(), String> {
     let initial = phys.0 as usize * phys.1 as usize * 4 * 3;
     let pool = SlotPool::new(initial, &shm).map_err(|e| format!("shm 池建不起来: {e}"))?;
 
+    // `--db` 没给 ⇒ 演示模式（不建文件、UI 打 DRYRUN 标）。在 `opts` 被搬进 App 之前取出来。
+    let dry_run = opts.db.is_none();
     let mut app = App {
         conn,
         registry_state: RegistryState::new(&globals),
@@ -327,6 +333,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         configured: false,
         drag: false,
         grab_offset: Vec2::ZERO,
+        dry_run,
         last_press: None,
         pointer_world: Vec2::ZERO,
     };
@@ -674,6 +681,10 @@ impl MenuState {
         self.viewport.is_some()
     }
 
+    fn scale_f(&self) -> f32 {
+        scale_of(self.scale_num, self.has_viewport())
+    }
+
     fn to_phys(&self, logical: f32) -> i32 {
         to_phys_of(logical, self.scale_num, self.has_viewport())
     }
@@ -744,6 +755,7 @@ impl MenuState {
         compositor: &CompositorState,
         qh: &QueueHandle<App>,
         balance: i64,
+        dry_run: bool,
         error: &str,
     ) -> bool {
         if !self.configured || self.frame_pending {
@@ -756,6 +768,8 @@ impl MenuState {
         let bw = self.to_phys(self.logical.0 as f32).max(1);
         let bh = self.to_phys(self.logical.1 as f32).max(1);
         let stride = bw * 4;
+        // `scale_f` 先取：下面 `self.pool` 是可变借用，同一个表达式里不能再不可变借 self
+        let scale = self.scale_f();
         let created = self
             .pool
             .create_buffer(bw, bh, stride, wl_shm::Format::Argb8888);
@@ -766,12 +780,21 @@ impl MenuState {
                 return false;
             }
         };
-        // Step 3 先只验"能不能映射 + 落点对不对"：整卡不透明深灰。
-        // 文字/扩散/结果卡在 draw_menu 那一步替掉这里的填充。
-        // 卡片色 0x1B1E23（RRGGBB）⇒ `wl_shm` 的 Argb8888 是小端 B,G,R,A，且不透明 ⇒ 预乘不变。
-        for px in canvas.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0x23, 0x1E, 0x1B, 0xFF]);
-        }
+        // 像素全在 `card.rs`（纯函数，headless 能出图给人看）。这里的 `self.anim` 已经
+        // 由 `step()` 推进过，签名相同 ⇒ 上面就早退了，静止的菜单一帧都不投。
+        card::paint(
+            &mut canvas[..],
+            bw,
+            bh,
+            stride as usize,
+            &self.anim,
+            card::Ctx {
+                balance,
+                dry_run,
+                error,
+                scale,
+            },
+        );
         // 句柄克隆（不是对象克隆）：下面的 `self.arm()` 要可变借 self，不能同时留引用
         let surface = self.surface.clone();
         if let Some(s) = self.buffer_scale() {
@@ -924,7 +947,7 @@ impl App {
         }
         m.step();
         let qh = self.qh();
-        if m.draw(&self.compositor, &qh, balance, &error) {
+        if m.draw(&self.compositor, &qh, balance, self.dry_run, &error) {
             self.counters.menu_commits += 1;
         }
         self.menu = Some(m);
@@ -1399,7 +1422,7 @@ impl CompositorHandler for App {
                 if m.force_draw {
                     let qh = self.qh();
                     let (b, e) = (self.menu_balance(), self.menu_error_line());
-                    if m.draw(&self.compositor, &qh, b, &e) {
+                    if m.draw(&self.compositor, &qh, b, self.dry_run, &e) {
                         self.counters.menu_commits += 1;
                     }
                 }
@@ -1505,7 +1528,7 @@ impl LayerShellHandler for App {
                 m.clear_wait();
                 let qh = self.qh();
                 let (b, e) = (self.menu_balance(), self.menu_error_line());
-                if m.draw(&self.compositor, &qh, b, &e) {
+                if m.draw(&self.compositor, &qh, b, self.dry_run, &e) {
                     self.counters.menu_commits += 1;
                 }
                 self.menu = Some(m);
