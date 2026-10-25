@@ -21,6 +21,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 getrandom = "0.3"
 
 petcore = { path = "crates/petcore" }
+petstore = { path = "crates/petstore" }
 overlay-wayland = { path = "crates/overlay-wayland" }
 
 [profile.release]

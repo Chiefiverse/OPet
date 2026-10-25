@@ -1,6 +1,9 @@
 //! `opet` 命令行入口。M1 = headless 模拟与吞吐基准；
+//! M3 起加 `gacha-sim`/`catalog`/`pull`/`redeem`/`audit`（盲盒引擎与存档，见 [`gacha_cmd`]）；
 //! M4 起加 `overlay`（Wayland 宠物客户端，与 `opet-overlay-wayland` 共用参数口径）。
 //! IPC/资产子命令在 M3 之后补（§10.2）。
+
+mod gacha_cmd;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -22,6 +25,18 @@ M1 可用：
   opet sim table
       打印 §3.3 迁移表的 Markdown（改状态机后用它回写设计书）
 
+M3 可用（headless，完整参数：`opet gacha-sim --usage`）：
+  opet gacha-sim [--pulls N] [--seed S] [--seeds K]
+      100 万次抽样的概率门禁（实测 vs 公示，末行 GATE … result=PASS/FAIL）
+  opet catalog rates|validate
+      生成/校验概率公示与抽取目录（公示由引擎推导，不是手写的字符串）
+  opet pull --count N [--dry-run]
+      抽取并落账本；--dry-run 走内存库，不写盘不扣币
+  opet redeem --item ID
+      碎片商店自选 SSR（不掷骰 ⇒ 不进审计链）
+  opet audit verify|export
+      审计链校验与导出（第三方只需导出文件 + seed + 公示参数）
+
 M4 可用（完整参数：`opet overlay --help`）：
   opet overlay --probe
       只读打印 Wayland registry 与显示器几何，不映射任何 surface
@@ -38,8 +53,12 @@ M4 可用（完整参数：`opet overlay --help`）：
 /// M1 门槛：每秒至少这么多 tick。
 const TICK_RATE_GATE: f64 = 1_000_000.0;
 
+/// M3 的子命令名。放在这里而不是 `gacha_cmd` 里，是因为**路由**发生在 `main`；
+/// 两处共用这一张表，就不会出现"加了一个命令但忘了进 usage"。
+const GACHA_CMDS: [&str; 5] = ["gacha-sim", "catalog", "pull", "redeem", "audit"];
+
 #[derive(Debug)]
-struct Opts {
+pub struct Opts {
     hours: f32,
     ticks: Option<u64>,
     seed: u64,
@@ -63,14 +82,25 @@ impl Default for Opts {
     }
 }
 
-fn num(args: &[String], i: &mut usize, name: &str) -> Result<f64, String> {
+pub(crate) fn num(args: &[String], i: &mut usize, name: &str) -> Result<f64, String> {
     *i += 1;
     let raw = args.get(*i).ok_or_else(|| format!("{name} 缺少参数值"))?;
     raw.parse::<f64>()
         .map_err(|e| format!("{name} 不是数字: {e}"))
 }
 
-fn word(args: &[String], i: &mut usize, name: &str) -> Result<String, String> {
+/// 整数选项专用：**不能走 [`num`]**。f64 只有 53 位有效位，而 seed 是 u64
+/// （实测 `7377030585196009423` 经 f64 变成 `…472`），用浮点接它会让
+/// `audit verify --file … --seed …` 重放出另一个哈希 ⇒ 好账本被验成"骰子被动过"。
+pub(crate) fn ints(args: &[String], i: &mut usize, name: &str) -> Result<u64, String> {
+    *i += 1;
+    let raw = args.get(*i).ok_or_else(|| format!("{name} 缺少参数值"))?;
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|e| format!("{name} 不是非负整数: {e}"))
+}
+
+pub(crate) fn word(args: &[String], i: &mut usize, name: &str) -> Result<String, String> {
     *i += 1;
     args.get(*i)
         .cloned()
@@ -85,8 +115,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--hours" => o.hours = num(args, &mut i, "--hours")? as f32,
             "--width" => o.width = num(args, &mut i, "--width")? as f32,
             "--height" => o.height = num(args, &mut i, "--height")? as f32,
-            "--seed" => o.seed = num(args, &mut i, "--seed")? as u64,
-            "--ticks" => o.ticks = Some(num(args, &mut i, "--ticks")? as u64),
+            "--seed" => o.seed = ints(args, &mut i, "--seed")?,
+            "--ticks" => o.ticks = Some(ints(args, &mut i, "--ticks")?),
             "--monitor" => o.monitor = word(args, &mut i, "--monitor")?,
             "--manifest" => o.manifest = Some(PathBuf::from(word(args, &mut i, "--manifest")?)),
             other => return Err(format!("未知选项: {other}")),
@@ -196,9 +226,19 @@ fn overlay(args: &[String]) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // overlay 的退出码自成一套，不进下面的 Ok/Err 通道
+    // overlay 与 M3 的退出码自成一套，不进下面的 Ok/Err 通道：
+    // 它们的"非零"是**门禁判红**（已经打过 k=v 了），不该再附一坨 usage。
     if args.first().map(String::as_str) == Some("overlay") {
         return overlay(&args[1..]);
+    }
+    if let Some(cmd) = args.first().map(String::as_str) {
+        if GACHA_CMDS.contains(&cmd) {
+            if args.get(1).map(String::as_str) == Some("--usage") {
+                print!("{}", gacha_cmd::USAGE);
+                return ExitCode::SUCCESS;
+            }
+            return gacha_cmd::dispatch(&args);
+        }
     }
     let result = match args.first().map(String::as_str) {
         Some("sim") => {

@@ -12,5 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 petcore = { workspace = true }
+# M3：抽取落账本与审计导出需要 IO 层（`petcore` 本身不碰磁盘，见 D13）
+petstore = { workspace = true }
 # `opet overlay` 复用 Wayland 客户端的解析与运行环（同一份参数口径）
 overlay-wayland = { workspace = true }
