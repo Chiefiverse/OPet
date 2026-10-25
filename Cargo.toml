@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/petcore", "crates/overlay-wayland", "crates/opet-cli"]
+members = ["crates/petcore", "crates/overlay-wayland", "crates/petstore", "crates/opet-cli"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,18 @@
+[package]
+name = "petstore"
+description = "OPet 存档层：SQLite schema、账本、墙钟、内容包权益（petcore 的 IO 外门）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+petcore = { workspace = true }
+rusqlite = { workspace = true }
+getrandom = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
