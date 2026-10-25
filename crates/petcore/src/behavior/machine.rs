@@ -214,7 +214,7 @@ impl BehaviorMachine {
             }
             Command::DragMove { to } => {
                 if self.state == State::Dragged {
-                    body.drag_to(to, dt);
+                    body.drag_to(world, to, dt);
                 }
                 true
             }

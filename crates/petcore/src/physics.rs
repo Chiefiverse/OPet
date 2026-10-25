@@ -119,11 +119,21 @@ impl Body {
         self.vel = Vec2::ZERO;
     }
 
-    /// 指针移动：位置直接跟手，同时估计抛出速度（低通，避免单帧抖动把宠物弹飞）。
-    pub fn drag_to(&mut self, pos: Vec2, dt: f32) {
+    /// 指针移动：位置跟手，但**裁剪进舞台**（屏幕坐标 y 向下为正，地面 = 舞台底边），
+    /// 同时估计抛出速度（低通，避免单帧抖动把宠物弹飞）。
+    ///
+    /// 裁剪不是"防呆"而是必需的：宠物正常站立时脚**就在地面线上**，所以指针只要往下
+    /// 动一点，未裁剪的目标就到了地面以下 —— 而 [`World::landing`] 只拦"从地面上方
+    /// 穿过地面"，一旦到了下面就来不回来，表现就是"一按左键宠物掉出屏幕、再也不出现"
+    /// （2026-10-25 真机手测报出来的缺陷）。
+    pub fn drag_to(&mut self, world: &World, pos: Vec2, dt: f32) {
         if self.motion != Motion::Dragged || dt <= 0.0 {
             return;
         }
+        let pos = Vec2::new(
+            world.clamp_x(pos.x, self.half_width),
+            pos.y.clamp(world.ceiling_y(), world.ground_y()),
+        );
         let inst = Vec2::new((pos.x - self.pos.x) / dt, (pos.y - self.pos.y) / dt);
         const ALPHA: f32 = 0.4;
         self.vel = Vec2::new(
@@ -252,6 +262,23 @@ impl Body {
         if self.pos.y < world.ceiling_y() && self.vel.y < 0.0 {
             self.pos.y = world.ceiling_y();
             self.vel.y = 0.0;
+        }
+
+        // 兜底（地面侧，与上面那条对称）：位置已经在地面以下时 `landing()` 的
+        // "从上方穿过"条件永远不成立 ⇒ 无限下坠、宠物永久消失。当场接住并当作落地，
+        // 让状态机照走 Land。触发途径不止拖拽：显示器几何变小后 `snap_to_stage` 在
+        // 非 Grounded 时是早退的。
+        if self.pos.y > world.ground_y() && self.vel.y >= 0.0 {
+            let impact = self.vel.y;
+            self.pos.y = world.ground_y();
+            self.vel.y = 0.0;
+            self.support = Some(Support::Ground);
+            self.motion = Motion::Grounded;
+            self.last_impact = impact;
+            out.landed = Some(Landing {
+                support: Support::Ground,
+                impact_speed: impact,
+            });
         }
     }
 
@@ -433,19 +460,59 @@ mod tests {
         assert_eq!(b.motion, Motion::Airborne);
     }
 
+    /// 真机报出来的缺陷（2026-10-25 用户手测）：**左键一按宠物就掉出屏幕、再也不回来**。
+    /// 根因是拖拽把位置**直接跟手、不做任何舞台裁剪**，而正常站立时脚就在地面线上
+    /// （地面 = 显示器底边），所以指针只要往下动一点，宠物就到了地面以下。
+    #[test]
+    fn a_drag_can_not_move_the_pet_outside_the_stage() {
+        let w = world();
+        let mut b = Body::new(Vec2::new(500.0, w.ground_y()), 16.0);
+        b.begin_drag();
+        b.drag_to(&w, Vec2::new(500.0, w.ground_y() + 300.0), DT);
+        assert_eq!(
+            b.pos.y,
+            w.ground_y(),
+            "往地面以下拖 ⇒ 必须钉在舞台上，否则宠物就丢了"
+        );
+        b.drag_to(&w, Vec2::new(99_999.0, 300.0), DT);
+        assert_eq!(b.pos.x, w.right_wall() - b.half_width, "往墙外拖同理");
+    }
+
+    /// 第二个洞，独立于拖拽：`landing()` 只拦"从地面上方穿过地面"，一旦位置已经在地面
+    /// 以下（上面那个洞、或显示器几何变小后 `snap_to_stage` 在非 Grounded 时早退），
+    /// 之后就再也条件不成立 ⇒ 无限下坠，宠物永久消失。
+    #[test]
+    fn a_pet_below_the_floor_gets_caught_instead_of_falling_forever() {
+        let w = world();
+        let mut b = Body::new(Vec2::new(500.0, w.ground_y() + 100.0), 16.0);
+        b.motion = Motion::Airborne;
+        b.support = None;
+        let mut caught = None;
+        for i in 0..600 {
+            let o = b.step(DT, &w);
+            if o.landed.is_some() {
+                caught = Some(i);
+                break;
+            }
+        }
+        assert!(caught.is_some(), "在地面以下也必须被接住，不能一直掉");
+        assert_eq!(b.pos.y, w.ground_y());
+        assert_eq!(b.motion, Motion::Grounded);
+    }
+
     #[test]
     fn drag_velocity_estimate_is_smoothed() {
+        let w = world();
         let mut b = Body::new(Vec2::new(0.0, 0.0), 16.0);
         b.begin_drag();
         // 每帧往右下拖 10px ⇒ 瞬时速度约 (600, 600)
         for i in 1..12 {
-            b.drag_to(Vec2::new(i as f32 * 10.0, i as f32 * 10.0), DT);
+            b.drag_to(&w, Vec2::new(i as f32 * 10.0, i as f32 * 10.0), DT);
         }
         let v = b.end_drag();
         assert!(v.x > 300.0 && v.x < 620.0, "估计速度 {:?}", v.x);
         assert_eq!(b.vel, v);
     }
-
     #[test]
     fn standing_still_never_drifts_over_8_hours() {
         let w = world();
