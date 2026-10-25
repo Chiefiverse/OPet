@@ -75,8 +75,7 @@ use crate::region::{CellRect, Regions};
 const SCALE_UNIT: u32 = 120;
 /// 单轮事件循环最多补几个 tick（合盖/高负载回来后追帧会一次性提交一串 buffer）。
 const MAX_CATCHUP: u32 = 3;
-/// `BTN_LEFT`
-const BTN_LEFT: u32 = 0x110;
+// 按键码只在 `menu::BTN_*` 一处定义（外部 ABI，两处就会漂移）。
 const DOUBLE_TAP_GAP: Duration = Duration::from_millis(320);
 const DOUBLE_TAP_RADIUS: f32 = 24.0;
 
@@ -1806,7 +1805,7 @@ impl PointerHandler for App {
                 match e.kind {
                     PointerEventKind::Enter { .. } => self.set_cursor(conn),
                     PointerEventKind::Press { button, .. } => {
-                        if menu::button_from_raw(button).is_some() {
+                        if menu::menu_press_activates(button) {
                             self.on_menu_press(local);
                         }
                     }
@@ -1847,7 +1846,7 @@ impl PointerHandler for App {
                     }
                 }
                 PointerEventKind::Release { button, .. } => {
-                    if button == BTN_LEFT {
+                    if button == menu::BTN_LEFT {
                         self.on_release(conn);
                     }
                 }

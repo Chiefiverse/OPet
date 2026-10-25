@@ -155,12 +155,21 @@ fn clamp(c: RectI, out: RectI) -> RectI {
     RectI::new(x, y, CARD_W, CARD_H)
 }
 
-/// 原始按键码 → 契约按钮（`BTN_LEFT/RIGHT/MIDDLE` = 0x110/0x111/0x112，其余键不上报）。
+/// `linux/input-event-codes.h` 的三个鼠标键。**顺序是 左→右→中**，不是"左中右"：
+/// `BTN_LEFT=0x110`、`BTN_RIGHT=0x111`、`BTN_MIDDLE=0x112`。
+/// 写成具名常量而不是把十六进制直接摊进 match，是因为本文件曾经把 0x111/0x112
+/// 对调过 —— 真机上表现为"右键打不开菜单"，而单测当时**全绿**（测试和实现抄了
+/// 同一份误解）。⇒ 键位这种外部 ABI 只能引用具名事实，不能凭印象排序。
+pub const BTN_LEFT: u32 = 0x110;
+pub const BTN_RIGHT: u32 = 0x111;
+pub const BTN_MIDDLE: u32 = 0x112;
+
+/// 原始按键码 → 契约按钮（其余键不上报）。
 pub fn button_from_raw(code: u32) -> Option<petcore::render::Button> {
     match code {
-        0x110 => Some(petcore::render::Button::Left),
-        0x111 => Some(petcore::render::Button::Middle),
-        0x112 => Some(petcore::render::Button::Right),
+        BTN_LEFT => Some(petcore::render::Button::Left),
+        BTN_RIGHT => Some(petcore::render::Button::Right),
+        BTN_MIDDLE => Some(petcore::render::Button::Middle),
         _ => None,
     }
 }
@@ -190,6 +199,12 @@ pub fn menu_toggle_for(button: u32, currently_open: bool) -> bool {
         PetPressAction::ToggleMenu => !currently_open,
         _ => currently_open,
     }
+}
+
+/// 菜单 surface 上，哪些键算"点项"。**只有左键**：右键在宠物那块是开关，落进菜单里
+/// 若也激活项，"想关掉菜单而点到 PULL 10"就会顺手抽一次；中键同理一律不理。
+pub fn menu_press_activates(button: u32) -> bool {
+    button == BTN_LEFT
 }
 
 /// 指针被取消（Leave / remove_capability）时是否要当场按 Release 收尾。
@@ -553,9 +568,9 @@ mod tests {
     #[test]
     fn only_right_button_toggles_the_menu() {
         for (code, want) in [
-            (0x110, false),
-            (0x111, false),
-            (0x112, true),
+            (BTN_LEFT, false),
+            (BTN_RIGHT, true),
+            (BTN_MIDDLE, false),
             (0x113, false),
         ] {
             assert_eq!(
@@ -564,22 +579,61 @@ mod tests {
                 "按键 {code:#x} 的翻转判定错了"
             );
         }
-        assert!(menu_toggle_for(0x112, false), "右键在关闭态 ⇒ 打开");
-        assert!(!menu_toggle_for(0x112, true), "右键在打开态 ⇒ 关闭");
-        assert!(!menu_toggle_for(0x110, false), "左键开拖拽，不碰菜单");
-        assert!(menu_toggle_for(0x110, true), "左键在菜单打开时也不关它");
+        assert!(menu_toggle_for(BTN_RIGHT, false), "右键在关闭态 ⇒ 打开");
+        assert!(
+            !menu_toggle_for(BTN_RIGHT, true),
+            "右键在打开态 ⇒ 翻转成关闭"
+        );
+        assert!(!menu_toggle_for(BTN_LEFT, false), "左键开拖拽，不碰菜单");
+        assert!(
+            menu_toggle_for(BTN_LEFT, true),
+            "左键在菜单打开时也不关它（返回值仍是打开）"
+        );
+    }
+
+    /// 键位是**外部 ABI**（`linux/input-event-codes.h`），不是可以自己排序的枚举。
+    /// 这条把三个码钉死成 左/右/中 = 0x110/0x111/0x112：曾经 0x111 与 0x112 被对调，
+    /// 真机的表现是"右键完全打不开菜单"，而当时两条测试**都是绿的**（抄了同一份误解）
+    /// ⇒ 光有测试不够，测试必须钉事实源本身。
+    #[test]
+    fn button_codes_match_the_linux_input_abi() {
+        assert_eq!(BTN_LEFT, 0x110);
+        assert_eq!(BTN_RIGHT, 0x111, "0x111 是右键，不是中键");
+        assert_eq!(BTN_MIDDLE, 0x112, "0x112 是中键，不是右键");
+        assert_eq!(button_from_raw(0x111), Some(petcore::render::Button::Right));
+        assert_eq!(
+            button_from_raw(0x112),
+            Some(petcore::render::Button::Middle)
+        );
     }
 
     #[test]
     fn button_mapping_covers_the_contract_and_rejects_extensions() {
-        assert_eq!(button_from_raw(0x110), Some(petcore::render::Button::Left));
         assert_eq!(
-            button_from_raw(0x111),
+            button_from_raw(BTN_LEFT),
+            Some(petcore::render::Button::Left)
+        );
+        assert_eq!(
+            button_from_raw(BTN_RIGHT),
+            Some(petcore::render::Button::Right)
+        );
+        assert_eq!(
+            button_from_raw(BTN_MIDDLE),
             Some(petcore::render::Button::Middle)
         );
-        assert_eq!(button_from_raw(0x112), Some(petcore::render::Button::Right));
         assert_eq!(button_from_raw(0x115), None, "侧键不该挤进契约");
         assert_eq!(button_from_raw(0), None);
+    }
+
+    #[test]
+    fn only_left_press_activates_a_menu_item() {
+        assert!(menu_press_activates(BTN_LEFT));
+        assert!(
+            !menu_press_activates(BTN_RIGHT),
+            "右键落进菜单不许顺手抽一次"
+        );
+        assert!(!menu_press_activates(BTN_MIDDLE));
+        assert!(!menu_press_activates(0x1FF));
     }
 
     #[test]
