@@ -6,5 +6,7 @@
 pub mod app;
 pub mod atlas;
 pub mod cli;
+pub mod font;
+pub mod menu;
 pub mod probe;
 pub mod region;
