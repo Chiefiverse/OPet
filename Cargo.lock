@@ -343,6 +343,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smithay-client-toolkit",
+ "tempfile",
  "wayland-client",
  "wayland-protocols",
 ]

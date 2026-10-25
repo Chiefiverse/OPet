@@ -28,3 +28,8 @@ smithay-client-toolkit = "0.19.2"
 [[bin]]
 name = "opet-overlay-wayland"
 path = "src/main.rs"
+
+[dev-dependencies]
+# 抽取层的测试要写真存档，但绝不能碰用户的 `~/.local/share/opet/opet.db`
+# （和 petstore 的写库测试同一个理由、同一个工具；这个 crate 已在依赖树里）。
+tempfile = "3"

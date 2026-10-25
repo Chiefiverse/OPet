@@ -14,10 +14,12 @@ use std::time::{Duration, Instant};
 use petcore::assets::Manifest;
 use petcore::behavior::config::BehaviorConfig;
 use petcore::behavior::machine::Command;
+use petcore::gacha::{Catalog, Currency, GachaParams, Rarity};
 use petcore::geom::{Rect, Vec2};
 use petcore::intent::{PresentationIntent, SURFACE_MARGIN};
 use petcore::sim::{Sim, TICK_HZ};
 use petcore::world::{Monitor, World, WorldEvent};
+use petstore::Store;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::delegate_compositor;
@@ -213,6 +215,89 @@ pub struct App {
     /// `--db` 没给 ⇒ 菜单与结果卡一律打 DRYRUN 标，且**不产生任何文件**。
     /// 从 `Options.db` 一次定死（每进程恒定，所以 `content_sig` 不含它也够精确）。
     dry_run: bool,
+    /// 抽取层，**lazy**：第一次右键才连库。rusqlite + WAL 一打开就把页缓存和语句缓存
+    /// 挂进进程，而常驻宠物的 VmHWM 门禁（M4 基线 15.7 MB）不该为"也许根本不抽"付这笔。
+    gacha: Option<Gacha>,
+    /// 连不上库 / 抽取失败的唯一出声处：画在菜单错误行上，**不 panic、不置 `exit`**
+    /// （硬约束 3 同族 —— UI 的故障不许波及宠物，更不许波及桌面）。
+    gacha_error: Option<String>,
+}
+
+/// 库与目录成对出现（`connect` 一起建、一起失败），所以没有"有库没目录"的中间态。
+///
+/// 这一层**不含任何 wayland 类型**（和 `menu.rs`/`card.rs` 同族约束）：好处不是整洁，
+/// 而是"落库这条路"能在 headless 里被测 —— 抽取的入口是鼠标，而我绝不注入点击。
+struct Gacha {
+    store: Store,
+    catalog: Catalog,
+}
+
+impl Gacha {
+    /// 连库 + 装目录。`None` = 内存库（一条文件都不产生，UI 全程打 DRYRUN 标）。
+    ///
+    /// 不做 canonicalize：它要求文件已存在，第一次运行必然失败，反而把"能建库"这条正路
+    /// 堵死。绝对路径的要求由 `Store::open` 自己把关（相对路径取决于 cwd，而宠物可能被
+    /// systemd user service 起），口径与 CLI 一致。
+    fn connect(db: Option<&str>) -> Result<Self, String> {
+        let mut store = match db {
+            None => Store::in_memory().map_err(|e| format!("内存库建不起来: {e}"))?,
+            Some(p) => {
+                Store::open(std::path::Path::new(p)).map_err(|e| format!("打不开存档 {p}: {e}"))?
+            }
+        };
+        let catalog = Catalog::default_v1().map_err(|e| format!("公示目录读不出来: {e}"))?;
+        store
+            .install_catalog(&catalog)
+            .map_err(|e| format!("装目录失败: {e}"))?;
+        Ok(Self { store, catalog })
+    }
+
+    /// 碎片余额。`u64 → i64` 只在天文数字上饱和 —— 宁可显示封顶，也不许把余额读成负数。
+    fn balance(&self) -> i64 {
+        self.store
+            .shards(Currency::Shards)
+            .ok()
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// 抽 `count` 次并落库，返回菜单要的三样：结果卡行、最高档、抽完的余额。
+    /// 错误只是一条给人看的字（进菜单错误行），调用方不许因为它而停环。
+    fn pull(&mut self, count: u32, dry_run: bool) -> Result<(Vec<String>, Rarity, i64), String> {
+        let report = self
+            .store
+            .pull_for(
+                &GachaParams::V1,
+                &self.catalog,
+                petstore::DEFAULT_BANNER,
+                petstore::DEFAULT_PROFILE,
+                count,
+            )
+            .map_err(|e| format!("PULL {count}: {e}"))?;
+        let items: Vec<(String, Rarity, bool)> = report
+            .outcomes
+            .iter()
+            .map(|o| (o.item_id.clone(), o.rarity, o.duplicate))
+            .collect();
+        let lines = menu::report_lines(
+            &report.counts,
+            &items,
+            u64::from(report.shards_gained),
+            dry_run,
+        );
+        let best = menu::best_rarity(&report.counts).unwrap_or(Rarity::N);
+        let balance = self.balance();
+        eprintln!(
+            "gacha: 抽 {count} ⇒ N={} R={} SR={} SSR={} 碎片 +{} 余额 {balance}（{}）",
+            report.counts[0],
+            report.counts[1],
+            report.counts[2],
+            report.counts[3],
+            report.shards_gained,
+            if dry_run { "DRYRUN" } else { "已落库" }
+        );
+        Ok((lines, best, balance))
+    }
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -334,6 +419,8 @@ pub fn run(opts: Options) -> Result<(), String> {
         drag: false,
         grab_offset: Vec2::ZERO,
         dry_run,
+        gacha: None,
+        gacha_error: None,
         last_press: None,
         pointer_world: Vec2::ZERO,
     };
@@ -667,6 +754,12 @@ struct MenuState {
     /// 布局表只算一次：`hit_test` 与 draw 共用同一份矩形
     items: Vec<ItemRect>,
     anim: MenuAnim,
+    /// 余额行。**只在事件上刷新**（开菜单时、每次抽取后），不每 tick 查库：
+    /// §4 的省电契约明写"事件驱动，禁止定时轮询"，而 60 Hz 一条 `SELECT` 正是轮询。
+    /// 代价是菜单开着时外部（CLI）的变动不会立刻反映 —— v1 没有 IPC，接受。
+    balance: i64,
+    /// 从 `App` 抄来的演示标（每进程恒定，不进 `content_sig` 也精确）
+    dry_run: bool,
     /// 上一次 commit 的内容签名 ⇒ 静止时"什么都不发"
     last_sig: Option<u64>,
     frame_pending: bool,
@@ -750,21 +843,16 @@ impl MenuState {
     }
 
     /// 出一帧卡片。返回是否真的 commit 了。
-    fn draw(
-        &mut self,
-        compositor: &CompositorState,
-        qh: &QueueHandle<App>,
-        balance: i64,
-        dry_run: bool,
-        error: &str,
-    ) -> bool {
+    fn draw(&mut self, compositor: &CompositorState, qh: &QueueHandle<App>, error: &str) -> bool {
         if !self.configured || self.frame_pending {
             return false;
         }
-        let sig = menu::content_sig(&self.anim, balance, error);
+        let sig = menu::content_sig(&self.anim, self.balance, error);
         if self.last_sig == Some(sig) && !self.force_draw {
             return false;
         }
+        let dry_run = self.dry_run;
+        let balance = self.balance;
         let bw = self.to_phys(self.logical.0 as f32).max(1);
         let bh = self.to_phys(self.logical.1 as f32).max(1);
         let stride = bw * 4;
@@ -865,6 +953,14 @@ impl App {
             to_phys_of(logical.0 as f32, scale_num, has_viewport).max(1),
             to_phys_of(logical.1 as f32, scale_num, has_viewport).max(1),
         );
+        // "打开菜单"就是一个事件：连库（第一次才真连）+ 查一次余额。
+        // 连不上也照样把菜单开出来 —— 错误行会说话，而打不开库绝不是宠物的死因。
+        let balance = if self.ensure_gacha() {
+            self.gacha_balance()
+        } else {
+            0
+        };
+        let dry_run = self.dry_run;
 
         let surface = self.compositor.create_surface(&qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -912,6 +1008,8 @@ impl App {
             logical,
             items: menu::layout(),
             anim: MenuAnim::Menu,
+            balance,
+            dry_run,
             last_sig: None,
             frame_pending: false,
             pending_since: None,
@@ -938,7 +1036,7 @@ impl App {
             return;
         }
         let scale_num = self.scale_num;
-        let (balance, error) = (self.menu_balance(), self.menu_error_line());
+        let error = self.menu_error_line();
         let mut m = self.menu.take().expect("上面查过 is_some");
         m.mirror_scale(scale_num);
         if m.tick_watchdog(now) {
@@ -947,7 +1045,7 @@ impl App {
         }
         m.step();
         let qh = self.qh();
-        if m.draw(&self.compositor, &qh, balance, self.dry_run, &error) {
+        if m.draw(&self.compositor, &qh, &error) {
             self.counters.menu_commits += 1;
         }
         self.menu = Some(m);
@@ -964,18 +1062,88 @@ impl App {
         };
         match item {
             menu::MenuItem::Close => self.close_menu(),
-            // 真抽取在下一步接：`MenuAnim` 还没东西可放时点它只会静默吞掉，不给假反馈
-            menu::MenuItem::Pull1 | menu::MenuItem::Pull10 => {}
+            menu::MenuItem::Pull1 => self.do_pull(1),
+            menu::MenuItem::Pull10 => self.do_pull(10),
         }
     }
 
-    /// 余额与错误行：Step 5 接 `petstore` 之前恒为 `(0, "")`。
-    fn menu_balance(&self) -> i64 {
-        0
+    /// 第一次用到才连库，之后复用同一条连接。返回"库是否可用"，调用方据此决定余额读不读。
+    ///
+    /// 失败**只写错误行**：菜单照样开得出、宠物照样跑（硬约束 3 同族 —— UI 的故障不许
+    /// 波及宠物，更不许波及桌面）。
+    fn ensure_gacha(&mut self) -> bool {
+        if self.gacha.is_some() {
+            return true;
+        }
+        match Gacha::connect(self.opts.db.as_deref()) {
+            Ok(g) => {
+                eprintln!(
+                    "gacha: 库已就绪（{}）",
+                    self.opts.db.as_deref().unwrap_or("内存库：不写盘")
+                );
+                self.gacha = Some(g);
+                self.gacha_error = None;
+                true
+            }
+            Err(msg) => {
+                self.gacha_bailed(msg);
+                false
+            }
+        }
     }
 
+    /// 抽取层唯一的出声处：stderr + 菜单错误行。**不 panic、不置 `exit`**。
+    fn gacha_bailed(&mut self, msg: String) {
+        eprintln!("gacha: {msg}");
+        self.gacha_error = Some(msg);
+    }
+
+    fn gacha_balance(&self) -> i64 {
+        self.gacha.as_ref().map(|g| g.balance()).unwrap_or(0)
+    }
+
+    /// 点"抽一次/十连"。同步抽完（单抽实测 0.61 ms、十连 0.85 ms，都在 16.6 ms 的 tick
+    /// 预算里），不值得为它引入一条线程和它的竞态。
+    ///
+    /// 宠物本体复用 `Command::DoubleTap`（3 帧 react 叠加动画）：M3-b 不加新 Command，
+    /// 碰 `machine.rs` 就是威胁状态指纹与 §3.3 的迁移表。DoubleTap 附带"着地且允许 run
+    /// 则起跑"的副作用，这是计划里明写接受的代价。
+    fn do_pull(&mut self, count: u32) {
+        if !self.ensure_gacha() {
+            return;
+        }
+        let dry_run = self.dry_run;
+        let pulled = match self.gacha.as_mut() {
+            Some(g) => g.pull(count, dry_run),
+            None => return,
+        };
+        let (lines, best, balance) = match pulled {
+            Ok(v) => {
+                self.gacha_error = None;
+                v
+            }
+            // 库被别的进程锁住、公示与库里对不上…… 都只出声，不停宠物
+            Err(msg) => {
+                self.gacha_bailed(msg);
+                return;
+            }
+        };
+        if let Some(m) = self.menu.as_mut() {
+            m.anim = MenuAnim::Burst {
+                rarity: best,
+                elapsed: 0,
+                lines,
+            };
+            m.balance = balance;
+        }
+        if let Some(sim) = self.sim.as_mut() {
+            sim.send(Command::DoubleTap);
+        }
+    }
+
+    /// 菜单的错误行（连不上库、抽取失败都靠它出声）。
     fn menu_error_line(&self) -> String {
-        String::new()
+        self.gacha_error.clone().unwrap_or_default()
     }
 }
 
@@ -1421,8 +1589,8 @@ impl CompositorHandler for App {
                 m.clear_wait();
                 if m.force_draw {
                     let qh = self.qh();
-                    let (b, e) = (self.menu_balance(), self.menu_error_line());
-                    if m.draw(&self.compositor, &qh, b, self.dry_run, &e) {
+                    let e = self.menu_error_line();
+                    if m.draw(&self.compositor, &qh, &e) {
                         self.counters.menu_commits += 1;
                     }
                 }
@@ -1527,8 +1695,8 @@ impl LayerShellHandler for App {
                 m.force_draw = true;
                 m.clear_wait();
                 let qh = self.qh();
-                let (b, e) = (self.menu_balance(), self.menu_error_line());
-                if m.draw(&self.compositor, &qh, b, self.dry_run, &e) {
+                let e = self.menu_error_line();
+                if m.draw(&self.compositor, &qh, &e) {
                     self.counters.menu_commits += 1;
                 }
                 self.menu = Some(m);
@@ -1820,3 +1988,88 @@ delegate_seat!(App);
 delegate_pointer!(App);
 delegate_layer!(App);
 delegate_registry!(App);
+
+// ───────────────────────────── 抽取层测试 ─────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 抽取层的入口是鼠标，而**我绝不注入点击**（三项人工门禁只有用户本人能判）。
+    /// 所以这一层的验收必须在 headless 里跑完：`Gacha` 不含任何 wayland 类型，
+    /// 下面测的就是"菜单按下去之后真正执行的那段代码"，不是它的替身。
+    #[test]
+    fn memory_store_pulls_and_stamps_the_demo_line() {
+        let mut g = Gacha::connect(None).expect("内存库该建得起来");
+        assert!(
+            g.store.path().is_none(),
+            "内存库必须连路径都没有 ⇒ 一条文件都不会产生"
+        );
+        let before = g.balance();
+        let (lines, _best, balance) = g.pull(10, true).expect("十连该成功");
+        assert!(lines[0].starts_with("10 PULLED"), "标题行得说出抽了几次");
+        assert!(
+            lines.iter().any(|l| l == "DRYRUN"),
+            "不带 `--db` 必须打演示标 —— 用户把演示当成落库是最坏的一种说谎"
+        );
+        assert!(
+            balance >= before,
+            "抽取只加碎片（v1 免费软通货，D2），余额倒退说明扣了不该扣的钱"
+        );
+    }
+
+    #[test]
+    fn real_archive_is_written_and_replays_the_chain() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("opet.db");
+        let mut g = Gacha::connect(path.to_str()).expect("--db 指向可写路径就该建库");
+        let (lines, _best, balance) = g.pull(10, false).expect("十连该成功");
+        assert!(
+            !lines.iter().any(|l| l == "DRYRUN"),
+            "真落库不许打演示标（否则用户不知道哪次真的写进了存档）"
+        );
+        // 换一条连接重开：只有磁盘上真有东西，才认得这 10 条、链才验得过
+        let reopened = Store::open(&path).expect("重开存档");
+        let catalog = Catalog::default_v1().unwrap();
+        let rep = reopened
+            .verify(
+                &catalog,
+                petstore::DEFAULT_PROFILE,
+                petstore::DEFAULT_BANNER,
+            )
+            .expect("账本该自洽");
+        assert_eq!(rep.len, 10, "落库条数");
+        assert_eq!(
+            balance,
+            i64::try_from(reopened.shards(Currency::Shards).unwrap()).unwrap(),
+            "菜单显示的余额必须就是库里那个数"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_before_anything_is_written() {
+        // 相对路径取决于 cwd，而宠物可能被 systemd user service 起 ⇒ 只能拒绝，不能猜。
+        let Err(err) = Gacha::connect(Some("opet_m3b_relative.db")) else {
+            panic!("相对路径该被拒绝");
+        };
+        assert!(err.contains("绝对路径"), "错误要读得懂: {err}");
+        assert!(
+            !std::path::Path::new("opet_m3b_relative.db").exists(),
+            "拒绝就该一个字都没写"
+        );
+    }
+
+    #[test]
+    fn an_unopenable_store_only_produces_a_line_of_text() {
+        // 父路径是个普通文件 ⇒ `create_dir_all` 必炸。这条测的是**失败的形状**：
+        // 返回 Err（调用方转成菜单错误行），而不是 panic（硬约束 3）。
+        let dir = tempfile::tempdir().expect("临时目录");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").expect("占位文件");
+        let bad = blocker.join("opet.db");
+        let Err(err) = Gacha::connect(bad.to_str()) else {
+            panic!("该建不起来");
+        };
+        assert!(err.starts_with("打不开存档"), "错误要带上是哪个路径: {err}");
+    }
+}
