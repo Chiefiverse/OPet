@@ -342,6 +342,7 @@ dependencies = [
  "petstore",
  "serde",
  "serde_json",
+ "sha2",
  "smithay-client-toolkit",
  "tempfile",
  "wayland-client",

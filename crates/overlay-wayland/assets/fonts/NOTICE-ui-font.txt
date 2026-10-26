@@ -1,0 +1,51 @@
+NOTICE — OPet UI 字体子集
+=========================
+
+产物：crates/overlay-wayland/assets/fonts/ui.otf
+  大小     35,316 B（34.5 KiB）
+  sha256   99ae9411f2d656bc2b82948c9466a45c1365927c70169d0d51cb2a87fc0182a1
+  家族名   OPet UI（name ID 1）／唯一标识 OPetUI-Regular（ID 6）
+  码位     237 个：ASCII 95 + 汉字 99 + 谚文 29 + 假名 12 + 标点 2（… U+2026、：U+FF1A）
+  轮廓     CFF（Type 2 charstring）—— 本机所有中文字体都是这个形状，栅格器必须能吃它
+
+来源（下面每一行都是 2026-10-26 用 `python3 tools/subset_font.py --name-report` 从字体
+name 表读出来的原文。**不是凭记忆写的** —— 上游打包的那份 LICENSE 是裸 OFL 正文、没有版权头，
+`fc-query` 读 ID 0/13 也是空，所以唯一依据是字体自己带的那张表）：
+  文件     /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc，face index 2 = "Noto Sans CJK SC" "Regular"
+           （这个 .ttc 有 10 个 face，**0 是 JP**；不显式给 index 会静默裁出日文默认字形）
+  文件摘要 sha256 b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a
+  ID 0     © 2014-2021 Adobe (http://www.adobe.com/).
+  ID 7     Noto is a trademark of Google Inc.
+  ID 8     Adobe
+  ID 9     Ryoko NISHIZUKA 西塚涼子 (kana, bopomofo & ideographs); Paul D. Hunt (Latin, Greek &
+           Cyrillic); Sandoll Communications 산돌커뮤니케이션, Soo-young JANG 장수영 & Joo-yeon KANG
+           강주연 (hangul elements, letters & syllables)
+  ID 11    http://www.google.com/get/noto/
+  ID 13    This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font
+           Software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+           KIND, either express or implied. See the SIL Open Font License for the specific language,
+           permissions and limitations governing your use of this Font Software.
+  ID 14    http://scripts.sil.org/OFL
+  上游包   Arch `noto-fonts-cjk 20240730-1`，其 /usr/share/licenses/noto-fonts-cjk/LICENSE 就是
+           同目录 LICENSE-ui-font.txt 的逐字节副本
+
+所做的修改（OFL 定义下的 Modified Version）：
+  1. 按同目录 ui-codepoints.txt 裁子集 —— **只删不改**：一个轮廓都没重画，也没加字。
+     那份清单由 `python3 tools/subset_font.py --emit-codes` 从**代码里的函数**生成（l10n 四 locale
+     的 `ui_strings()` ∪ 目录 30 个 `name`），不是人写的；`tests/font_assets.rs` 的两条相等门禁
+     保证"清单 = 会画上卡片的东西"，缺字（卡片静默画 `?`）和多余字（白占常驻内存）都会红。
+  2. 丢表 DSIG / BASE / GPOS / GSUB / VORG / vhea / vmtx，布局特性清空（UI 只用 hmtx 的 advance，
+     不做连字与字距）。
+  3. CFF 子程序展开（--desubroutinize），glyph 名不写进产物。
+  4. name 表 ID 0/1/2/3/4/6/8/13 重写：家族名改为 OPet UI ⇒ 满足 **OFL §3**（Modified Version
+     不得沿用 Reserved Font Name "Noto Sans CJK"）；ID 0 保留原版权行并加 derived 声明。
+  5. head.created / head.modified 钉成上游值 ⇒ 产物逐字节可重放。
+  重放与验证：`python3 tools/subset_font.py --verify`（重建到临时目录并逐字节比对入库产物）。
+  ⚠️ **换 fontTools 版本必然改变产物字节**（本机钉的是 4.64.0）⇒ 换版本后必须重跑全部内存门禁。
+
+许可证（OFL §5）：
+  这份字体（含本子集）**整体继续在 SIL Open Font License Version 1.1 下分发**，原文见同目录
+  LICENSE-ui-font.txt。仓库根的 `LICENSE` 是 OPet 代码的 AGPL-3.0-only（决策 D8），**不覆盖**
+  这个 .otf；反过来这份 OFL 也不改变代码的授权。随包带版权说明 + 许可证原文，满足 OFL §2。
+  OFL §4：本文件列出作者与贡献者是为了署名，不是用他们的名义为 OPet 背书。
+  OFL 不限制"用这份字体渲染出来的文档/图像"⇒ 卡片截图、出图产物不受这份许可证约束。
