@@ -19,6 +19,14 @@ sha2 = "=0.11.0"
 # `cargo tree -p petcore -e normal` 里出现任何一个就说明分层被破坏了。
 rusqlite = { version = "0.37", features = ["bundled"] }
 getrandom = "0.3"
+# 本项目**第一次**真加依赖（视觉重做 V2 / 设计书 §6.1.4 判据③的 (b) 路线）。
+# D8 allowlist 逐条核过，四个 crate 都读了 `~/.cargo/registry/src/**/LICENSE*` 原文，不是凭记忆：
+#   ab_glyph 0.2.32 = Apache-2.0 · ab_glyph_rasterizer 0.1.10 = Apache-2.0
+#   owned_ttf_parser 0.25.1 = Apache-2.0 · ttf-parser 0.25.1 = "MIT OR Apache-2.0"
+# 全部落在 allowlist（BSD/MIT/Apache-2.0/LGPL-3）内，**GPL-2-only 那个排除项一个都没沾**。
+# 钉死版本 + 关掉默认特性：① 字形栅格化结果**就是卡片像素**，换版本等于换 hinting ⇒ 出图过眼
+# 门禁要全部重跑；② 子集里没有 `gvar` 表，`variable-fonts`/`gvar-alloc` 用不上，多开只是多代码。
+ab_glyph = { version = "=0.2.32", default-features = false, features = ["std"] }
 
 petcore = { path = "crates/petcore" }
 petstore = { path = "crates/petstore" }

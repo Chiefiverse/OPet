@@ -24,6 +24,9 @@ wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 # §3.7 说"依赖 wayland-client + wayland-protocols"，sctk 就是这两个之上的纯 Rust 封装，
 # 不引入 GTK/Qt 运行时；用它换掉手写 memfd/mmap/cursor 三整块易错代码。
 smithay-client-toolkit = "0.19.2"
+# 视觉重做 V2 的文字层（§4.1）。**本项目第一次真加依赖** —— 版本/特性钉死、D8 许可证逐条
+# 读原文核过（四个 crate 全 Apache-2.0 或 MIT OR Apache-2.0），论证与理由都写在根 Cargo.toml。
+ab_glyph = { workspace = true }
 
 [[bin]]
 name = "opet-overlay-wayland"

@@ -5,11 +5,17 @@
 //!
 //! ⚠️ **改这里的任何一个非 ASCII 字面量，必须重跑 `python3 tools/subset_font.py` 重裁字体**，
 //! 否则卡片上那个字会静默画成缺字形 —— 像素计数断言抓不住"画了但读不出"（上一轮白字金底
-//! 就是同族）。两道测试替你记着这件事：`l10n_literals_are_in_the_codes_list`（清单）与
-//! `every_ui_string_is_in_the_font`（真 cmap）。
+//! 就是同族）。两道测试替你记着这件事，它们在 `tests/font_assets.rs`：
+//! `everything_the_ui_can_render_is_in_the_codes_list`（会渲染的 ⊆ 清单）与
+//! `codes_list_covers_nothing_unrendered`（清单 ⊆ 会渲染的）；再加上 `text.rs` 里
+//! `every_listed_codepoint_has_a_glyph_in_the_asset`（清单 ⊆ 真 cmap），三条把"清单 = 字体 = 上屏"夹死。
 //!
-//! 另一条硬规矩：**渲染层（`menu.rs`/`card.rs`）不许再写任何文案字面量**，只准从这里取
-//! （`no_literal_copy_outside_l10n` 钉着）。上一轮的教训是"排版口径散在三处"，文案同理。
+//! 另一条硬规矩：**渲染层（`menu.rs`/`card.rs`）不许再写任何文案字面量**，只准从这里取。
+//! 上一轮的教训是"排版口径散在三处"，文案同理。⚠️ 这条**目前没有自动化**：想扫源码里的
+//! 非 ASCII 字面量，会把 `"candidates 非空"` 这类**诊断消息**一起抓进来（它们永不上屏），
+//! 正则分不开"文案"和"消息"。兜得住的是**落笔时**查 cmap 的 [`crate::text::missing`] ——
+//! 它看的是到达画布的那串字，硬写的中文一旦真画上去就红，比任何源码扫描都准
+//! （`card.rs` 换成 `text::draw` 的那一步把它接上，本轮 C2 只有函数）。
 
 use petcore::gacha::Rarity;
 

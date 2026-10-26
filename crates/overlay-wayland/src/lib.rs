@@ -12,3 +12,4 @@ pub mod l10n;
 pub mod menu;
 pub mod probe;
 pub mod region;
+pub mod text;

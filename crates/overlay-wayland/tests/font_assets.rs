@@ -19,8 +19,10 @@
 //!   · `everything_the_ui_can_render_is_in_the_codes_list` —— 会渲染的 ⊆ 清单（缺字 = 卡片静默画 `?`）
 //!   · `codes_list_covers_nothing_unrendered` —— 清单 ⊆ 会渲染的（多字 = 白占内存 + 没人知道为什么）
 //! "什么会渲染"由**函数**给出（`Lang::ui_strings()` + 目录 `name`），不由人抄清单给出。
-//! 至于"`menu.rs` 里硬写了一句中文"这种形状，正解是 C2 的**落笔时**门禁（`text::missing()`
+//! 至于"`menu.rs` 里硬写了一句中文"这种形状，正解是**落笔时**的门禁（[`overlay_wayland::text::missing`]
 //! 对每个真的画上去的串查 cmap）—— 它看的是到达画布的内容，比任何源码正则都准。
+//! ⚠️ 那条门禁的**函数已经在了，接线在 `card.rs` 换成 `text::draw` 的那一步**；在它接上之前，
+//! 这三条等式（会渲染 ⊆ 清单、清单 ⊆ 会渲染、清单 ⊆ 真 cmap）就是全部防线。
 
 use std::collections::BTreeSet;
 
@@ -28,7 +30,6 @@ use overlay_wayland::l10n::Lang;
 use petcore::gacha::Catalog;
 
 const FONT: &[u8] = include_bytes!("../assets/fonts/ui.otf");
-const CODES: &str = include_str!("../assets/fonts/ui-codepoints.txt");
 const LICENSE: &str = include_str!("../assets/fonts/LICENSE-ui-font.txt");
 const NOTICE: &str = include_str!("../assets/fonts/NOTICE-ui-font.txt");
 
@@ -42,18 +43,13 @@ const FONT_BUDGET: usize = 320 * 1024;
 
 /// 码位清单：每行 `U+XXXX # 来源`。**唯一事实源**，Rust 侧不留第二份清单。
 ///
-/// ⚠️ 十六进制必须显式给基数：`"0050".parse::<u32>()` 是**五十**而 `0x50` 是 P。本轮第一版
-/// 就栽在这儿 —— 解析出 264 个"码位"、严格递增、无重复，三条结构断言全绿，实际值却一半是错的
-/// （含字母的直接变 `None` 被丢掉）。这正是"数字全绿但画面对不上"。
+/// 解析器用的是 [`overlay_wayland::text::codes_list`] —— 单元测试（`text::one_tier_of_every_glyph_fits_the_arena`
+/// 与 `every_listed_codepoint_has_a_glyph_in_the_asset`）读的是同一个函数。两处各写一份，就会在
+/// "哪一行算码位"上漂移，而漂移的方向恰好是"门禁绿着、清单其实没被解析全"。
+/// ⚠️ 那条坑本身值得记：`"0050".parse::<u32>()` 是**五十**而 `0x50` 是 `P`；本项目第一版就栽在
+/// 这儿 —— 解析出 264 个"码位"、严格递增、无重复，三条结构断言全绿，实际值却一半是错的。
 fn codepoints() -> Vec<u32> {
-    CODES
-        .lines()
-        .filter_map(|line| {
-            let rest = line.trim_start().strip_prefix("U+")?;
-            let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-            u32::from_str_radix(&hex, 16).ok()
-        })
-        .collect()
+    overlay_wayland::text::codes_list()
 }
 
 /// **会渲染的东西**的全集：四 locale 的全部 UI 串（函数给的，不是人抄的）+ 目录里 30 个
