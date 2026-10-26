@@ -15,6 +15,7 @@ use petcore::gacha::Rarity;
 
 use crate::font;
 use crate::menu::{self, CARD_H, CARD_W, LINE_STEP, MenuAnim, PAD, ROW_H, RectI, TEXT_PX};
+use crate::settings::Motion;
 
 /// 卡片底色（0xRRGGBB，全不透明 ⇒ 预乘等于原值）。
 const BG: u32 = 0x1B_1E_23;
@@ -109,17 +110,25 @@ pub struct Ctx<'a> {
     pub dry_run: bool,
     pub error: &'a str,
     pub scale: f32,
+    /// 动画强度档。**每进程恒定**（同 `dry_run`）⇒ 不进 `menu::content_sig`，但画 burst
+    /// 与白闪时必须看它，否则 `--motion reduce/off` 就只是"读出来打印一行"的假功能。
+    pub motion: Motion,
 }
 
 /// 画一帧卡片。`bw`/`bh` 是物理宽高，`stride` 是每行字节数（= bw×4）。
 ///
-/// `dry_run` **不进** `menu::content_sig`：它是每进程恒定的量（不给 `--db` 就是内存库），
-/// 所以签名相等时不可能"一次是演示、另一次是真档" ⇒ 漏了它不会让静止判定错过像素变化。
+/// `dry_run` 与 `motion` 都**不进** `menu::content_sig`：两者都是每进程恒定的量（不给
+/// `--db` 就是内存库；`--motion` 没有运行中的 UI 入口能改），所以签名相等时不可能出现
+/// "一次是演示另一次是真档"或"一次闪另一次不闪" ⇒ 漏了它们不会让静止判定错过像素变化。
 pub fn paint(canvas: &mut [u8], bw: i32, bh: i32, stride: usize, anim: &MenuAnim, ctx: Ctx) {
     let scale = ctx.scale;
     canvas.fill(0);
     fill(canvas, stride, 0, 0, bw, bh, bgra(BG));
-    let border = if menu::white_flash(anim) { FLASH } else { EDGE };
+    let border = if menu::white_flash(anim, ctx.motion) {
+        FLASH
+    } else {
+        EDGE
+    };
     stroke(
         canvas,
         stride,
@@ -139,7 +148,7 @@ pub fn paint(canvas: &mut [u8], bw: i32, bh: i32, stride: usize, anim: &MenuAnim
             paint_error(canvas, stride, ctx);
         }
         MenuAnim::Reveal { lines, best, .. } => {
-            if menu::white_flash(anim) {
+            if menu::white_flash(anim, ctx.motion) {
                 // SSR 的"闪一下"必须是**看不到内容**的整卡过白（只画个白框等于没闪）。
                 fill(canvas, stride, 0, 0, bw, bh, bgra(FLASH));
                 return;
@@ -212,7 +221,7 @@ fn paint_burst(
     ctx: Ctx,
 ) {
     let scale = ctx.scale;
-    let spec = menu::anim_spec(rarity);
+    let spec = menu::anim_spec(rarity, ctx.motion);
     let rad = menu::burst_radius(elapsed, spec);
     let (cx, cy) = (CARD_W / 2, CARD_H / 2);
     fill(
@@ -250,7 +259,7 @@ fn paint_burst(
 fn paint_reveal(canvas: &mut [u8], stride: usize, lines: &[String], best: Rarity, ctx: Ctx) {
     let scale = ctx.scale;
     let ts = text_px(scale);
-    let spec = menu::anim_spec(best);
+    let spec = menu::anim_spec(best, ctx.motion);
     for (i, l) in lines.iter().enumerate().take(menu::MAX_REPORT_LINES) {
         let y = PAD + (i as i32) * LINE_STEP;
         // 第一行是标题（含最高档）⇒ 用该档主色，其余走正文色：SSR 的金色要一眼可辨
@@ -290,7 +299,20 @@ mod tests {
     }
 
     impl Shot {
+        /// **默认档（`full`）**的一次出图 —— 已签收的那套像素口径。现有断言全部走这里，
+        /// 于是"这一轮没改掉默认观感"本身就是测试形状：谁动了 full 档的像素，红的是旧断言。
         fn at(scale: f32, anim: &MenuAnim, balance: i64, dry: bool, err: &str) -> Self {
+            Self::with_motion(scale, anim, balance, dry, err, Motion::Full)
+        }
+
+        fn with_motion(
+            scale: f32,
+            anim: &MenuAnim,
+            balance: i64,
+            dry: bool,
+            err: &str,
+            motion: Motion,
+        ) -> Self {
             let (bw, bh) = (px(CARD_W, scale).max(1), px(CARD_H, scale).max(1));
             let stride = (bw * 4) as usize;
             let mut canvas = vec![0u8; stride * bh as usize];
@@ -305,6 +327,7 @@ mod tests {
                     dry_run: dry,
                     error: err,
                     scale,
+                    motion,
                 },
             );
             Shot {
@@ -411,7 +434,7 @@ mod tests {
     #[test]
     fn burst_message_is_legible_on_every_rarity() {
         for r in Rarity::ALL {
-            let spec = menu::anim_spec(r);
+            let spec = menu::anim_spec(r, Motion::Full);
             let ink = ink_on(spec.color);
             assert_ne!(ink, spec.color, "{r}：墨色和块同色 ⇒ 提示必然看不见");
             for t in [0u32, spec.burst_ticks / 2] {
@@ -443,7 +466,7 @@ mod tests {
 
     #[test]
     fn burst_block_grows_tick_by_tick() {
-        let spec = menu::anim_spec(Rarity::SSR);
+        let spec = menu::anim_spec(Rarity::SSR, Motion::Full);
         let mut prev = 0;
         for t in 0..spec.burst_ticks {
             let anim = MenuAnim::Burst {
@@ -545,6 +568,65 @@ mod tests {
         assert!(!r.all_color(FLASH), "非 SSR 档不该白闪");
     }
 
+    /// 判据②（"可访问性先于音效"）的**像素**证明，不是参数证明：
+    /// `reduce`/`off` 下 SSR 结果卡的**第 0 tick** 必须与"full 档闪完之后那一帧"逐字节相同
+    /// ⇒ 过白那一帧真的没了，而不是"标志位读了但还照着旧样子画"。
+    /// `paint_reveal` 不读 `elapsed`，所以这两帧相等是唯一可能的等式（也正因此这条抓的是闪烁窗口）。
+    #[test]
+    fn motion_tiers_remove_the_white_flash_pixels() {
+        let lines = vec!["SSR!".to_string()];
+        let past = Shot::at(
+            1.5,
+            &MenuAnim::Reveal {
+                elapsed: menu::SSR_FLASH_TICKS,
+                lines: lines.clone(),
+                best: Rarity::SSR,
+            },
+            0,
+            false,
+            "",
+        );
+        for motion in [Motion::Reduce, Motion::Off] {
+            let head = Shot::with_motion(
+                1.5,
+                &MenuAnim::Reveal {
+                    elapsed: 0,
+                    lines: lines.clone(),
+                    best: Rarity::SSR,
+                },
+                0,
+                false,
+                "",
+                motion,
+            );
+            assert_eq!(
+                head.canvas, past.canvas,
+                "{motion:?} 档在 SSR 结果卡头一帧仍画出了别的东西（白闪没真的关掉）"
+            );
+        }
+        // 反面对照：同一帧在 full 档必须**整卡过白**，否则上面那个等式可能只是"两边都没画"。
+        let full = Shot::with_motion(
+            1.5,
+            &MenuAnim::Reveal {
+                elapsed: 0,
+                lines: lines.clone(),
+                best: Rarity::SSR,
+            },
+            0,
+            false,
+            "",
+            Motion::Full,
+        );
+        assert!(
+            full.all_color(FLASH),
+            "full 档的白闪必须还在（默认观感不许被这轮改掉）"
+        );
+        assert_ne!(
+            full.canvas, past.canvas,
+            "full 与 reduce 必须真的画出不同的东西"
+        );
+    }
+
     #[test]
     fn error_line_is_drawn_and_truncated_not_dropped() {
         let clean = Shot::at(1.0, &MenuAnim::Menu, 0, true, "");
@@ -577,6 +659,7 @@ mod tests {
             dry_run: true,
             error: "E",
             scale: 1.0,
+            motion: Motion::Full,
         };
         paint(&mut tiny, 1, 1, 4, &MenuAnim::Menu, ctx);
         let mut zero: Vec<u8> = vec![];

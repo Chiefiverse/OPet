@@ -47,8 +47,10 @@ impl ValueSource {
 /// 动画强度档（`--motion` / `[ui] motion`）。设计书 §3.9 那条"动画强度可关 / 闪烁可关"，
 /// 判据②点名要求它先于音效落地。
 ///
-/// ⚠️ 本提交只把它**读出来并解释**；真正改掉 `anim_spec`/`advance`/白闪的像素行为在下一步
-/// （提交 4）。分档语义定死在这里，免得下一步再发明一套口径：
+/// 分档语义定死在这里（三档各改什么、不改什么），渲染侧 [`crate::menu::anim_spec`] 是它
+/// 唯一的执行者 —— 免得两处各发明一套口径。像素效果由 `card::Ctx.motion` 落地，
+/// 测试 `motion_tiers_only_touch_burst_and_flash` / `motion_tiers_remove_the_white_flash_pixels`
+/// 分别钉"参数表"和"真的少画了那一帧"。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Motion {
     /// 现状：burst 4/8/16/24 tick，SSR 白闪 2 tick
@@ -99,6 +101,34 @@ fn motion_codes() -> String {
         .join("/")
 }
 
+/// 两句"认不出来"的报错**只在这里拼**：CLI 预检（[`validate_cli`]）与链条本体
+/// （[`Settings::resolve`]）用的是同两个函数，所以"参数阶段说的支持范围"和"运行阶段说的"
+/// 不可能漂移 —— 手抄两遍的话，加第五种语言时必然有一份变成谎话。
+fn unknown_lang(v: &str) -> String {
+    format!("--lang 的值 {v:?} 认不出来（只支持 {}）", lang_codes())
+}
+
+fn unknown_motion(v: &str) -> String {
+    format!("--motion 的值 {v:?} 认不出来（只支持 {}）", motion_codes())
+}
+
+/// `--lang` / `--motion` 的**预检**，给 `cli::Args::options()` 用：参数写错要在解析阶段
+/// 就退出，而不是等 `run()` 连上 Wayland、建好 surface 之后。
+/// 合法与否只问 [`Lang::parse`] / [`Motion::parse`] 这一处，不在 CLI 再抄一张支持表。
+pub fn validate_cli(lang: Option<&str>, motion: Option<&str>) -> Result<(), String> {
+    if let Some(v) = lang {
+        if Lang::parse(v).is_none() {
+            return Err(unknown_lang(v));
+        }
+    }
+    if let Some(v) = motion {
+        if Motion::parse(v).is_none() {
+            return Err(unknown_motion(v));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub lang: Lang,
@@ -132,12 +162,7 @@ impl Settings {
             // 显式给错 = 错误，不是降级（见模块头）。
             match Lang::parse(v) {
                 Some(l) => (lang, lang_from) = (l, ValueSource::Cli),
-                None => {
-                    return Err(format!(
-                        "--lang 的值 {v:?} 认不出来（只支持 {}）",
-                        lang_codes()
-                    ));
-                }
+                None => return Err(unknown_lang(v)),
             }
         } else {
             // **逐级往下**：文件里是坏值 ⇒ 出声后继续试环境变量，最后才默认。停在坏值上直接
@@ -219,10 +244,7 @@ fn resolve_motion(
     if let Some(v) = cli {
         return match Motion::parse(v) {
             Some(m) => Ok((m, ValueSource::Cli)),
-            None => Err(format!(
-                "--motion 的值 {v:?} 认不出来（只支持 {}）",
-                motion_codes()
-            )),
+            None => Err(unknown_motion(v)),
         };
     }
     if let Some(v) = &file.motion {

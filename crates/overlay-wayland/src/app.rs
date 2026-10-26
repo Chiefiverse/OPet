@@ -70,7 +70,7 @@ use crate::atlas::Atlas;
 use crate::card;
 use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
 use crate::region::{CellRect, Regions};
-use crate::settings;
+use crate::settings::{self, Motion};
 
 /// `wp_fractional_scale` 的 scale 单位是 1/120（180 = 1.5×，本机 eDP-1 实测值）。
 const SCALE_UNIT: u32 = 120;
@@ -102,6 +102,12 @@ pub struct Options {
     pub test_rect: bool,
     /// 不设光标（主题加载失败时的退路，代价是"鼠标在宠物上隐形"）
     pub no_cursor: bool,
+    /// `--lang zh|en|ja|ko` 的**原始字符串**。这里不解释值：解释只在
+    /// [`settings::Settings::resolve`] 一处（`Lang::parse`/`Motion::parse` + 优先级链），
+    /// 免得 CLI 和配置文件各写一套"什么算合法"。
+    pub lang: Option<String>,
+    /// `--motion full|reduce|off`，同上存原始字符串
+    pub motion: Option<String>,
 }
 
 impl Default for Options {
@@ -116,6 +122,8 @@ impl Default for Options {
             db: None,
             test_rect: false,
             no_cursor: false,
+            lang: None,
+            motion: None,
         }
     }
 }
@@ -215,6 +223,12 @@ pub struct App {
     /// `--db` 没给 ⇒ 菜单与结果卡一律打 DRYRUN 标，且**不产生任何文件**。
     /// 从 `Options.db` 一次定死（每进程恒定，所以 `content_sig` 不含它也够精确）。
     dry_run: bool,
+    /// 生效的 UI 设置（`--lang`/`--motion` > config.toml > `LC_ALL`/`LANG` > 默认，链条
+    /// 只在 [`settings`] 一处解释）。整份存下来的理由不是省事：**退出摘要要能复述"这一场
+    /// 会话到底用了哪一档、它是从哪一级来的"**（验收 §6-4），而只存值就把来源丢了。
+    /// `MenuState.motion` 是从这里抄的副本（同 `dry_run` 的手法：`draw()` 里先
+    /// `menu.as_mut()` 再读 `self.ui` 会撞借用冲突；下一步的语言行同理）。
+    ui: settings::Settings,
     /// 抽取层，**lazy**：第一次右键才连库。rusqlite + WAL 一打开就把页缓存和语句缓存
     /// 挂进进程，而常驻宠物的 VmHWM 门禁（M4 基线 15.7 MB）不该为"也许根本不抽"付这笔。
     gacha: Option<Gacha>,
@@ -306,8 +320,10 @@ pub fn run(opts: Options) -> Result<(), String> {
     let cfg = petstore::config::Config::read();
     cfg.announce();
     eprintln!("ui: 配置 {}", cfg.describe());
-    // `None, None` = CLI 那两个开关还没接（提交 4），此刻文件与环境变量是仅有的两级。
-    let settings = settings::Settings::from_process(None, None, &cfg)?;
+    // CLI 那两级开关此刻真的传进来了：`--lang`/`--motion` 给错值 = 报错退出（不是静默变默认），
+    // 文件/环境变量给错值 = 出声后跳过那一级的 notice（两条路的区别与理由见 `settings.rs` 模块头）。
+    let settings =
+        settings::Settings::from_process(opts.lang.as_deref(), opts.motion.as_deref(), &cfg)?;
     settings.announce();
 
     let conn = Connection::connect_to_env().map_err(|e| format!("连不上 Wayland: {e}"))?;
@@ -428,6 +444,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         drag: false,
         grab_offset: Vec2::ZERO,
         dry_run,
+        ui: settings,
         gacha: None,
         gacha_error: None,
         last_press: None,
@@ -769,6 +786,9 @@ struct MenuState {
     balance: i64,
     /// 从 `App` 抄来的演示标（每进程恒定，不进 `content_sig` 也精确）
     dry_run: bool,
+    /// 从 `App.ui.motion` 抄来的动画强度档（同 `dry_run`：每进程恒定 ⇒ 不进签名，
+    /// 但 `step`/`draw` 每格都要读它，否则 `--motion` 就是个只打印不生效的假开关）。
+    motion: Motion,
     /// 上一次 commit 的内容签名 ⇒ 静止时"什么都不发"
     last_sig: Option<u64>,
     frame_pending: bool,
@@ -808,7 +828,7 @@ impl MenuState {
         if !self.anim.is_busy() {
             return false;
         }
-        let next = menu::advance(&self.anim);
+        let next = menu::advance(&self.anim, self.motion);
         let changed = next != self.anim;
         self.anim = next;
         changed
@@ -862,6 +882,7 @@ impl MenuState {
         }
         let dry_run = self.dry_run;
         let balance = self.balance;
+        let motion = self.motion;
         let bw = self.to_phys(self.logical.0 as f32).max(1);
         let bh = self.to_phys(self.logical.1 as f32).max(1);
         let stride = bw * 4;
@@ -890,6 +911,7 @@ impl MenuState {
                 dry_run,
                 error,
                 scale,
+                motion,
             },
         );
         // 句柄克隆（不是对象克隆）：下面的 `self.arm()` 要可变借 self，不能同时留引用
@@ -970,6 +992,7 @@ impl App {
             0
         };
         let dry_run = self.dry_run;
+        let motion = self.ui.motion;
 
         let surface = self.compositor.create_surface(&qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -1019,6 +1042,7 @@ impl App {
             anim: MenuAnim::Menu,
             balance,
             dry_run,
+            motion,
             last_sig: None,
             frame_pending: false,
             pending_since: None,
@@ -1138,11 +1162,9 @@ impl App {
             }
         };
         if let Some(m) = self.menu.as_mut() {
-            m.anim = MenuAnim::Burst {
-                rarity: best,
-                elapsed: 0,
-                lines,
-            };
+            // 从哪一格开始由 `menu::after_pull` 定（`off` 档根本不进 `Burst`）。分派写成
+            // 纯函数是为了让它有自动化覆盖 —— 这条写在 `App` 里就只有真机看得出来。
+            m.anim = menu::after_pull(best, lines, self.ui.motion);
             m.balance = balance;
         }
         if let Some(sim) = self.sim.as_mut() {
@@ -1485,6 +1507,9 @@ impl App {
 
     /// 退出前的门禁读数（RSS/CPU 直接读 `/proc`，比 btop 可脚本化）。
     fn report(&self) {
+        // 生效值与来源在**退出摘要**里再打一遍：验收要按 300 s 那一轮读数判"我配的到底
+        // 生效没有"，而启动那一行早就滚出屏幕了。
+        println!("  {}", self.ui.summary());
         let secs = self.started.elapsed().as_secs_f64().max(0.001);
         let t = (self.counters.commits + self.counters.moves + self.counters.idle).max(1) as f64;
         println!(

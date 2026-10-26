@@ -4,6 +4,8 @@
 
 use petcore::gacha::Rarity;
 
+use crate::settings::Motion;
+
 /// 可点的菜单项。余额行与错误行是信息，不进命中表。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuItem {
@@ -231,7 +233,10 @@ pub struct AnimSpec {
 
 pub const SSR_FLASH_TICKS: u32 = 2;
 
-pub fn anim_spec(r: Rarity) -> AnimSpec {
+/// `full` 档的原始规格 = **用户已经签收过的那套像素**（2026-10-25 真机判过："burst 和结果卡
+/// 都看见了，SSR 是黄色"）。`anim_specs_are_monotonic_and_ssr_flashes` 把这四个数字逐个钉死，
+/// 因为下面两档是**从它派生**的：动这里的基准值会连带改掉 `reduce`，而那条改动没人签收过。
+fn anim_spec_full(r: Rarity) -> AnimSpec {
     match r {
         Rarity::N => AnimSpec {
             burst_ticks: 4,
@@ -256,6 +261,32 @@ pub fn anim_spec(r: Rarity) -> AnimSpec {
             dwell_ticks: 180,
             color: 0xF5B301,
             white_flash_ticks: SSR_FLASH_TICKS,
+        },
+    }
+}
+
+/// 同一张规格表按**动画强度档**收窄（`UI_REDESIGN_V2` §4.7 那张表 = 判据②"闪烁可关"）。
+///
+/// 三档的取舍刻意不一样：
+/// · `Reduce` = **节奏还在、闪烁没了**：burst 缩到 `max(1, n/4)`（1/2/4/6 tick），白闪 0，
+///   dwell **不变**（dwell 是"结果卡停留多久"，不是动效；砍它会让玩家来不及读完卡）。
+/// · `Off` = **扩散期整个跳过**（`burst_ticks = 0`，且 [`after_pull`] 直接给 `Reveal`）：
+///   提交数只减不增 ⇒ 这一档不可能把省电基线做坏。
+/// 两档都不动 `color` 与 `dwell_ticks`：**关掉闪烁之后"这是 SSR"只剩色带**，颜色是信息不是装饰
+/// （要真机判的就是这个，见 §6-6②）。
+pub fn anim_spec(r: Rarity, motion: Motion) -> AnimSpec {
+    let full = anim_spec_full(r);
+    match motion {
+        Motion::Full => full,
+        Motion::Reduce => AnimSpec {
+            burst_ticks: (full.burst_ticks / 4).max(1),
+            white_flash_ticks: 0,
+            ..full
+        },
+        Motion::Off => AnimSpec {
+            burst_ticks: 0,
+            white_flash_ticks: 0,
+            ..full
         },
     }
 }
@@ -285,9 +316,37 @@ impl MenuAnim {
     }
 }
 
+/// 抽完一次之后卡片**从哪一格开始**。这条判断放在纯模块里而不是 `app.rs` 里，是因为它是
+/// `--motion off` 的全部语义：off 档**根本不进 `Burst`**，而不是"在 `Burst` 里画 0 帧"。
+///
+/// 少了这一步，`off` 档仍会投出一帧扩散（`card::paint` 照样走 `paint_burst`），而
+/// [`burst_radius`] 在 `burst_ticks == 0` 上会退化成"第 0 格就是整卡满块"（那里的 clamp
+/// 把 t 顶到 ticks）⇒ 玩家看到的不是"没有动画"，而是一帧盖住整张卡的稀有度色块，
+/// 下一格才变结果卡。"只减不增"这条省电承诺也会当场破：那一帧是一次实打实的提交。
+/// 留在 `app.rs` 里则这条**永远没有自动化覆盖**（headless 起不了 `App`）⇒ 只有真机能发现，
+/// 而那时它已经是一个可能说谎的开关。
+pub fn after_pull(best: Rarity, lines: Vec<String>, motion: Motion) -> MenuAnim {
+    match motion {
+        Motion::Off => MenuAnim::Reveal {
+            elapsed: 0,
+            lines,
+            best,
+        },
+        Motion::Full | Motion::Reduce => MenuAnim::Burst {
+            rarity: best,
+            elapsed: 0,
+            lines,
+        },
+    }
+}
+
 /// 推进一格（60 Hz tick）。**返回值与原值相等就代表卡片像素一模一样** ⇒ 调用方据此
 /// 跳过 commit（省电契约：静止的 surface 不许每 tick 投新 buffer）。
-pub fn advance(anim: &MenuAnim) -> MenuAnim {
+///
+/// `motion` 是**每进程恒定**的量（CLI/配置文件在启动时一次定死，运行中没有 UI 入口能改它，
+/// 与 `dry_run` 同族）⇒ 它不进 `content_sig`（见那里的注释），但**必须**进 `advance`：
+/// 各档的 burst/dwell 边界由它决定，少了这个参数 `off` 档就只是"不白闪"而扩散期照走。
+pub fn advance(anim: &MenuAnim, motion: Motion) -> MenuAnim {
     match anim {
         MenuAnim::Menu => MenuAnim::Menu,
         MenuAnim::Burst {
@@ -295,7 +354,7 @@ pub fn advance(anim: &MenuAnim) -> MenuAnim {
             elapsed,
             lines,
         } => {
-            let spec = anim_spec(*rarity);
+            let spec = anim_spec(*rarity, motion);
             if *elapsed + 1 >= spec.burst_ticks {
                 MenuAnim::Reveal {
                     elapsed: 0,
@@ -315,7 +374,7 @@ pub fn advance(anim: &MenuAnim) -> MenuAnim {
             lines,
             best,
         } => {
-            let spec = anim_spec(*best);
+            let spec = anim_spec(*best, motion);
             if *elapsed + 1 >= spec.dwell_ticks {
                 MenuAnim::Menu
             } else {
@@ -339,10 +398,11 @@ pub fn burst_radius(elapsed: u32, spec: AnimSpec) -> i32 {
 }
 
 /// 白闪窗口：SSR 的结果卡头几 tick 整卡过白（`white_flash_ticks == 0` 的档位恒 false）。
-pub fn white_flash(anim: &MenuAnim) -> bool {
+/// `reduce`/`off` 两档的 flash 计数在 [`anim_spec`] 里就是 0 ⇒ 这里恒 false，不需要再判断相。
+pub fn white_flash(anim: &MenuAnim, motion: Motion) -> bool {
     match anim {
         MenuAnim::Reveal { elapsed, best, .. } => {
-            let f = anim_spec(*best).white_flash_ticks;
+            let f = anim_spec(*best, motion).white_flash_ticks;
             f > 0 && *elapsed < f
         }
         _ => false,
@@ -352,6 +412,11 @@ pub fn white_flash(anim: &MenuAnim) -> bool {
 /// 卡片内容签名：`(相位, 余额, 错误行)` 全同 ⇒ 像素一模一样 ⇒ draw 层跳过 commit。
 /// 这是菜单的省电闸门 —— 没有它，`update_menu` 每 tick 置脏，静止的菜单也会 60 次/秒
 /// 提交 180×150 的 buffer（M4 的三档口径里"无事可做"那一档就永远不会出现）。
+///
+/// ⚠️ **`motion` 故意不进签名**：它和 `dry_run` 同族 —— 启动时一次定死，运行中没有任何
+/// UI 入口能改它 ⇒ "同一份输入给同一个签名"不会因为少了它而失真。对照 `lang`：语言**能**
+/// 在运行中被点着换，所以它必须在签名里（下一步接语言行时加，混入位置 = 相位 tag 之后、
+/// `elapsed` 之前）。把这条区别写在这里，是因为两者长得像而语义相反，最容易顺手抄错。
 /// FNV-1a：不需要新依赖，且**只用来判等**，不当哈希表键、不进任何确定性契约。
 pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -651,7 +716,7 @@ mod tests {
 
     #[test]
     fn anim_specs_are_monotonic_and_ssr_flashes() {
-        let specs = Rarity::ALL.map(anim_spec);
+        let specs = Rarity::ALL.map(|r| anim_spec(r, Motion::Full));
         for w in specs.windows(2) {
             assert!(w[1].burst_ticks > w[0].burst_ticks, "burst 必须随档位增长");
             assert!(w[1].dwell_ticks > w[0].dwell_ticks, "dwell 必须随档位增长");
@@ -666,6 +731,106 @@ mod tests {
         }
     }
 
+    /// §4.7 那张表钉成代码。两条不许动的东西比"能关"本身更容易被顺手改坏：
+    /// **dwell 与颜色在两档里都原样保留** —— dwell 是"结果卡停留多久"不是动效（砍了玩家
+    /// 来不及读完卡），而关掉白闪之后**色带是"这是 SSR"的唯一凭据**。
+    /// 总 tick 数只减不增 ⇒ 省电基线（三档相加 == tick 总数）在新档位下不可能被做坏。
+    #[test]
+    fn motion_tiers_only_touch_burst_and_flash() {
+        for r in Rarity::ALL {
+            let full = anim_spec(r, Motion::Full);
+            let reduce = anim_spec(r, Motion::Reduce);
+            let off = anim_spec(r, Motion::Off);
+            assert_eq!(reduce.burst_ticks, (full.burst_ticks / 4).max(1));
+            assert!(
+                reduce.burst_ticks >= 1,
+                "reduce 至少要留一格，不然等于没有 burst"
+            );
+            assert_eq!(off.burst_ticks, 0, "off = 扩散期整个跳过");
+            assert_eq!(
+                reduce.white_flash_ticks, 0,
+                "前庭敏感是硬需求：reduce 不许闪"
+            );
+            assert_eq!(off.white_flash_ticks, 0);
+            for narrowed in [reduce, off] {
+                assert_eq!(
+                    narrowed.dwell_ticks, full.dwell_ticks,
+                    "{r} 的 dwell 被动了"
+                );
+                assert_eq!(narrowed.color, full.color, "{r} 的档位色被动了");
+            }
+            assert!(
+                reduce.burst_ticks + reduce.dwell_ticks <= full.burst_ticks + full.dwell_ticks,
+                "{r} 的 reduce 提交数比 full 还多"
+            );
+            assert!(off.burst_ticks + off.dwell_ticks <= full.burst_ticks + full.dwell_ticks);
+        }
+    }
+
+    /// `--motion off` 的**语义**证明：抽完那一次不从 `Burst` 出发，于是扩散那一帧一次都不画
+    /// （`card::paint` 进不到 `paint_burst`），忙碌格数从 `burst + dwell` 降到恰好 `dwell`
+    /// ⇒ "只减不增"这条承诺是量出来的，不是嘴上说的。
+    ///
+    /// 这条**必须**是纯函数断言：分派发生在 `App::do_pull`，而 headless 起不了 `App` ⇒
+    /// 留在 `app.rs` 里就是"off 到底关掉了什么只有真机看得出来"，而那时它已经是一个
+    /// 可能说谎的开关（M4 那条"计数器为 0 不等于代码对"同族）。
+    #[test]
+    fn off_never_enters_the_burst_phase() {
+        for r in Rarity::ALL {
+            let lines = vec![format!("BEST {r}")];
+            let off = after_pull(r, lines.clone(), Motion::Off);
+            match &off {
+                MenuAnim::Reveal {
+                    elapsed,
+                    best,
+                    lines: got,
+                } => {
+                    assert_eq!(*elapsed, 0, "off 档的结果卡该从第 0 格起");
+                    assert_eq!(*best, r);
+                    assert_eq!(got, &lines, "跳过扩散不能把行数一起跳过 ⇒ 会渲成空白卡");
+                }
+                other => panic!("off 档该直接进 Reveal，得到 {other:?}"),
+            }
+            let mut a = off;
+            let mut ticks: u32 = 0;
+            while a != MenuAnim::Menu {
+                a = advance(&a, Motion::Off);
+                assert!(
+                    !matches!(a, MenuAnim::Burst { .. }),
+                    "{r}：off 档走到了扩散期"
+                );
+                ticks += 1;
+                assert!(
+                    ticks <= 300,
+                    "{r}：off 档回不到静止 ⇒ 菜单每 tick 投 buffer"
+                );
+            }
+            assert_eq!(
+                ticks,
+                anim_spec(r, Motion::Off).dwell_ticks,
+                "{r}：off 档忙碌格数该恰好等于 dwell（扩散一格都不剩）"
+            );
+
+            // 另两档仍从扩散期起步 —— 默认观感不许被这一轮改掉。
+            for motion in [Motion::Full, Motion::Reduce] {
+                let spec = anim_spec(r, motion);
+                assert_eq!(
+                    after_pull(r, lines.clone(), motion),
+                    MenuAnim::Burst {
+                        rarity: r,
+                        elapsed: 0,
+                        lines: lines.clone()
+                    },
+                    "{r}/{motion:?} 该从扩散期开始"
+                );
+                assert!(
+                    ticks <= spec.burst_ticks.max(1) + spec.dwell_ticks,
+                    "{r}/{motion:?} 的忙碌格数比 off 还少 ⇒ off 增加了提交"
+                );
+            }
+        }
+    }
+
     #[test]
     fn best_rarity_reads_counts_high_to_low() {
         assert_eq!(best_rarity(&[1, 0, 0, 0]), Some(Rarity::N));
@@ -676,35 +841,55 @@ mod tests {
 
     /// 相位机的唯一走法：Burst 放完 ⇒ Reveal（行数原样带过去）⇒ dwell 到点 ⇒ Menu。
     /// 中间任何一格"回不到 Menu"都会让菜单永远每 tick 提交 buffer（省电契约破）。
+    /// **逐档 × 逐 motion 都验**：`off` 的 `burst_ticks == 0`，交棒发生在第一次 advance；
+    /// 这条若只在默认档成立，换档就是一个卡在扩散期、每 tick 都投 buffer 的菜单。
     #[test]
     fn advance_walks_burst_reveal_menu_and_returns_to_rest() {
         let lines = vec!["1 PULLED BEST SSR".to_string()];
-        let spec = anim_spec(Rarity::SSR);
-        let mut a = MenuAnim::Burst {
-            rarity: Rarity::SSR,
-            elapsed: 0,
-            lines: lines.clone(),
-        };
-        for _ in 0..spec.burst_ticks {
-            a = advance(&a);
-        }
-        match &a {
-            MenuAnim::Reveal {
-                elapsed,
-                best,
-                lines: got,
-            } => {
-                assert_eq!(*best, Rarity::SSR);
-                assert!(*elapsed < spec.dwell_ticks, "dwell 还没开始就该停");
-                assert_eq!(got, &lines, "burst 必须在结束时把行数交棒给 reveal");
+        for motion in Motion::ALL {
+            for r in Rarity::ALL {
+                let spec = anim_spec(r, motion);
+                let mut a = MenuAnim::Burst {
+                    rarity: r,
+                    elapsed: 0,
+                    lines: lines.clone(),
+                };
+                // 回静止恰好用掉"扩散那一格 + dwell"—— 不多一格（早退 = 卡住的菜单），
+                // 也不少一格（晚退 = 结果卡凭空少停一 tick）。
+                // `max(1)`：`off` 档 `burst_ticks == 0`，但从 `Burst` 出发仍要花**一次** advance
+                // 才交棒 ⇒ 零长度的扩散期不等于零格（真机上这一档根本不会进 `Burst`，
+                // 见 `after_pull` 与 `off_never_enters_the_burst_phase`）。
+                let handoff = spec.burst_ticks.max(1);
+                let total = handoff + spec.dwell_ticks;
+                let mut handed_off = false;
+                for tick in 1..=total {
+                    a = advance(&a, motion);
+                    if handed_off || matches!(a, MenuAnim::Burst { .. }) {
+                        continue;
+                    }
+                    handed_off = true;
+                    assert_eq!(tick, handoff, "{r}/{motion:?} 交棒时机");
+                    match &a {
+                        MenuAnim::Reveal {
+                            elapsed,
+                            best,
+                            lines: got,
+                        } => {
+                            assert_eq!(*best, r);
+                            assert_eq!(*elapsed, 0, "{r}/{motion:?} 交棒时 elapsed 该从 0 起");
+                            assert_eq!(got, &lines, "burst 必须在结束时把行数交棒给 reveal");
+                        }
+                        other => panic!("burst 放完该进 Reveal，得到 {other:?}"),
+                    }
+                }
+                assert_eq!(
+                    a,
+                    MenuAnim::Menu,
+                    "{r}/{motion:?} 在 {total} tick 后该回静止"
+                );
+                assert_eq!(advance(&a, motion), MenuAnim::Menu, "静止是吸收态");
             }
-            other => panic!("burst 放完该进 Reveal，得到 {other:?}"),
         }
-        for _ in 0..spec.dwell_ticks {
-            a = advance(&a);
-        }
-        assert_eq!(a, MenuAnim::Menu, "dwell 到点必须自动回静止");
-        assert_eq!(advance(&a), MenuAnim::Menu, "静止是吸收态");
     }
 
     /// 静止 ⇒ 签名不变 ⇒ draw 层不 commit。三个输入（相位/余额/错误行）任一变了都要变。
@@ -712,7 +897,10 @@ mod tests {
     fn content_sig_is_stable_when_static_and_moves_with_every_visible_input() {
         let rest = content_sig(&MenuAnim::Menu, 100, "");
         assert_eq!(rest, content_sig(&MenuAnim::Menu, 100, ""));
-        assert_eq!(rest, content_sig(&advance(&MenuAnim::Menu), 100, ""));
+        assert_eq!(
+            rest,
+            content_sig(&advance(&MenuAnim::Menu, Motion::Full), 100, "")
+        );
         assert_ne!(rest, content_sig(&MenuAnim::Menu, 101, ""), "余额行会变");
         assert_ne!(
             rest,
@@ -726,24 +914,36 @@ mod tests {
         };
         assert_ne!(
             content_sig(&burst, 100, ""),
-            content_sig(&advance(&burst), 100, ""),
+            content_sig(&advance(&burst, Motion::Full), 100, ""),
             "扩散期每 tick 都在动 ⇒ 签名必须动"
+        );
+        // motion 不进签名（启动定死、运行中无人能改），但**同相位的不同档**像素确实相同，
+        // 所以这里必须是等号；写成断言是为了让"顺手把 motion 混进来"当场红，而不是悄悄多一提交。
+        assert_eq!(
+            content_sig(&burst, 100, ""),
+            content_sig(&burst, 100, ""),
+            "签名不该看进程外的东西"
         );
     }
 
     #[test]
     fn burst_radius_grows_monotonically_and_stays_in_the_card() {
-        for r in Rarity::ALL {
-            let spec = anim_spec(r);
-            let mut prev = -1;
-            for t in 0..spec.burst_ticks {
-                let rad = burst_radius(t, spec);
-                assert!(rad > prev, "{r} 的扩散在 tick {t} 没长大");
-                assert!(rad <= CARD_W / 2, "{r} 的扩散越出卡片：{rad}");
-                prev = rad;
+        // 只验 Full/Reduce：`off` 档 `after_pull` 直接给 `Reveal`，扩散那一帧**根本不画**，
+        // 而这一档的 `burst_radius` 会退化成"第 0 格就满块"（见它的注释）—— 拿它出图既
+        // 不是交付观感，也不是在测任何真会被画出来的东西。
+        for motion in [Motion::Full, Motion::Reduce] {
+            for r in Rarity::ALL {
+                let spec = anim_spec(r, motion);
+                let mut prev = -1;
+                for t in 0..spec.burst_ticks {
+                    let rad = burst_radius(t, spec);
+                    assert!(rad > prev, "{r}/{motion:?} 的扩散在 tick {t} 没长大");
+                    assert!(rad <= CARD_W / 2, "{r}/{motion:?} 的扩散越出卡片：{rad}");
+                    prev = rad;
+                }
+                // 尾帧之后不许回头增长（elapsed 超上限时 clamp，draw 层不该画出格外方块）。
+                assert_eq!(burst_radius(spec.burst_ticks * 3, spec), prev);
             }
-            // 尾帧之后不许回头增长（elapsed 超上限时 clamp，draw 层不该画出格外方块）。
-            assert_eq!(burst_radius(spec.burst_ticks * 3, spec), prev);
         }
     }
 
@@ -754,26 +954,51 @@ mod tests {
             lines: vec![],
             best: Rarity::SSR,
         };
-        assert!(white_flash(&ssr));
-        assert!(white_flash(&MenuAnim::Reveal {
-            elapsed: SSR_FLASH_TICKS - 1,
-            lines: vec![],
-            best: Rarity::SSR,
-        }));
-        assert!(!white_flash(&MenuAnim::Reveal {
-            elapsed: SSR_FLASH_TICKS,
-            lines: vec![],
-            best: Rarity::SSR,
-        }));
-        assert!(
-            !white_flash(&MenuAnim::Reveal {
-                elapsed: 0,
+        assert!(white_flash(&ssr, Motion::Full));
+        assert!(white_flash(
+            &MenuAnim::Reveal {
+                elapsed: SSR_FLASH_TICKS - 1,
                 lines: vec![],
-                best: Rarity::SR
-            }),
+                best: Rarity::SSR,
+            },
+            Motion::Full
+        ));
+        assert!(!white_flash(
+            &MenuAnim::Reveal {
+                elapsed: SSR_FLASH_TICKS,
+                lines: vec![],
+                best: Rarity::SSR,
+            },
+            Motion::Full
+        ));
+        assert!(
+            !white_flash(
+                &MenuAnim::Reveal {
+                    elapsed: 0,
+                    lines: vec![],
+                    best: Rarity::SR
+                },
+                Motion::Full
+            ),
             "只有 SSR 闪白"
         );
-        assert!(!white_flash(&MenuAnim::Menu));
+        assert!(!white_flash(&MenuAnim::Menu, Motion::Full));
+        // 判据②：可访问性那一档要**真的**不闪，而且四档里哪一档都不闪（SSR 也照样不闪）。
+        for motion in [Motion::Reduce, Motion::Off] {
+            for r in Rarity::ALL {
+                assert!(
+                    !white_flash(
+                        &MenuAnim::Reveal {
+                            elapsed: 0,
+                            lines: vec![],
+                            best: r
+                        },
+                        motion
+                    ),
+                    "{motion:?} 档在 {r} 上还闪白"
+                );
+            }
+        }
     }
 
     /// 排版可行性证明：7 行 × 18 logical 高 + 上下边距 ≤ 卡片高；

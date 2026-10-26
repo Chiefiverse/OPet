@@ -3,6 +3,7 @@
 
 use crate::app::{self, Options};
 use crate::probe;
+use crate::settings;
 
 pub const USAGE: &str = "\
 opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 同参数）
@@ -20,6 +21,12 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
                      别让一条随手起的 overlay 写脏用户真存档
   --test-rect        不接内核，画一块纯色矩形（验证 surface 映射与点击穿透）
   --no-cursor        不设光标表面（调试用；代价是鼠标在宠物上方可能隐形）
+  --lang CODE        界面语言：zh / en / ja / ko。不给 = 走 `config.toml` 的 `[ui] lang`，
+                     再退 `LC_ALL`/`LANG`，最后默认 zh。**认不出来直接报错退出**，
+                     不静默退回默认（打错了和「语言不对但没人说」是两种完全不同的故障）
+  --motion TIER      动画强度：full / reduce / off。reduce = 开箱扩散缩到 1/4 且**不闪白**，
+                     off = 整个跳过扩散（只减提交、不增）；两档都不动 dwell 与稀有度色带。
+                     判据②「闪烁可关」就是这一条 —— 前庭敏感是硬需求，优先于音效
 ";
 
 #[derive(Debug, Default, PartialEq)]
@@ -35,10 +42,20 @@ pub struct Args {
     pub db: Option<String>,
     pub test_rect: bool,
     pub no_cursor: bool,
+    /// `--lang` 的原始值。合法性由 [`settings::validate_cli`] 判（**不在这里抄一张表**），
+    /// 解释（大小写/子标签/优先级链）更不在这里 —— 那是 `settings` 唯一的一份口径。
+    pub lang: Option<String>,
+    pub motion: Option<String>,
 }
 
 impl Args {
     pub fn options(&self) -> Result<Options, String> {
+        // **放在最前面**：一个打错的语言码比"没给 manifest"更具体，也更容易是用户真正想问的事。
+        // `--lang=` / `--motion=` 空值与任何不认识的值一样：**报错，不静默退默认**（R14）。
+        // 这一族最早是 `--seconds -5` 与 `--db=` 那两条立下的规矩：宁可退出，也不留一个
+        // "看起来开了档但其实没用上"的会话。
+        // 合法值表只有 `settings` 一份（CLI 不抄第二份，否则加第五种语言时这里必然滞后）。
+        settings::validate_cli(self.lang.as_deref(), self.motion.as_deref())?;
         if !self.test_rect && self.manifest.is_none() {
             return Err(
                 "没给 --manifest 就没有像素可画。要么给清单，要么用 --test-rect 只验 surface。\n\
@@ -81,6 +98,8 @@ impl Args {
             db: self.db.clone(),
             test_rect: self.test_rect,
             no_cursor: self.no_cursor,
+            lang: self.lang.clone(),
+            motion: self.motion.clone(),
         })
     }
 }
@@ -127,6 +146,8 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--manifest" => a.manifest = Some(next_val(&mut i)?),
             "--monitor" => a.monitor = Some(next_val(&mut i)?),
             "--db" => a.db = Some(next_val(&mut i)?),
+            "--lang" => a.lang = Some(next_val(&mut i)?),
+            "--motion" => a.motion = Some(next_val(&mut i)?),
             "--probe" => a.probe = true,
             "--test-rect" => a.test_rect = true,
             "--no-cursor" => a.no_cursor = true,
@@ -159,6 +180,10 @@ pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
     }
     let parsed = parse(args)?;
     if parsed.probe {
+        // 探测本身不吃语言/动画档，但**不能因此放过打错的值**：`--probe --lang=jap` 静默成功
+        // 就等于告诉用户"这个码是对的"，而他下次真起 overlay 时看到的仍是默认档。
+        // `options()` 在探测路径上会因"没给 manifest"先炸，所以这里单独预检一次。
+        settings::validate_cli(parsed.lang.as_deref(), parsed.motion.as_deref())?;
         let report = probe::probe();
         print!("{}", probe::format_report(&report));
         return Ok(Outcome::Probed(probe_ok(&report)));
@@ -277,5 +302,101 @@ mod tests {
                 .options()
                 .is_err()
         );
+    }
+
+    /// `--lang` / `--motion` 走到底：**认得出来的值原样交给 `Options`**（解释在
+    /// `settings` 那一处），认不出来的一律报错退出，**不静默退回默认档**。
+    /// 静默退默认 = "我明明说了日文，卡片还是英文，而全程没有任何一句话" —— 这一族
+    /// 和 `--db=` 空值、`--seconds -5` 是同一条红线（R14）。
+    #[test]
+    fn lang_and_motion_reach_the_options_verbatim() {
+        let eq = parse(&v(&["--test-rect", "--lang=en", "--motion=reduce"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(eq.lang.as_deref(), Some("en"));
+        assert_eq!(eq.motion.as_deref(), Some("reduce"));
+        // 两种写法同义（同 `--db`）
+        let sp = parse(&v(&["--test-rect", "--lang", "en", "--motion", "reduce"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(sp.lang, eq.lang, "两种写法必须同义");
+        assert_eq!(sp.motion, eq.motion);
+        // 不给 ⇒ `None`（= 让下一级说话），这一条必须测：把默认写成 `Some("zh")`
+        // 就会永久盖掉 config.toml 与环境变量两级。
+        let none = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert_eq!(none.lang, None);
+        assert_eq!(none.motion, None);
+    }
+
+    #[test]
+    fn bad_lang_or_motion_is_an_error_and_never_a_silent_default() {
+        for bad in [
+            "--lang=zh-tw", // 子标签本身能解析出 zh（合法），先测真正认不出的
+            "--lang=zz",
+            "--lang=",
+            "--motion=high",
+            "--motion=",
+            "--motion=off2",
+        ] {
+            let args = v(&["--test-rect", bad]);
+            let got = parse(&args).unwrap().options();
+            if bad == "--lang=zh-tw" {
+                // `zh_TW` 是**合法**的（落简体，本轮只有简体文案）⇒ 只有真认不出的才炸
+                assert!(got.is_ok(), "{bad} 不该被拒：{got:?}");
+                continue;
+            }
+            let Err(msg) = got else {
+                panic!("「{bad}」被静默接受了 ⇒ 用户看不到自己写错了");
+            };
+            // 报错必须点名是哪个开关、并列出支持范围（否则用户只能翻源码）
+            let which = if bad.starts_with("--lang") {
+                "--lang"
+            } else {
+                "--motion"
+            };
+            assert!(msg.contains(which), "{bad} 的报错没点名开关：{msg}");
+            assert!(
+                msg.contains("zh/en/ja/ko") || msg.contains("full/reduce/off"),
+                "{bad} 的报错没列出支持哪些值：{msg}"
+            );
+        }
+    }
+
+    /// 值长得像 flag 的那条老规矩对两个新开关同样成立：`--lang --probe` 吞掉 `--probe`
+    /// 就等于"探测变成起 surface"，是 live 会话上最坏的一种错。
+    #[test]
+    fn lang_and_motion_never_swallow_the_next_flag() {
+        assert!(parse(&v(&["--lang", "--probe"])).is_err());
+        assert!(parse(&v(&["--motion", "--probe"])).is_err());
+        assert!(parse(&v(&["--lang"])).is_err(), "缺值也要报错");
+    }
+
+    /// `--probe` 这条路径**不渲染任何东西**，所以它绕过 `options()`（那会因"没 manifest"先炸），
+    /// 但**不能因此放过打错的档**：`--probe --lang=jap` 静默成功 = 对用户说谎（他下次真起
+    /// overlay 时看到的仍是默认档）。R14 的口径是"任何一条路径都不静默退默认"，不是
+    /// "只有会画像素的那条不静默"。
+    #[test]
+    fn probe_path_still_rejects_a_bad_lang_or_motion() {
+        for bad in [
+            &["--probe", "--lang=jap"][..],
+            &["--probe", "--motion=high"][..],
+            &["--probe", "--lang", ""][..],
+        ] {
+            let Err(msg) = dispatch(&v(bad)) else {
+                panic!("{bad:?} 被静默接受了 ⇒ 探测在告诉用户这个码是对的");
+            };
+            assert!(
+                msg.contains("认不出来")
+                    && (msg.contains("zh/en/ja/ko") || msg.contains("full/reduce/off")),
+                "{bad:?} 的报错没点名开关与支持范围：{msg}"
+            );
+        }
+        // 合法值在探测路径上必须放行（否则这条预检就把诊断功能给堵死了）
+        assert!(matches!(
+            dispatch(&v(&["--probe", "--lang=en", "--motion=reduce"])),
+            Ok(Outcome::Probed(_))
+        ));
     }
 }
