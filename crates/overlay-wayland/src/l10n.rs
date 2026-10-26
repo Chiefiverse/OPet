@@ -1,6 +1,6 @@
 //! 界面文案的唯一来源：四种语言 × 一张词表（`docs/UI_REDESIGN_V2.md` §4.3）。
 //!
-//! 纯逻辑 —— 不许出现 wayland 类型，也不许读环境变量/文件（`Lang` 的生效值由 `app.rs`
+//! 纯逻辑 —— 不许出现 wayland 类型，也不许读环境变量/文件（`Lang` 的生效值由 `settings.rs`
 //! 按"`--lang` > config.toml > `LC_ALL`/`LANG` > 默认"决定后传进来），headless CI 必绿。
 //!
 //! ⚠️ **改这里的任何一个非 ASCII 字面量，必须重跑 `python3 tools/subset_font.py` 重裁字体**，

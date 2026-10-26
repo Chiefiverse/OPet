@@ -70,6 +70,7 @@ use crate::atlas::Atlas;
 use crate::card;
 use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
 use crate::region::{CellRect, Regions};
+use crate::settings;
 
 /// `wp_fractional_scale` 的 scale 单位是 1/120（180 = 1.5×，本机 eDP-1 实测值）。
 const SCALE_UNIT: u32 = 120;
@@ -300,6 +301,15 @@ impl Gacha {
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
+    // 设置只在**启动时读一次**（设计书 §4 禁止定时轮询 ⇒ 不做 watcher）。顺序固定：
+    // 先说文件本身怎么样（坏语法要抢在生效值前面），再说生效值和它来自哪一层。
+    let cfg = petstore::config::Config::read();
+    cfg.announce();
+    eprintln!("ui: 配置 {}", cfg.describe());
+    // `None, None` = CLI 那两个开关还没接（提交 4），此刻文件与环境变量是仅有的两级。
+    let settings = settings::Settings::from_process(None, None, &cfg)?;
+    settings.announce();
+
     let conn = Connection::connect_to_env().map_err(|e| format!("连不上 Wayland: {e}"))?;
     let (globals, event_queue) =
         registry_queue_init::<App>(&conn).map_err(|e| format!("registry 初始化失败: {e}"))?;
