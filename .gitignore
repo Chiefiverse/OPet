@@ -20,3 +20,6 @@
 
 # CLI 会话在本项目目录里落的工作产物，与代码无关
 /.qoder/
+
+# Python 字节码：tools/*.py 是入库脚本，编译检查或 import 会就地生成 __pycache__
+__pycache__/

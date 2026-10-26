@@ -120,22 +120,38 @@ def main():
     ok_anchor = bool(feet) and 0 <= feet[0] <= w and 0 <= feet[1] <= h
     rep.add("anchor.feet 在帧内", str(feet), "x∈[0,%d] y∈[0,%d]" % (w, h), ok_anchor, "越界则内核判'不在帧内'并拒绝清单")
 
-    # 待机底边抖动：anchor 不等于底行（四足在俯视下腿投影低于原点），所以查帧间抖动
+    # 待机底边抖动：anchor 不等于底行（四足在俯视下腿投影低于原点），所以查帧间抖动。
+    #
+    # ⚠️ 比较轴必须是"同一朝向、跨帧"，不是"同一帧、跨朝向"。后者量的是 15° 俯视把
+    # 前后脚投影到不同屏幕行的**固定透视差**（脚越靠前投影越低），模型站得一动不动
+    # 也会有 2–3 px；按它判等于把"换个骨架"自动判成"脚在滑"。
+    # 换轴后用三个已知样本标定（同一套 96px/16samples 烘焙）：
+    #   占位小白（腿是刚体图元）      跨帧 0 px / 跨朝向 1 px
+    #   太空猫参数化骨骼 idle         跨帧 2 px（开 --plant-feet）/ 4 px（不开）
+    #   太空猫套现成人类 HumanDrunkIdle 跨帧 8 px
+    # ⇒ 新轴仍然会红（剪辑那条就是），只是不再把投影差误判成抖动。
     if "idle" in manifest["states"]:
-        bottoms = {}
+        grid = {}
         for row in manifest["states"]["idle"]["rows"]:
             for col in range(cols):
-                block = sheet[row * h : (row + 1) * h, col * w : (col + 1) * w, 3] > ALPHA_THRESHOLD
+                block = sheet[row * h : (row + 1) * h, col * w : (col * w) + w, 3] > ALPHA_THRESHOLD
                 ys = np.nonzero(block.any(axis=1))[0]
-                bottoms.setdefault(row, []).append(int(ys.max()) if ys.size else -1)
-        spreads = {r: max(v) - min(v) for r, v in bottoms.items()}
-        worst = max(spreads.values())
+                grid[(row, col)] = int(ys.max()) if ys.size else -1
+        by_col = {}
+        for (row, col), y in grid.items():
+            by_col.setdefault(col, []).append(y)
+        frame_spread = {col: max(v) - min(v) for col, v in by_col.items()}
+        worst = max(frame_spread.values())
+        by_row = {}
+        for (row, col), y in grid.items():
+            by_row.setdefault(row, []).append(y)
+        face_spread = {row: max(v) - min(v) for row, v in by_row.items()}
         rep.add(
             "idle 底边帧间抖动",
-            "最大 %d px (逐行 %s)" % (worst, spreads),
+            "最大 %d px (逐朝向 %s)" % (worst, dict(sorted(frame_spread.items()))),
             "<= %d px" % IDLE_BOTTOM_JITTER_PX,
             worst <= IDLE_BOTTOM_JITTER_PX,
-            "非零 ⇒ 待机时脚在滑",
+            "同朝向跨帧；同帧跨朝向极差 %s 是俯视投影差，不算抖动" % dict(sorted(face_spread.items())),
         )
 
     # polygon.json
