@@ -4,25 +4,59 @@
 
 use petcore::gacha::Rarity;
 
+use crate::l10n::{self, Key, Lang};
 use crate::settings::Motion;
+use crate::text;
 
-/// 可点的菜单项。余额行与错误行是信息，不进命中表。
+/// 可点的菜单项。余额行是信息，不进命中表。
+///
+/// ⚠️ `Lang`（语言行）**不在 [`MenuItem::CLICKABLE`] 里**，但**能被命中** —— 它走
+/// [`footer`] 那一块单独的矩形，好让"三行行带 + 缝隙不命中"那条证明一行不动（§4.4）。
+/// 加了它 `on_menu_press` 的 `match` 会因穷尽性编译不过 ⇒ 新项漏分派不可能静默。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuItem {
     Pull1,
     Pull10,
     Close,
+    /// 点一下循环 zh→en→ja→ko。**只改本进程**，不写回 config.toml（§7-R15：手写 reader
+    /// 保不住用户注释，读改写会把文件刷平）。
+    Lang,
 }
 
 impl MenuItem {
+    /// 三行行带。常量长度是 3 而不是 4 是有意的：`layout()` 的几何证明、缝隙判定、
+    /// `ROW_STEP` 全部按这三行算，语言行不属于这一族。
     pub const CLICKABLE: [Self; 3] = [Self::Pull1, Self::Pull10, Self::Close];
 
-    /// 卡片上的显示文本（字模只认 ASCII，非 ASCII 会被 `font` 画成 `?`）。
-    pub const fn label(self) -> &'static str {
+    /// 卡片上显示的字。**唯一来源是 `l10n`**，这里一个字面量都不写（写了就绕过
+    /// `everything_the_ui_can_render_is_in_the_codes_list` 那对字体门禁）。
+    /// 语言行返回 `语言 中文` 这种"标签 + 当前语言的自名"（理由见 [`l10n::lang_row`]：
+    /// 看不懂当前语言的人恰恰最需要点它）。
+    pub fn label(self, lang: Lang) -> String {
         match self {
-            Self::Pull1 => "PULL x1",
-            Self::Pull10 => "PULL x10",
-            Self::Close => "CLOSE",
+            Self::Pull1 => lang.t(Key::Pull1).to_string(),
+            Self::Pull10 => lang.t(Key::Pull10).to_string(),
+            Self::Close => lang.t(Key::Close).to_string(),
+            Self::Lang => l10n::lang_row(lang),
+        }
+    }
+
+    /// 这一项占的矩形（行带里的三项 + 底部语言行）。`layout()` 与 [`footer`] 的并集就是
+    /// 命中表 ⇒ 两处共用同一份几何，draw 与 hit_test 不可能各算一套。
+    pub fn rect(self) -> ItemRect {
+        if self == Self::Lang {
+            return footer();
+        }
+        let i = Self::CLICKABLE
+            .iter()
+            .position(|&it| it == self)
+            .expect("CLICKABLE 覆盖三个行项");
+        ItemRect {
+            item: self,
+            x: PAD,
+            y: PAD + HEAD_H + (i as i32) * ROW_STEP,
+            w: CARD_W - 2 * PAD,
+            h: ROW_H,
         }
     }
 }
@@ -52,18 +86,23 @@ impl ItemRect {
 
 /// 卡片尺寸（logical px）。取菜单态与结果卡两者的最大需求，动画期不重建 surface。
 ///
-/// 宽度由**排版契约**定，不是拍的：结果卡一行最宽的形状是 `"{rarity} {item_id} NEW"`
-/// （实测形如 `SSR cat_shiro_01 NEW` = 19 字符），而字号必须是"逻辑 2 px/字模像素"
-/// 才在 96 px 宠物旁边读得清（见 [`TEXT_PX`]）。`2*PAD + 18*STEP*TEXT_PX = 232 ≤ CARD_W`
-/// 这条算术由 `report_budget_fits_the_card` 钉住。
+/// 宽度由**排版契约**定，不是拍的：结果卡一行最宽的形状是"档位 + 物品名 + 尾标"，而物品名
+/// 现在是 catalog 里的**中文名**（`SSR 蓝帽 新`），拉丁语系的标签更长（en 的
+/// `+999999 shards`、`Balance 9,999,999`）。⇒ 预算单位必须是**像素**而不是字符数：
+/// CJK 每字 ≈1 em、拉丁字母窄得多，按字数截必然一边宽一边窄（§4.5）。
+/// 由 [`MAX_LINE_PX`] 与 [`line_width`] 给，逐 locale × 逐档由 `every_locale_fits_the_card` 量。
 /// ⚠️ 上一版这里写的是 180 + 20 字符，证明用的是"物理 scale 2"，也就是**只在 1.5× 屏上**
 /// 成立（270 物理像素刚好够）；换到 1× 屏就是 240 > 180 直接切字。排版预算必须和显示器
 /// 缩放无关，否则门禁绿着、字却被裁了 —— 又是"看起来对、其实说谎"那一族。
+/// 这条口径现在由 `report_budget_is_scale_independent` 钉住（同一句话在 1×/1.5×/2× 上
+/// 截在同一个字上）。
 pub const CARD_W: i32 = 240;
 pub const CARD_H: i32 = 150;
 
-/// 字号：**逻辑**像素/字模像素。`draw` 层乘上生效缩放得到物理字号 ⇒ 同一份排版
-/// 在 1× 和 1.5× 上占的 logical 宽度一模一样，预算也就只需要证一次。
+/// 降级字模（`font.rs`，5×7 ASCII 位图）的逻辑字号：**逻辑**像素/字模像素。
+/// 只有 [`crate::text::face`] 拿不到字体资产时才会用到它（那条路径在 CI 里被
+/// `the_shipped_font_loads_and_covers_the_list` 拦住，永远不执行）。留着的理由不是整洁，
+/// 是硬约束 3「宠物崩溃不能影响桌面」：字体资产出事只能不画字/画丑字，不能炸进程。
 pub const TEXT_PX: i32 = 2;
 
 /// 行几何：左右留边 8，顶部信息行占 22，行高 26，**行步进 30**（26 高 + 4 缝）。
@@ -73,23 +112,45 @@ pub const PAD: i32 = 8;
 pub const HEAD_H: i32 = 22;
 pub const ROW_H: i32 = 26;
 pub const ROW_STEP: i32 = 30;
-/// 结果卡行步进（logical）：字模 7 px 高 × scale 2 = 14，留 4 leading。
+/// 结果卡行步进（logical）：字体度量给的行高是 16（`line_height == px`，见 `text::LOGICAL_PX`
+/// 那张实测表），留 2 leading。
 pub const LINE_STEP: i32 = 18;
+
+/// 底部语言行的几何：`124..140`，**右对齐**（`draw` 层按 `measure` 反推 x）。
+///
+/// 为什么是 16 高：`line_height(16) == 16`，而底部带 `116..150` 只有 34 px —— 两行加间隙要
+/// 40 px 装不下。这是算术不是审美（§4.4）。为什么从 124 起：三行的最后一行底边在
+/// `PAD + HEAD_H + 2*ROW_STEP + ROW_H = 116`，留 8 px 气 ⇒ 语言行与行带**不相交**，
+/// 这条由 `footer_is_below_the_rows_and_inside_the_card` 钉住（写成 122 时那个"气"实测只有
+/// 6 px，断言当场红了 ⇒ 常量按证明改，不是按记忆改）。
+pub const FOOTER_Y: i32 = 124;
+pub const FOOTER_H: i32 = 16;
+/// 语言行与错误行同行带，两者之间必须留的气（logical）。错误行左对齐、语言行右对齐。
+pub const FOOTER_GAP: i32 = 8;
+
+/// 语言行的矩形（**不**在 [`layout`] 的三行里，但在 [`rects`] 的命中表里）。
+pub fn footer() -> ItemRect {
+    ItemRect {
+        item: MenuItem::Lang,
+        x: PAD,
+        y: FOOTER_Y,
+        w: CARD_W - 2 * PAD,
+        h: FOOTER_H,
+    }
+}
 
 /// 固定布局：3 个可点项从上到下。`layout` 与 `hit_test` 是唯一的真相源，
 /// `draw_menu` 画矩形、`menu_pointer_event` 判命中都从这张表取，不许各处再算一份。
 pub fn layout() -> Vec<ItemRect> {
-    MenuItem::CLICKABLE
-        .iter()
-        .enumerate()
-        .map(|(i, &item)| ItemRect {
-            item,
-            x: PAD,
-            y: PAD + HEAD_H + (i as i32) * ROW_STEP,
-            w: CARD_W - 2 * PAD,
-            h: ROW_H,
-        })
-        .collect()
+    MenuItem::CLICKABLE.iter().map(|&it| it.rect()).collect()
+}
+
+/// 命中表 = 三行 + 语言行。语言行走 `footer()` 这条路，所以行带的四个常量与
+/// "缝隙不命中"那条证明（`hit_test_hits_centers_and_misses_gaps_and_margins`）一行没动。
+pub fn rects() -> Vec<ItemRect> {
+    let mut v = layout();
+    v.push(footer());
+    v
 }
 
 /// 菜单-local logical 坐标 → 命中的项。缝隙、边距、行外一律 None。
@@ -409,16 +470,19 @@ pub fn white_flash(anim: &MenuAnim, motion: Motion) -> bool {
     }
 }
 
-/// 卡片内容签名：`(相位, 余额, 错误行)` 全同 ⇒ 像素一模一样 ⇒ draw 层跳过 commit。
+/// 卡片内容签名：`(相位, 语言, 余额, 错误行)` 全同 ⇒ 像素一模一样 ⇒ draw 层跳过 commit。
 /// 这是菜单的省电闸门 —— 没有它，`update_menu` 每 tick 置脏，静止的菜单也会 60 次/秒
 /// 提交 180×150 的 buffer（M4 的三档口径里"无事可做"那一档就永远不会出现）。
 ///
+/// ⚠️ **`lang` 必须在 `elapsed` 之前**：切语言应当在**同一 tick 计数**下也被认成内容变化
+/// （菜单态三行的字换了，而 `elapsed` 一直是 0）。把它排在后面，`Menu` 相位的 `elapsed = 0`
+/// 会让"换了字"这件事仍然混进签名 —— 顺序在这里不影响正确性，但影响**读代码的人能不能
+/// 一眼看出 lang 不属于动画量**，所以固定这个位置并由 `switching_lang_bumps_sig_once_then_is_stable` 钉住。
 /// ⚠️ **`motion` 故意不进签名**：它和 `dry_run` 同族 —— 启动时一次定死，运行中没有任何
 /// UI 入口能改它 ⇒ "同一份输入给同一个签名"不会因为少了它而失真。对照 `lang`：语言**能**
-/// 在运行中被点着换，所以它必须在签名里（下一步接语言行时加，混入位置 = 相位 tag 之后、
-/// `elapsed` 之前）。把这条区别写在这里，是因为两者长得像而语义相反，最容易顺手抄错。
+/// 在运行中被点着换 ⇒ 必须进。把这条区别写在这里，是因为两者长得像而语义相反，最容易顺手抄错。
 /// FNV-1a：不需要新依赖，且**只用来判等**，不当哈希表键、不进任何确定性契约。
-pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str) -> u64 {
+pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str, lang: Lang) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |b: u8| {
         h ^= b as u64;
@@ -432,6 +496,11 @@ pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str) -> u64 {
         MenuAnim::Reveal { elapsed, best, .. } => (5 + best.index() as u8, *elapsed),
     };
     mix(tag);
+    // 语言紧跟相位 tag、在 elapsed 前（见上面那条 ⚠️）。用 `code()` 的字节而不是枚举序号
+    // ⇒ 新增一档语言不需要改这里，也不可能出现"两个不同枚举值混成同一个签名"。
+    for &b in lang.code().as_bytes() {
+        mix(b);
+    }
     for b in elapsed.to_le_bytes() {
         mix(b);
     }
@@ -464,65 +533,170 @@ pub fn best_rarity(counts: &[u32; 4]) -> Option<Rarity> {
         .copied()
 }
 
-/// 结果卡排版预算。十连全列 = 13 行，卡片（180×150 logical、字模 scale 2 一行约 21 字符）
-/// 装不下，`font` 的逐点裁剪又会把词切一半 ⇒ **行数和行宽必须在拼行时就定死**，
-/// 而不是留给渲染层兜底。这三条常量是 draw 层的排版契约。
-pub const MAX_LINE_CHARS: usize = 18;
-/// 结果卡最多 7 行：`标题 + 档位计数 + TOP_ITEMS 明细 + MORE + 碎片 + DRYRUN`。
-/// 与 [`LINE_STEP`] 一起构成"卡片装得下"的算术证明（见测试 `report_budget_fits_the_card`）。
-pub const MAX_REPORT_LINES: usize = 7;
-/// 明细最多列几条（其余并进 `+N MORE`），永远先列最高档。
+/// 结果卡排版预算。**单位是像素，不是字符数**：CJK 每字比拉丁宽得多，按字数截必然一边宽
+/// 一边窄（§4.5）。`MAX_LINE_PX` 是**逻辑**预算（内容区宽），[`line_budget_px`] 按字号档
+/// 换成物理预算，与 [`line_width`] 同量纲。
+///
+/// ⚠️ 这里有一个**上一版方案里写错的前提**（§4.5 说"CJK 每字正好 1 em 没有进位 ⇒ 截点逐位
+/// 相等"）：[`crate::text`] 传给 `ab_glyph` 的 `px` 是**字体高度**（`PxScale` = ascent−descent），
+/// 不是 em。实测这份子集 `ascent 1160 / descent −288 / upem 1000` ⇒ 一个汉字的 advance 是
+/// `1000/1448 = 0.6906` 个 `px`，于是三档的逐字取整是 **11 / 17 / 22**（11.05·1.5 = 16.58 进位）。
+/// 按"每档各自的取整宽"决定截点，1.5× 就会比 1×/2× 少截一个字（实测 [20, 19, 20]）—— 而这
+/// 正是判据"预算与缩放无关"要防的形状。正解见 [`advance_bound_log`]：**截点在逻辑域里一次定
+/// 死**，物理档只负责验证"画得下"。
+///
+/// 十连全列 = 13 行，卡片装不下，而逐点裁剪会把词切一半 ⇒ **行数和行宽必须在拼行时就定死**，
+/// 不是留给渲染层兜底。
+pub const MAX_LINE_PX: i32 = CARD_W - 2 * PAD;
+/// 结果卡最多 **6** 行：`标题 + 档位计数 + TOP_ITEMS 明细 + MORE + 碎片` = 1+1+2+1+1。
+/// （**演示标在标题行**，不占一行 —— 打两处就是把一个冗余行花在零信息上。）
+///
+/// ⚠️ 这个数不是"卡片还能塞几行"的最大值，而是"**不许压到 footer**"的上界：行带从 `PAD`
+/// 起、每行 [`LINE_STEP`]，而 footer 从 [`FOOTER_Y`] 起 ⇒ `PAD + 6×18 = 116 ≤ 124`，
+/// 第七行会写到 134 直接盖住余额/语言行。上一版写 7 时 footer 还不存在，那条算术证明
+/// 只对着 `CARD_H` 核 ⇒ 底部带一加进来就破了（`report_budget_fits_the_card` 现在钉的是这个）。
+pub const MAX_REPORT_LINES: usize = 6;
+/// 明细最多列几条（其余并进 `+N 更多`），永远先列最高档。
 pub const TOP_ITEMS: usize = 2;
 
-/// 按字符数截断到 [`MAX_LINE_CHARS`]（超长留一个 `.`）。ASCII 预算下 char 与 byte 等价，
-/// 但按 char 走，非 ASCII 混进来也不会切在字节中间。
-pub fn fit(s: &str) -> String {
-    if s.chars().count() <= MAX_LINE_CHARS {
-        return s.to_string();
+/// 单个字的推进宽度（**物理**像素），与 [`line_width`] 同一个口径（可加 ⇒ 两者一致）。
+///
+/// ⚠️ 这里**不能**直接写 `text::measure(...)`：字体拿不到时 `measure` 返回 0（"不画字"），
+/// 而 0 宽会让 [`fit_to`] 以为整行都放得下 ⇒ 结果是"卡片上一个字都没有、门禁全绿"。
+/// 显式分两支，降级路径按等宽点阵算自己的账。
+fn advance_px(c: char, scale: f32) -> i32 {
+    if text::face().is_some() {
+        text::measure(&c.to_string(), text::physical_px(scale))
+    } else {
+        // 降级字模等宽：`STEP` 逻辑 × 逻辑字号，再乘缩放。这条分支在 CI 里永不执行
+        // （字体资产有 sha256 门禁），留着只为了"资产坏了也只是字丑，不炸进程"。
+        (crate::font::STEP as f32 * TEXT_PX as f32 * scale).round() as i32
     }
-    let head: String = s.chars().take(MAX_LINE_CHARS - 1).collect();
-    format!("{head}.")
 }
 
-/// 结果卡文本（渲染无关，逐行走 `font::draw_str`）。
-/// `items` = 每抽的 `(item_id, rarity, 是否重复)`；`dry_run` 必须打 DRYRUN 标 ——
-/// 让用户能一眼分清"这是内存库的演示"还是"真落库了"（与 `--allow-default-archive` 红线同族）。
+/// 字号档相对逻辑字号的比 ∈ {1, 1.5, 2}（`physical_px` 已经把任意 scale 夹进三档）。
+///
+/// ⚠️ 预算和排版**必须共用这一个比**，不能用传进来的 `scale` 原值：1.25× 的屏会夹到 16 px 档
+/// （比 = 1.0），若预算按原值放大到 280，就会出现"按 1.25× 的钱排、按 1× 的字画"⇒ 一行放 25
+/// 个字而卡片只有 240 逻辑宽 ⇒ 顶穿右边距，而像素门禁只看得见"这一格没东西"。
+fn tier_ratio(scale: f32) -> f32 {
+    text::physical_px(scale) as f32 / text::LOGICAL_PX as f32
+}
+
+/// 一串字有多宽（物理像素）。draw 层居中/右对齐也用它 ⇒ 排版与截断**不会差 1 px**。
+pub fn line_width(s: &str, scale: f32) -> i32 {
+    s.chars().map(|c| advance_px(c, scale)).sum()
+}
+
+/// 一行能占多少物理像素（`MAX_LINE_PX` 随字号档放大，见 [`tier_ratio`]）。
+pub fn line_budget_px(scale: f32) -> i32 {
+    (MAX_LINE_PX as f32 * tier_ratio(scale)).floor() as i32
+}
+
+/// 单 char 的**逻辑宽度上界**：16 px 档的取整宽 + 1。截断只按它算 ⇒ 截点与缩放无关。
+///
+/// 为什么 `+1` 就够了（这条是整个"预算与缩放无关"的地基，所以要能口算）：
+/// `round(u) ≥ u − 0.5` ⇒ `bound = round(u) + 1 ≥ u + 0.5`；又 `round(u·r) ≤ u·r + 0.5·r`
+/// 且 `r ≥ 1` ⇒ `round(u·r) ≤ (u + 0.5)·r ≤ bound·r`。逐 char 求和：
+/// **任意档的实际画宽 ≤ `比 × Σ bound`**，所以只要 `Σ bound ≤ 逻辑预算` 就一定画得下。
+/// （空格在 [`crate::text::measure`] 里特判成 `px/3`，是整数除法不是比例，但
+/// `floor(16r/3) ≤ 5.34r ≤ 6r = bound·r` 同样成立。）
+///
+/// 代价：每字最多 1 个逻辑 px 的余量 ⇒ 一行少装约一个字。换来的是"三档截在同一个字上"
+/// 从**实测**升级成**可证**，而这正是判据①（1× 屏上的字被切一半）防的东西。
+fn advance_bound_log(c: char) -> i32 {
+    advance_px(c, 1.0) + 1
+}
+
+/// 整串的逻辑宽度上界（配合 [`advance_bound_log`]）。
+fn line_bound_log(s: &str) -> i32 {
+    s.chars().map(advance_bound_log).sum()
+}
+
+/// 逐 char 累加**像素**截断，超长补一个 `…`（U+2026，在子集清单里）。
+///
+/// 先给省略号留出宽度再装正文 ⇒ 结果串必然 `<= budget`，不会因为"最后一个字正好顶边、
+/// 再加个省略号就超"而仍然出界。空串与正好等预算的都原样返回（不无端补点）。
+///
+/// ⚠️ **决定截在哪的是 [`line_bound_log`]（逻辑域、与 scale 无关），不是每档各自的取整宽**，
+/// 理由见 [`MAX_LINE_PX`] 那段（`report_budget_is_scale_independent` 钉的就是这条）。`scale`
+/// 只用来把调用方给的**物理**预算折回逻辑预算（下取整 ⇒ 只会更保守）。
+pub fn fit(s: &str, scale: f32) -> String {
+    fit_to(s, line_budget_px(scale), scale)
+}
+
+/// [`fit`] 但预算由调用方给 —— 底部那一行同时装错误行（左）与语言行（右），
+/// 错误行的可用宽 = 内容区 − 语言行宽 − [`FOOTER_GAP`]，不是整行。
+///
+/// **放不下省略号就一个字节都不画**（返回空串）：画一个顶穿出界的 `…` 比不画更坏 ——
+/// 像素门禁看不见"顶穿"，只会看见"这一格没东西"，而人会读到一条被切掉尾巴的错误。
+/// 这条与"宁可不画也不炸进程"（硬约束 3）同族。
+pub fn fit_to(s: &str, budget: i32, scale: f32) -> String {
+    let budget = budget.max(0);
+    let room = (budget as f32 / tier_ratio(scale)).floor() as i32;
+    let ell_w = advance_bound_log('…');
+    if line_bound_log(s) <= room {
+        return s.to_string();
+    }
+    if ell_w > room {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = advance_bound_log(c);
+        if used + w + ell_w > room {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    debug_assert!(
+        line_width(&out, scale) <= budget,
+        "fit 出来的串在这一档还超物理预算：{out:?} budget={budget} 实宽={}",
+        line_width(&out, scale)
+    );
+    out
+}
+
+/// 结果卡文本（渲染无关，逐行走 draw 层）。
+///
+/// `items` = 每抽的 **(`显示名`, rarity, 是否重复)** —— 第一项现在是 catalog 里的**中文名**
+/// 而不是 `item_id`：玩家抽到「蓝帽」，卡片上就该写「蓝帽」（`app.rs` 取 `catalog.find(id)`，
+/// 查不到回退 id，**绝不留白**）。
+///
+/// `lang` 决定每一条的文案与词序（模板各语言各写，见 `l10n`）；`scale` 决定截断的像素口径。
+/// ⚠️ 这两样都是在**抽取那一刻**烤进字符串的 ⇒ 之后切语言不会重刷已经挂着的卡，
+/// 这不是 bug 而是"当前显示的卡永远与生成它时的语言一致"（§4.4 / §7-R10，
+/// 由 `baked_lines_keep_the_language_they_were_pulled_in` 钉住）。
+/// 演示标不在这里：它由 `card.rs` 的标题行徽标承担（`l10n::header_shards`）。
 pub fn report_lines(
     counts: &[u32; 4],
     items: &[(String, Rarity, bool)],
     shards_gained: u64,
-    dry_run: bool,
+    lang: Lang,
+    scale: f32,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    match best_rarity(counts) {
-        Some(best) => lines.push(fit(&format!("{} PULLED BEST {best}", items.len()))),
-        None => lines.push(fit(&format!("{} PULLED", items.len()))),
-    }
+    lines.push(fit(
+        &l10n::line_pulled(lang, items.len(), best_rarity(counts)),
+        scale,
+    ));
     // 档位计数行：只列非零档，从高到低。稳定排序 ⇒ 同档永远按抽取顺序出。
-    let tiers: Vec<String> = Rarity::ALL
-        .iter()
-        .rev()
-        .filter(|r| counts[r.index()] > 0)
-        .map(|r| format!("{}{}", r.as_str(), counts[r.index()]))
-        .collect();
+    let tiers = l10n::line_tiers(counts);
     if !tiers.is_empty() {
-        lines.push(fit(&tiers.join(" ")));
+        lines.push(fit(&tiers, scale));
     }
     let mut ranked: Vec<&(String, Rarity, bool)> = items.iter().collect();
     ranked.sort_by_key(|(_, r, _)| std::cmp::Reverse(r.index()));
-    for (id, r, dup) in ranked.iter().take(TOP_ITEMS) {
-        lines.push(fit(&format!(
-            "{r} {id} {}",
-            if *dup { "DUP" } else { "NEW" }
-        )));
+    for (name, r, dup) in ranked.iter().take(TOP_ITEMS) {
+        lines.push(fit(&l10n::line_item(lang, *r, name, *dup), scale));
     }
     if items.len() > TOP_ITEMS {
-        lines.push(fit(&format!("+{} MORE", items.len() - TOP_ITEMS)));
+        lines.push(fit(&l10n::line_more(lang, items.len() - TOP_ITEMS), scale));
     }
-    lines.push(fit(&format!("+{shards_gained} SHARDS")));
-    if dry_run {
-        lines.push(fit("DRYRUN"));
-    }
+    lines.push(fit(&l10n::line_shards(lang, shards_gained), scale));
     debug_assert!(lines.len() <= MAX_REPORT_LINES, "结果卡超行 ⇒ 排版契约破了");
     lines
 }
@@ -530,11 +704,23 @@ pub fn report_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use petcore::gacha::Catalog;
 
     #[test]
     fn layout_rects_are_disjoint_and_inside_the_card() {
-        let rects = layout();
-        assert_eq!(rects.len(), 3);
+        // 四张矩形（三行 + 语言行）都在命中表里 ⇒ 这张表**必须**是 draw 与 hit_test 共用的
+        // 那一份；漏了第 4 项，语言行画得出来却点不到。
+        let rects = rects();
+        assert_eq!(rects.len(), 4, "三行 + 语言行 = 四张命中矩形");
+        assert_eq!(
+            rects.iter().map(|r| r.item).collect::<Vec<_>>(),
+            vec![
+                MenuItem::Pull1,
+                MenuItem::Pull10,
+                MenuItem::Close,
+                MenuItem::Lang
+            ]
+        );
         for r in &rects {
             assert!(r.x >= 0 && r.y >= 0 && r.x + r.w <= CARD_W && r.y + r.h <= CARD_H);
         }
@@ -546,9 +732,42 @@ mod tests {
         }
     }
 
+    /// 语言行的几何证明（§4.4）：它在三行**之下**、在卡片**之内**，而且与行带不相交 ——
+    /// 这条取代了"footer 只在 layout 里"的那种假前提。
+    #[test]
+    fn footer_is_below_the_rows_and_inside_the_card() {
+        let rows = layout();
+        assert_eq!(rows.len(), 3, "CLICKABLE 恒三行：语言行走 footer 那条路");
+        let f = footer();
+        let last = rows.last().unwrap();
+        assert_eq!(
+            last.y + last.h,
+            PAD + HEAD_H + 2 * ROW_STEP + ROW_H,
+            "最后一行的底边由四个行常量决定，改常量要看得见"
+        );
+        assert_eq!(
+            f.y - (last.y + last.h),
+            8,
+            "语言行与行带之间留 8 px 气 ⇒ 两者不相交"
+        );
+        assert!(!overlaps(last.as_rect(), f.as_rect()), "语言行压进行带了");
+        assert!(
+            f.y + f.h <= CARD_H,
+            "语言行底边出卡：{} > {CARD_H}",
+            f.y + f.h
+        );
+        // 底部带只装得下一行（两行要 30–32 px）：这是算术不是审美。
+        assert!(
+            2 * text::line_height(text::LOGICAL_PX) + FOOTER_GAP > CARD_H - last.y - last.h,
+            "底部带装得下两行了 ⇒ FOOTER_H = 16 那条理由（§4.4）就不再成立，得重论"
+        );
+    }
+
     #[test]
     fn hit_test_hits_centers_and_misses_gaps_and_margins() {
-        let rects = layout();
+        // 用 [`rects`]（三行 + 语言行）而不是 [`layout`]：命中表**必须**与 draw 用的是同一份，
+        // 否则语言行画得出来却点不到 —— 而这只有真机能发现。
+        let rects = rects();
         for r in &rects {
             assert_eq!(
                 hit_test(&rects, ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)),
@@ -892,38 +1111,72 @@ mod tests {
         }
     }
 
-    /// 静止 ⇒ 签名不变 ⇒ draw 层不 commit。三个输入（相位/余额/错误行）任一变了都要变。
+    /// 静止 ⇒ 签名不变 ⇒ draw 层不 commit。四个可见输入（相位/语言/余额/错误行）任一变了
+    /// 都要变。
     #[test]
     fn content_sig_is_stable_when_static_and_moves_with_every_visible_input() {
-        let rest = content_sig(&MenuAnim::Menu, 100, "");
-        assert_eq!(rest, content_sig(&MenuAnim::Menu, 100, ""));
+        let rest = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh);
+        assert_eq!(rest, content_sig(&MenuAnim::Menu, 100, "", Lang::Zh));
         assert_eq!(
             rest,
-            content_sig(&advance(&MenuAnim::Menu, Motion::Full), 100, "")
+            content_sig(&advance(&MenuAnim::Menu, Motion::Full), 100, "", Lang::Zh)
         );
-        assert_ne!(rest, content_sig(&MenuAnim::Menu, 101, ""), "余额行会变");
         assert_ne!(
             rest,
-            content_sig(&MenuAnim::Menu, 100, "DB LOCKED"),
+            content_sig(&MenuAnim::Menu, 101, "", Lang::Zh),
+            "余额行会变"
+        );
+        assert_ne!(
+            rest,
+            content_sig(&MenuAnim::Menu, 100, "DB LOCKED", Lang::Zh),
             "错误行会变"
         );
+        // 语言行是**可见**输入：三行的字（抽一次/Pull 1/1回引く/1회 뽑기）全换了 ⇒ 必须换签名。
+        for l in Lang::ALL.iter().copied().filter(|l| *l != Lang::Zh) {
+            assert_ne!(
+                rest,
+                content_sig(&MenuAnim::Menu, 100, "", l),
+                "{l:?} 换了字却没换签名 ⇒ 静止判定会漏掉这一次像素变化"
+            );
+        }
         let burst = MenuAnim::Burst {
             rarity: Rarity::N,
             elapsed: 0,
             lines: vec!["X".into()],
         };
         assert_ne!(
-            content_sig(&burst, 100, ""),
-            content_sig(&advance(&burst, Motion::Full), 100, ""),
+            content_sig(&burst, 100, "", Lang::Zh),
+            content_sig(&advance(&burst, Motion::Full), 100, "", Lang::Zh),
             "扩散期每 tick 都在动 ⇒ 签名必须动"
         );
         // motion 不进签名（启动定死、运行中无人能改），但**同相位的不同档**像素确实相同，
         // 所以这里必须是等号；写成断言是为了让"顺手把 motion 混进来"当场红，而不是悄悄多一提交。
         assert_eq!(
-            content_sig(&burst, 100, ""),
-            content_sig(&burst, 100, ""),
+            content_sig(&burst, 100, "", Lang::Zh),
+            content_sig(&burst, 100, "", Lang::Zh),
             "签名不该看进程外的东西"
         );
+    }
+
+    /// §4.4 的静止基线新论证：切语言 = **一次点击一次换内容 = 恰好 +1 提交**，与点 CLOSE 同族；
+    /// 切完之后仍然静止 ⇒ 之后每 tick 签名不再变。这条钉住"静止 1 提交 / 真抽 1,107 提交"
+    /// 这对实测数字在 `lang` 进签名之后仍然成立。
+    #[test]
+    fn switching_lang_bumps_sig_once_then_is_stable() {
+        let mut prev = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh);
+        let mut bumps = 0;
+        for l in [Lang::En, Lang::Ja, Lang::Ko, Lang::Zh] {
+            let now = content_sig(&MenuAnim::Menu, 100, "", l);
+            if now != prev {
+                bumps += 1;
+            }
+            // 同一个语言再算十次都不许变（⇒ draw 层那十次一个 buffer 都不投）。
+            for _ in 0..10 {
+                assert_eq!(now, content_sig(&MenuAnim::Menu, 100, "", l));
+            }
+            prev = now;
+        }
+        assert_eq!(bumps, 4, "转一圈 = 四次内容变化，不多不少");
     }
 
     #[test]
@@ -1001,9 +1254,11 @@ mod tests {
         }
     }
 
-    /// 排版可行性证明：7 行 × 18 logical 高 + 上下边距 ≤ 卡片高；
-    /// 20 字符 × 6 × scale 2 的字模在 1.5× 缓冲（270 物理像素宽）里扣掉边距后放得下。
-    /// 这两条一旦不成立，draw 层只能"切掉半个词"—— 像素门禁看不见少字，所以必须在这里红。
+    /// 排版可行性证明（§4.5 换成字体驱动的版本）。竖向那条算术不变；横向**不再按字数**：
+    /// 旧的 `18 字符 × STEP 6 × TEXT_PX 2 = 216` 是 5×7 等宽点阵的算术，对 CJK（每字 ≈1 em）
+    /// 与拉丁（窄得多）混排必然一边宽一边窄 ⇒ 预算改成 [`MAX_LINE_PX`]，用真字体量。
+    /// 与 `text.rs::every_locale_fits_the_card` 的分工：那条量的是"最坏的一行装不装得下"，
+    /// 这条量的是"排版契约本身（行数/行距/数字不裁）成不成立"。
     #[test]
     fn report_budget_fits_the_card() {
         assert!(
@@ -1011,93 +1266,266 @@ mod tests {
             "结果卡装不下 {} 行",
             MAX_REPORT_LINES
         );
-        // 行宽预算：全用 **logical** 口径（字号 [`TEXT_PX`] 也是 logical），所以这条证明
-        // 与显示器缩放无关 —— 物理像素只是同步乘 scale，不存在"1.5× 才够宽"。
-        let text_w = MAX_LINE_CHARS as i32 * crate::font::STEP * TEXT_PX;
+        // ⚠️ 上面那条对着 `CARD_H` 的证明**不够**：底部还有一条 footer（错误行 / 语言行），
+        // 结果卡不许把行写到它上面。`MAX_REPORT_LINES` 从 7 降到 6 就是这条逼出来的。
         assert!(
-            2 * PAD + text_w <= CARD_W,
-            "{MAX_LINE_CHARS} 字符在字号 {TEXT_PX} 下要 {} logical 像素，卡片只有 {CARD_W}",
-            2 * PAD + text_w
+            PAD + MAX_REPORT_LINES as i32 * LINE_STEP <= FOOTER_Y,
+            "结果卡最后一行的底边 {} 压进 footer {FOOTER_Y} ⇒ 余额/语言行会被明细盖住",
+            PAD + MAX_REPORT_LINES as i32 * LINE_STEP
+        );
+        // 拼装处也验一次：`report_lines` 在**最坏输入**（十连）下真的没超过这个数。
+        assert_eq!(
+            1 + 1 + TOP_ITEMS + 1 + 1,
+            MAX_REPORT_LINES,
+            "标题+档位计数+明细+更多+碎片 就是行数预算的全部 ⇒ 对不上说明其中一处改了没同步"
+        );
+        // 行步进必须是**字体度量**给的，不是手抄常数：换字体/换字号时这条会红，
+        // 而不是等卡片上的两行字叠在一起。
+        let px = text::LOGICAL_PX;
+        assert!(
+            LINE_STEP >= text::line_height(px),
+            "行步进 {LINE_STEP} 小于字体行高 {} ⇒ 相邻行相交（leading 是负的）",
+            text::line_height(px)
         );
         assert_eq!(
-            2 * PAD + text_w,
-            232,
-            "排版预算算的是这个数，改了常量要看得见"
+            LINE_STEP - text::line_height(px),
+            2,
+            "留的 leading 就是这个数，改了常量要看得见"
         );
+        // **数字永不裁**（读错钱比看不见更糟，§4.4 的降级优先级最后一条）。
+        for &l in &Lang::ALL {
+            for &scale in &[1.0f32, 1.5, 2.0] {
+                let money = l10n::line_balance(l, 9_999_999);
+                assert_eq!(
+                    fit(&money, scale),
+                    money,
+                    "{l:?}/{scale}× 把余额裁了 ⇒ 预算破了，只能缩徽标/砍标签，不许动数字"
+                );
+                let shards = l10n::line_shards(l, 999_999);
+                assert_eq!(fit(&shards, scale), shards, "{l:?}/{scale}× 把碎片裁了");
+            }
+        }
     }
 
+    /// §4.5 的口径证明：**排版预算与显示器缩放无关**。同一句话在 1×/1.5×/2×（以及夹进同一档的
+    /// 1.25×）上必须截在**同一个字**上 —— 否则门禁绿着、1× 屏上的字却被切了一半（上一版
+    /// `CARD_W` 的注释写的就是这个坑）。
+    ///
+    /// ⚠️ **这条比批准的方案（§4.5"拉丁允许漂 2 字、只有 CJK 逐位相等"）更强，因为地基换了**：
+    /// 上一版的前提"CJK 每字正好 1 em ⇒ 没有进位"实测是**假的**（`ab_glyph` 的 `PxScale` 是
+    /// 字体高度不是 em，汉字 advance = 0.6906·px ⇒ 三档逐字取整 11/17/22，1.5× 那档必然多进
+    /// 一位）。按每档自己的取整宽决定截点，实测就漂成 [20, 19, 20]。现在截点只由
+    /// [`advance_bound_log`]（逻辑域上界）决定 ⇒ **任何文种都逐位相等**，物理那一档只需要证明
+    /// "画得下"（下面第二条断言）。代价是每字最多 1 逻辑 px 余量，一行少装约一个字。
     #[test]
-    fn report_lines_are_ascii_one_per_line_with_the_dryrun_stamp() {
-        let items = vec![
-            ("cat_shiro".to_string(), Rarity::N, false),
-            ("hat_bell".to_string(), Rarity::SR, true),
-        ];
-        let lines = report_lines(&[1, 0, 1, 0], &items, 8, true);
-        assert_eq!(lines[0], "2 PULLED BEST SR");
-        assert_eq!(lines[1], "SR1 N1", "档位计数行从高到低、只列非零档");
-        assert_eq!(lines[2], "SR hat_bell DUP", "明细先列最高档");
-        assert_eq!(lines[3], "N cat_shiro NEW");
-        assert_eq!(lines[4], "+8 SHARDS");
-        assert_eq!(lines[5], "DRYRUN");
+    fn report_budget_is_scale_independent() {
+        // 1.25 也放进来：它夹不进任何一档（`physical_px` 会把它折回 16 px）⇒ 排版必须和 1×
+        // 完全一致，这一条抓的是"预算按原始 scale 放大、字按档位画"那种顶穿右边距的写法。
+        let scales = [1.0f32, 1.25, 1.5, 2.0];
+        // 测料用**目录里真实存在的中文名**连起来，而不是随手打一串 CJK：缺字的 advance
+        // 是 0 ⇒ `line_width` 会算出"放得下"，这条门禁就自己把自己骗过去了（而且手打的串
+        // 长度刚好 = 预算时，`fit` 根本不会截，测的是个空条件）。
+        let catalog = Catalog::default_v1().unwrap();
+        let cjk: String = catalog.items.iter().map(|i| i.name.as_str()).collect();
         assert!(
-            lines.iter().all(|l| l.is_ascii()),
-            "展示行必须是字模能画的 ASCII"
+            cjk.chars().count() > 14,
+            "测料太短（{} 字）⇒ 1× 档压根不会截，这条断言就退化成'没坏'",
+            cjk.chars().count()
         );
-        let real = report_lines(&[1, 0, 0, 0], &items[..1], 0, false);
         assert!(
-            !real.iter().any(|l| l == "DRYRUN"),
-            "真落库不许打 DRYRUN 标"
+            crate::text::missing(&cjk).is_none(),
+            "目录里有名字不在字体子集里：{:?} ⇒ 该重跑子集，别改测试",
+            crate::text::missing(&cjk)
         );
-        // 全 0 计数（理论不可达，防御病态输入）不许 panic。
-        let empty = report_lines(&[0, 0, 0, 0], &[], 0, true);
-        assert_eq!(empty[0], "0 PULLED");
+        let kept: Vec<usize> = scales
+            .iter()
+            .map(|&s| fit(&cjk, s).chars().count())
+            .collect();
+        assert!(
+            kept.windows(2).all(|w| w[0] == w[1]),
+            "CJK 在 {scales:?} 上截到不同字数：{kept:?} ⇒ 截点不再只由逻辑预算决定"
+        );
+        assert!(kept[0] > 1, "截到只剩省略号 = 预算算错：{kept:?}");
+        for &s in &scales {
+            let out = fit(&cjk, s);
+            assert!(out.chars().count() < cjk.chars().count(), "{s}× 竟然没截");
+            assert!(out.ends_with('…'), "{s}× 截断没留可见痕迹：{out:?}");
+            assert!(
+                line_width(&out, s) <= line_budget_px(s),
+                "{s}× 截完还超物理预算：{} > {} ⇒ 逻辑上界挡不住这一档的字宽（会顶穿右边距）",
+                line_width(&out, s),
+                line_budget_px(s)
+            );
+        }
+        // 拉丁：现在也逐位相等（同一个理由：截点不看每档的取整宽）。哪一档都不许"根本不截"
+        // 或"截到空"，那两种都是预算算错而不是排版风格。
+        let latin = "Balance 1,240 Shards 999,999 DEMO extra words here".to_string();
+        let kept_l: Vec<usize> = scales
+            .iter()
+            .map(|&s| fit(&latin, s).chars().count())
+            .collect();
+        assert!(
+            kept_l.windows(2).all(|w| w[0] == w[1]),
+            "拉丁在 {scales:?} 上截点漂了：{kept_l:?}"
+        );
+        for (s, k) in scales.iter().zip(&kept_l) {
+            let s = *s;
+            assert!(
+                *k > 1 && *k < latin.chars().count(),
+                "{s}× 的截点不像话：{k}"
+            );
+            let out = fit(&latin, s);
+            assert!(
+                line_width(&out, s) <= line_budget_px(s),
+                "{s}× 拉丁截完还超预算：{}",
+                line_width(&out, s)
+            );
+        }
     }
 
-    /// 排版契约：十连不许超行、任何行不许超宽。这两条是 draw 层"不切词"的前提，
+    /// 结果卡逐条文案：词序各随其文（绝不"英文词序 + 本地词表"拼接）、一行一条、
+    /// **演示标不占结果卡的行**（它在标题行，`l10n::header_shards`）。
+    /// ⚠️ 旧的 `lines.iter().all(is_ascii)` 删了：现在默认中文，那条断言会把交付本身当 bug。
+    /// 取而代之的是"每个上都屏的字都在字体里"（`text::missing`），同 §4.2 门禁 ①②③ 那一族。
+    #[test]
+    fn report_lines_are_one_per_line_in_the_puller_language() {
+        let items = vec![
+            ("小白".to_string(), Rarity::N, false),
+            ("铃帽".to_string(), Rarity::SR, true),
+        ];
+        let lines = report_lines(&[1, 0, 1, 0], &items, 8, Lang::Zh, 1.0);
+        assert_eq!(lines[0], "2 抽 最高 SR");
+        assert_eq!(lines[1], "SR1 N1", "档位计数行从高到低、只列非零档");
+        assert_eq!(lines[2], "SR 铃帽 重复", "明细先列最高档");
+        assert_eq!(lines[3], "N 小白 新");
+        assert_eq!(lines[4], "碎片 +8");
+        assert!(!lines.iter().any(|l| l.contains("演示")), "演示标不在这");
+        for l in &lines {
+            assert!(text::missing(l).is_none(), "上屏的字不在字体子集里：{l:?}");
+        }
+        // 同一份抽取在 en 下**词序不同**（不是把中文换词）：这条钉住"各语言各写模板"。
+        let en = report_lines(&[1, 0, 1, 0], &items, 8, Lang::En, 1.0);
+        assert_eq!(en[0], "2 pulled, best SR");
+        assert_eq!(en[4], "+8 shards");
+        assert_eq!(en[2], "SR 铃帽 DUP", "物品名保留目录中文（§7-R12）");
+        // 全 0 计数（理论不可达，防御病态输入）不许 panic。
+        let empty = report_lines(&[0, 0, 0, 0], &[], 0, Lang::Zh, 1.0);
+        assert_eq!(empty[0], "0 抽");
+    }
+
+    /// §4.4 / §7-R10：卡片上的字在**抽取那一刻**烤成字符串 ⇒ 之后切语言不改已挂着的卡。
+    /// 这条不是"懒得重翻译"的托词，是有测试的语义：当前显示的卡永远与生成它时的语言一致。
+    #[test]
+    fn baked_lines_keep_the_language_they_were_pulled_in() {
+        let items = vec![("小白".to_string(), Rarity::N, false)];
+        let zh = report_lines(&[1, 0, 0, 0], &items, 4, Lang::Zh, 1.0);
+        let anim = MenuAnim::Reveal {
+            elapsed: 0,
+            lines: zh.clone(),
+            best: Rarity::N,
+        };
+        // 走到"下一个 tick"再"切语言"：anim 里的行数与内容一个字都不动。
+        let after = advance(&anim, Motion::Full);
+        match &after {
+            MenuAnim::Reveal { lines, .. } => assert_eq!(lines, &zh),
+            other => panic!("reveal 第一格该还是 reveal，得到 {other:?}"),
+        }
+        // 换语言只影响**下一次**抽取（重新调 report_lines 才拿到英文）。
+        let en = report_lines(&[1, 0, 0, 0], &items, 4, Lang::En, 1.0);
+        assert_ne!(en, zh, "换了语言还是中文 ⇒ 词表没接上");
+        assert!(en.iter().all(|l| !l.contains("抽")));
+        // 语言行只在 `Menu` 相位可点（`is_busy` 挡住 burst/reveal）⇒ 上面这个"改不到"
+        // 是界面语义而不是实现巧合。
+        let busy = MenuAnim::Burst {
+            rarity: Rarity::N,
+            elapsed: 0,
+            lines: zh.clone(),
+        };
+        assert!(busy.is_busy(), "burst 期必须挡住点击，否则卡到一半会换字");
+        assert!(after.is_busy());
+    }
+
+    /// 排版契约：十连不许超行、任何行在任何缩放下不许超宽。这两条是 draw 层"不切词"的前提，
     /// 所以在纯逻辑层就钉死 —— 渲染层的逐点裁剪只会把词切一半，不会报错。
     #[test]
     fn ten_pull_report_fits_the_card_budget() {
+        // 物品名取目录里**真实**的中文名（不翻译，§7-R12），而且是目录里最长的那批 ——
+        // 用 "cat_item_0" 这种 ASCII 占位测不出 CJK 的宽度。
+        let catalog = Catalog::default_v1().unwrap();
+        let names: Vec<String> = catalog.items.iter().map(|i| i.name.clone()).collect();
+        assert!(names.len() >= 10, "目录不足 10 件 ⇒ 这条测的是空东西");
         let items: Vec<(String, Rarity, bool)> = (0..10)
-            .map(|i| {
-                (
-                    format!("cat_item_{}", i),
-                    [Rarity::N, Rarity::R, Rarity::SR, Rarity::SSR][i % 4],
-                    i % 3 == 0,
-                )
-            })
+            .map(|i| (names[i].clone(), Rarity::ALL[i % 4], i % 3 == 0))
             .collect();
         let counts = [4, 3, 2, 1];
-        let lines = report_lines(&counts, &items, 42, true);
-        assert!(
-            lines.len() <= MAX_REPORT_LINES,
-            "结果卡 {} 行 > 预算 {MAX_REPORT_LINES}",
-            lines.len()
-        );
-        for l in &lines {
-            assert!(
-                l.chars().count() <= MAX_LINE_CHARS,
-                "行超宽 {}: {l:?}",
-                l.chars().count()
-            );
+        for &l in &Lang::ALL {
+            for &scale in &[1.0f32, 1.5, 2.0] {
+                let lines = report_lines(&counts, &items, 999_999, l, scale);
+                assert!(
+                    lines.len() <= MAX_REPORT_LINES,
+                    "{l:?} 结果卡 {} 行 > 预算 {MAX_REPORT_LINES}",
+                    lines.len()
+                );
+                let budget = line_budget_px(scale);
+                for line in &lines {
+                    let w = line_width(line, scale);
+                    assert!(
+                        w <= budget,
+                        "{l:?} @ {scale}× 行超宽 {w} > {budget}：{line:?}"
+                    );
+                    assert!(
+                        text::missing(line).is_none(),
+                        "{l:?} 上有画不出来的字：{line:?}"
+                    );
+                }
+                assert_eq!(lines[1], "SSR1 SR2 R3 N4", "档位计数行四语言同形");
+                // 六行的形状固定：标题 / 档位 / 明细×2 / 其余并一行 / 碎片。
+                assert_eq!(
+                    lines.len(),
+                    6,
+                    "十连的行数就是六行，多一行少一行都是契约破了"
+                );
+                assert_eq!(lines[4], l10n::line_more(l, 8), "剩下的条目并进一行");
+                assert_eq!(
+                    *lines.last().unwrap(),
+                    l10n::line_shards(l, 999_999),
+                    "最后一行永远是碎片（演示标在标题行）"
+                );
+            }
         }
-        assert_eq!(lines[1], "SSR1 SR2 R3 N4");
-        assert_eq!(lines[lines.len() - 3], "+8 MORE", "剩下的档位并进一行");
-        assert_eq!(lines[lines.len() - 2], "+42 SHARDS");
-        assert_eq!(lines[lines.len() - 1], "DRYRUN");
     }
 
+    /// 按**像素**截断，且绝不切在字节中间。预算由 `CATALOG` 真实宽度量出来，不写死字数
+    /// （写死的 "19 个字符"下次改常量就变成假失败：失败得没错但原因离谱）。
     #[test]
-    fn fit_truncates_by_chars_not_bytes() {
-        // 字符串按预算生成而不是写死长度：卡片宽度是个会被排版契约改动的量，写死的
-        // "19 个字符"下次改常量就变成假失败（失败得没错但原因离谱）。
-        let digits =
-            |n: usize| -> String { (0..n).map(|i| (b'0' + (i % 10) as u8) as char).collect() };
-        assert_eq!(fit(&digits(MAX_LINE_CHARS)), digits(MAX_LINE_CHARS));
-        let long = fit(&digits(MAX_LINE_CHARS + 6));
-        assert_eq!(long.chars().count(), MAX_LINE_CHARS);
-        assert!(long.ends_with('.'), "截断要留下可见痕迹");
-        // 非 ASCII 按 char 切，绝不切在字节中间（`is_char_boundary` 恒真）。
-        let cjk = fit(&"啊".repeat(MAX_LINE_CHARS + 5));
-        assert!(cjk.is_char_boundary(cjk.len()) && cjk.chars().count() == MAX_LINE_CHARS);
+    fn fit_truncates_by_pixels_not_bytes() {
+        // 字符串按预算生成而不是写死长度：取"必然超宽"的串。
+        let long_digits: String = (0..200).map(|i| (b'0' + (i % 10) as u8) as char).collect();
+        let exact = fit(&long_digits, 1.0);
+        assert!(exact.ends_with('…'), "截断要留下可见痕迹");
+        assert!(
+            line_width(&exact, 1.0) <= line_budget_px(1.0),
+            "截完还超预算"
+        );
+        // 不超预算的串原样返回，无端补点就是把字改错了。
+        let short = "余额 1,240";
+        assert_eq!(fit(short, 1.0), short);
+        assert_eq!(fit("", 1.0), "");
+        // CJK 每字 ≈1 em ⇒ 同样的预算装的字数远少于 ASCII。这条是"按字数截"为什么会
+        // 一边宽一边窄的直接证据。
+        let cjk = fit(&"蓝".repeat(60), 1.0);
+        assert!(
+            cjk.chars().count() < exact.chars().count(),
+            "CJK 截出来的字数不比拉丁少 ⇒ 预算不是按像素算的：{} vs {}",
+            cjk.chars().count(),
+            exact.chars().count()
+        );
+        // 逐 char 累加 ⇒ 结果永远在 char 边界上（原来靠"不切半个 UTF-8"的写法换成了像素）。
+        assert!(cjk.is_char_boundary(cjk.len()));
+        // 预算连省略号都放不下 ⇒ **什么都不画**，而不是画一个顶穿右边距的 `…`。
+        assert!(
+            fit_to("抽取失败", advance_px('蓝', 1.0) - 1, 1.0).is_empty(),
+            "放不下省略号还硬画 ⇒ 顶穿出界，而像素门禁看不见这件事"
+        );
     }
 }

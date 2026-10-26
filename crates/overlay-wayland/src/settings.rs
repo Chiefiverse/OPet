@@ -31,6 +31,10 @@ pub enum ValueSource {
     ConfigFile,
     EnvVar,
     Default,
+    /// 语言行当场点出来的。**只有 `lang` 会走到这一档**（`motion` 没有 UI 入口，每进程
+    /// 恒定）。留着它是为了让退出摘要不说谎：启动时读到的那一档在点了语言行之后就不是
+    /// 生效来源了，把 `lang_from` 停在 `ConfigFile` 等于告诉排查的人"文件里写着 en"。
+    MenuClick,
 }
 
 impl ValueSource {
@@ -40,6 +44,7 @@ impl ValueSource {
             Self::ConfigFile => "config.toml",
             Self::EnvVar => "环境变量",
             Self::Default => "默认值",
+            Self::MenuClick => "菜单当场切换（不持久）",
         }
     }
 }

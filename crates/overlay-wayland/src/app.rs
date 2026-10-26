@@ -68,9 +68,11 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::atlas::Atlas;
 use crate::card;
+use crate::l10n::Lang;
 use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
 use crate::region::{CellRect, Regions};
 use crate::settings::{self, Motion};
+use crate::text;
 
 /// `wp_fractional_scale` 的 scale 单位是 1/120（180 = 1.5×，本机 eDP-1 实测值）。
 const SCALE_UNIT: u32 = 120;
@@ -229,6 +231,10 @@ pub struct App {
     /// `MenuState.motion` 是从这里抄的副本（同 `dry_run` 的手法：`draw()` 里先
     /// `menu.as_mut()` 再读 `self.ui` 会撞借用冲突；下一步的语言行同理）。
     ui: settings::Settings,
+    /// `config.toml` 的路径（**不存在也留着**）。语言行点下去时要打印"想固定就写哪儿"，
+    /// 而本轮不回写文件（自写的平坦 reader 保不住用户注释 ⇒ 读改写会把文件刷平）。
+    /// 存在 `App` 而不是现算：路径回退规则只在 `petstore::config` 一处，这里只复述结果。
+    ui_config_path: String,
     /// 抽取层，**lazy**：第一次右键才连库。rusqlite + WAL 一打开就把页缓存和语句缓存
     /// 挂进进程，而常驻宠物的 VmHWM 门禁（M4 基线 15.7 MB）不该为"也许根本不抽"付这笔。
     gacha: Option<Gacha>,
@@ -277,7 +283,17 @@ impl Gacha {
 
     /// 抽 `count` 次并落库，返回菜单要的三样：结果卡行、最高档、抽完的余额。
     /// 错误只是一条给人看的字（进菜单错误行），调用方不许因为它而停环。
-    fn pull(&mut self, count: u32, dry_run: bool) -> Result<(Vec<String>, Rarity, i64), String> {
+    ///
+    /// `lang`/`scale` 都在**这一刻**烤进字符串：文案由 `l10n` 按语言选，截断按当前缩放
+    /// 换算的像素预算算（§4.5）。⇒ 之后切语言/换显示器都不会重刷已经挂着的卡，这是语义
+    /// 而不是缺陷（"当前显示的卡永远与生成它时的语言一致"，§7-R10）。
+    fn pull(
+        &mut self,
+        count: u32,
+        dry_run: bool,
+        lang: Lang,
+        scale: f32,
+    ) -> Result<(Vec<String>, Rarity, i64), String> {
         let report = self
             .store
             .pull_for(
@@ -288,16 +304,27 @@ impl Gacha {
                 count,
             )
             .map_err(|e| format!("PULL {count}: {e}"))?;
+        // 显示名 = catalog 里的**中文**名（`蓝帽`），查不到回退 `item_id` ⇒ **绝不留白**。
+        // 四 locale 一律显示目录中文，英文界面配中文物品名是明写的取舍（§7-R12：给目录加
+        // `name_en` 要动 `petcore::gacha::catalog` 的 `deny_unknown_fields` schema，本轮不做）。
         let items: Vec<(String, Rarity, bool)> = report
             .outcomes
             .iter()
-            .map(|o| (o.item_id.clone(), o.rarity, o.duplicate))
+            .map(|o| {
+                let name = self
+                    .catalog
+                    .find(&o.item_id)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| o.item_id.clone());
+                (name, o.rarity, o.duplicate)
+            })
             .collect();
         let lines = menu::report_lines(
             &report.counts,
             &items,
             u64::from(report.shards_gained),
-            dry_run,
+            lang,
+            scale,
         );
         let best = menu::best_rarity(&report.counts).unwrap_or(Rarity::N);
         let balance = self.balance();
@@ -445,6 +472,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         grab_offset: Vec2::ZERO,
         dry_run,
         ui: settings,
+        ui_config_path: cfg.path.display().to_string(),
         gacha: None,
         gacha_error: None,
         last_press: None,
@@ -789,6 +817,10 @@ struct MenuState {
     /// 从 `App.ui.motion` 抄来的动画强度档（同 `dry_run`：每进程恒定 ⇒ 不进签名，
     /// 但 `step`/`draw` 每格都要读它，否则 `--motion` 就是个只打印不生效的假开关）。
     motion: Motion,
+    /// 从 `App.ui.lang` 抄来的当前语言。**必须进 `content_sig`**（与 `motion` 不同族：
+    /// 语言现在能在运行中被点着换，不进签名就出现"点了但卡片没换字"）。抄副本而不是
+    /// 每处借 `self.lang`：`draw()` 里 `self.pool`/`self.anim` 已经可变借用着 self。
+    lang: Lang,
     /// 上一次 commit 的内容签名 ⇒ 静止时"什么都不发"
     last_sig: Option<u64>,
     frame_pending: bool,
@@ -876,13 +908,14 @@ impl MenuState {
         if !self.configured || self.frame_pending {
             return false;
         }
-        let sig = menu::content_sig(&self.anim, self.balance, error);
+        let sig = menu::content_sig(&self.anim, self.balance, error, self.lang);
         if self.last_sig == Some(sig) && !self.force_draw {
             return false;
         }
         let dry_run = self.dry_run;
         let balance = self.balance;
         let motion = self.motion;
+        let lang = self.lang;
         let bw = self.to_phys(self.logical.0 as f32).max(1);
         let bh = self.to_phys(self.logical.1 as f32).max(1);
         let stride = bw * 4;
@@ -912,6 +945,7 @@ impl MenuState {
                 error,
                 scale,
                 motion,
+                lang,
             },
         );
         // 句柄克隆（不是对象克隆）：下面的 `self.arm()` 要可变借 self，不能同时留引用
@@ -993,6 +1027,7 @@ impl App {
         };
         let dry_run = self.dry_run;
         let motion = self.ui.motion;
+        let lang = self.ui.lang;
 
         let surface = self.compositor.create_surface(&qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -1038,11 +1073,12 @@ impl App {
             pool,
             scale_num,
             logical,
-            items: menu::layout(),
+            items: menu::rects(),
             anim: MenuAnim::Menu,
             balance,
             dry_run,
             motion,
+            lang,
             last_sig: None,
             frame_pending: false,
             pending_since: None,
@@ -1097,7 +1133,40 @@ impl App {
             menu::MenuItem::Close => self.close_menu(),
             menu::MenuItem::Pull1 => self.do_pull(1),
             menu::MenuItem::Pull10 => self.do_pull(10),
+            // 语言行**只在 `Menu` 相位**生效。burst/reveal 期间卡片右下那一格画的是余额行
+            // （`card::paint_footer`），语言行根本没画出来 ⇒ 画不出来的东西不许可点，否则
+            // 出现"点了没反应、下一次抽取却换了字"。已挂着的卡保持它生成那一刻的语言
+            // （§7-R10：这不是 bug，是"当前显示的卡永远与生成它时的语言一致"）。
+            menu::MenuItem::Lang => {
+                let busy = self.menu.as_ref().is_some_and(|m| m.anim.is_busy());
+                if !busy {
+                    self.cycle_lang();
+                }
+            }
         }
+    }
+
+    /// 点语言行：zh→en→ja→ko→zh，**只改本进程，不回写文件**。
+    ///
+    /// 不写回的理由不是省事：本轮的 reader 是自写的平坦 `key = "value"` 解析，读改写会把
+    /// 用户的注释整段刷平 ⇒ **丢注释比"重启回默认"更坏**（§7-R15）。所以切换时把持久化
+    /// 写法打在 stderr，让人自己决定要不要写。两处一起改（`App.ui.lang` 是真相源、
+    /// `MenuState.lang` 是 draw 用的副本）—— 全项目只有这一处写它。
+    fn cycle_lang(&mut self) {
+        let next = self.ui.lang.next();
+        self.ui.lang = next;
+        self.ui.lang_from = settings::ValueSource::MenuClick;
+        if let Some(m) = self.menu.as_mut() {
+            m.lang = next;
+            m.force_draw = true;
+        }
+        eprintln!(
+            "ui: 语言 → {} ({})；本轮会话生效，想固定请在 {} 写 [ui] lang = \"{}\"",
+            next.self_name(),
+            next.code(),
+            self.ui_config_path,
+            next.code()
+        );
     }
 
     /// 第一次用到才连库，之后复用同一条连接。返回"库是否可用"，调用方据此决定余额读不读。
@@ -1146,8 +1215,12 @@ impl App {
             return;
         }
         let dry_run = self.dry_run;
+        // 语言与缩放都在这一刻取：结果卡的文案与截断预算属于**这张卡**，之后用户切语言
+        // 或换显示器都不会把已经烤好的字符串重排（`baked_lines_keep_the_language_they_were_pulled_in`）。
+        let lang = self.ui.lang;
+        let scale = self.menu.as_ref().map(|m| m.scale_f()).unwrap_or(1.0);
         let pulled = match self.gacha.as_mut() {
-            Some(g) => g.pull(count, dry_run),
+            Some(g) => g.pull(count, dry_run, lang, scale),
             None => return,
         };
         let (lines, best, balance) = match pulled {
@@ -1556,6 +1629,21 @@ impl App {
                 sim.fingerprint()
             );
         }
+        // 字体这层的内存代价必须是**实测值**而不是"应该不多"：VmHWM 门禁（19 MB）的余量
+        // 只有 ≈580 KB，而子集 + 字形缓存是本轮新加的两块（§7-R4）。缓存 arena 在启动时
+        // 一次性 `resize`，所以这里读的数与峰值是同一个数，不存在"这次绿下次炸"。
+        let (hits, made, uncached) = text::cache_stats();
+        println!(
+            "  字体: face={} 资产 {} KiB / 字形缓存 {} B（上限 {} B，命中 {hits}，栅格化 {made}，未缓存 {uncached}）",
+            if text::face().is_some() {
+                "真字体"
+            } else {
+                "降级 5×7 点阵"
+            },
+            text::FONT_BYTES.len() / 1024,
+            text::cache_bytes(),
+            text::CACHE_MAX_BYTES,
+        );
         println!("  {}", proc_self_summary());
     }
 }
@@ -2028,28 +2116,62 @@ delegate_registry!(App);
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 只在测试里用：生产路径的文案都经 `card.rs`/`menu.rs` 取，`app.rs` 顶部不引 `Key`
+    use crate::l10n::Key;
 
     /// 抽取层的入口是鼠标，而**我绝不注入点击**（三项人工门禁只有用户本人能判）。
     /// 所以这一层的验收必须在 headless 里跑完：`Gacha` 不含任何 wayland 类型，
     /// 下面测的就是"菜单按下去之后真正执行的那段代码"，不是它的替身。
     #[test]
-    fn memory_store_pulls_and_stamps_the_demo_line() {
+    fn memory_store_pulls_and_bakes_the_locale_into_the_report() {
         let mut g = Gacha::connect(None).expect("内存库该建得起来");
         assert!(
             g.store.path().is_none(),
             "内存库必须连路径都没有 ⇒ 一条文件都不会产生"
         );
         let before = g.balance();
-        let (lines, _best, balance) = g.pull(10, true).expect("十连该成功");
-        assert!(lines[0].starts_with("10 PULLED"), "标题行得说出抽了几次");
+        let (lines, best, balance) = g.pull(10, true, Lang::Zh, 1.5).expect("十连该成功");
         assert!(
-            lines.iter().any(|l| l == "DRYRUN"),
-            "不带 `--db` 必须打演示标 —— 用户把演示当成落库是最坏的一种说谎"
+            lines[0].starts_with("10 抽") && lines[0].contains(best.as_str()),
+            "默认档的标题行要同时说出抽了几次和最高档：{lines:?}"
+        );
+        // 结果行里的名字必须是**目录里的中文名**，不是 `item_id`（本轮改的就是这一处）。
+        let named = lines
+            .iter()
+            .skip(1)
+            .filter(|l| l.starts_with(['N', 'R', 'S']))
+            .filter(|l| !l.is_ascii())
+            .count();
+        assert!(
+            named > 0,
+            "结果行里没有中文物品名 ⇒ catalog 查找没接上，卡片还在打 slug：{lines:?}"
         );
         assert!(
             balance >= before,
             "抽取只加碎片（v1 免费软通货，D2），余额倒退说明扣了不该扣的钱"
         );
+        // 演示标**不在这些行里**（它由 `card.rs` 的标题行徽标承担）：这里钉住的是
+        // "内存库这条路确实一个字节都没写盘"，像素侧的证据在 `dryrun_stamp_changes_the_header_pixels`。
+        assert!(
+            !lines.iter().any(|l| l.contains("DRYRUN")),
+            "演示标跑进结果行了 ⇒ 卡片上会有两处，而只有一处是签收过的"
+        );
+    }
+
+    #[test]
+    fn every_locale_pull_line_is_sayable_with_the_bundled_font() {
+        // 抽一次真东西，逐 locale 过一遍：这条抓的是"某个 locale 的模板里有一个没进子集的字"
+        // —— `ui_strings` 测的是**函数能产出的**串，而这里测的是**真抽取产出的**串（物品名
+        // 来自目录，不在 `ui_strings` 里）。缺字在画布上只会变成一个 `?`，只有这里能红。
+        let mut g = Gacha::connect(None).expect("内存库该建得起来");
+        for l in Lang::ALL {
+            let (lines, _best, _b) = g.pull(10, true, l, 1.5).expect("十连该成功");
+            for line in &lines {
+                if let Some(c) = crate::text::missing(line) {
+                    panic!("{l:?} 的结果行「{line}」里的 {c:?} 不在字体子集里");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2057,9 +2179,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("临时目录");
         let path = dir.path().join("opet.db");
         let mut g = Gacha::connect(path.to_str()).expect("--db 指向可写路径就该建库");
-        let (lines, _best, balance) = g.pull(10, false).expect("十连该成功");
+        // 这次传 `en`：既验"落库这条路"，也验 `lang` 参数真的走到底（默认档在上一条测过了）。
+        let (lines, _best, balance) = g.pull(10, false, Lang::En, 1.5).expect("十连该成功");
         assert!(
-            !lines.iter().any(|l| l == "DRYRUN"),
+            lines[0].starts_with("10 pulled"),
+            "英文标题行没按 locale 走（`lang` 参数没接上）：{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("DRYRUN") || l.contains(Lang::En.t(Key::DryRun))),
             "真落库不许打演示标（否则用户不知道哪次真的写进了存档）"
         );
         // 换一条连接重开：只有磁盘上真有东西，才认得这 10 条、链才验得过
