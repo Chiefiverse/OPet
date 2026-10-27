@@ -10,6 +10,8 @@
 
 盲盒与数据（M3）已落地 **headless 全套 + CLI**：全整数抽样引擎（百万分位，无浮点）、软保底 + 硬保底 + 十连必含 SR + 重复折算碎片，存档与审计链在 `crates/petstore`。**概率公示文件由引擎自己算出来**（马尔可夫链精确期望，不掷骰），100 万次真掷骰与它的偏差 worst 345 / 1500 百万分位、χ² 1.9746（限 7.815）——"公示说的数字 == 代码产出的数字"由单测逐字段钉住。抽取记录构成哈希链，第三方**只需导出的 JSONL + seed** 即可重放验证（不碰数据库）。**随机与付费在结构上隔离**：`gacha_banner.currency` 的 DB CHECK 只允许 `companion_time`/`shards`，`Currency` 枚举没有真钱变体，内容包类型没有权重字段，CLI 的 `--currency` 一律 `SCHEMA_ERROR`。概率公示浮层与 `opet.sock` IPC 尚未做（开箱动画与结果卡已由上面的 M3-b 交付）。
 
+**菜单与卡片的文字换成了真字体，并有四套语言**（UI 视觉重做 V2）：`ab_glyph` + **入库的最小字体子集**（`assets/fonts/ui.otf`，35 KB，覆盖 ASCII + 简中 + 假名 + 谚文实际用到的 237 个码位）⇒ 抽到「蓝帽」时卡上打的是**中文名**而不是 `cap_blue`。**界面语言用户自己能设**：`--lang zh|en|ja|ko` > `~/.config/opet/config.toml` 的 `[ui] lang` > 环境变量 `LC_ALL`/`LANG` > 默认中文，**菜单底部那一行"语言 中文"点一下就循环**（只在话内切换，客户端不回写你的配置文件）。**动画强度可关**（前庭敏感）：`--motion full|reduce|off`（或 `[ui] motion`），`off` 关掉全部 burst 与闪烁，SSR 那一帧白闪的上限也从"整卡过白"降到 85% 亮度。**文字可读性不再是观感而是数字**：任何会被当成文字底色的色块都要有一支 ≥ 4.5:1 的墨，由单测逐档 × 逐语言 × 逐底色遍历（含一条"白字压金底必须不合格"的反面对照）。⚠️ **旧的 5×7 ASCII 点阵留着只作兜底**（字体子集万一解析失败才走它，非 ASCII 会画 `?`）。
+
 ## 仓库结构
 
 ```
@@ -17,10 +19,16 @@ crates/petcore/            行为内核 + 抽样引擎（平台无关，无窗�
   src/gacha/               盲盒：参数/骰子流/保底/目录/审计链/公示生成（纯函数）
   assets/gacha/rates.json  概率公示产物（`opet catalog rates` 生成，不手写）
 crates/petstore/           存档：SQLite schema + 迁移 + 账本 + 墙钟 + JSONL 导出
+                           + config.rs：自写的平坦 `[ui]` reader（零新依赖，只读不回写）
 crates/opet-cli/           命令行入口：headless 模拟、吞吐基准、迁移表、抽样门禁、抽取与审计
 crates/overlay-wayland/    Wayland layer-shell 客户端（宠物上屏 + 点击穿透 + 右键菜单/结果卡）
-  menu.rs / font.rs / card.rs  菜单布局与命中 / 5×7 ASCII 位图 / 卡片像素（三者都不碰 wayland 类型）
+  menu.rs / card.rs        菜单布局·命中·相位 / 卡片像素（都不碰 wayland 类型 ⇒ 可 headless 出图）
+  text.rs / l10n.rs        真字体光栅与字号档 / zh·en·ja·ko 四套文案表（都不碰窗口）
+  font.rs                  5×7 ASCII 位图，**仅当字体子集解析失败时的兜底路径**
+  settings.rs              `--lang`/`--motion` > config.toml > LC_ALL/LANG > 默认 的唯一裁决处
+  assets/fonts/            ui.otf 子集 + ui-codepoints.txt（码位单一事实源）+ OFL 许可证与声明
 scripts/                   真机验收清单
+tools/                     bake.py / pack.py / validate.py / subset_font.py（子集重建与自检）
 ```
 
 ## 构建与验证
@@ -46,6 +54,23 @@ cargo build --release
 ./target/release/opet audit verify --db /path/opet.db --account local
                                                  # 抽完自己复核账本链（第三方走 --file + --seed）
 
+./target/release/opet overlay --manifest FILE --seconds 120 --panel-top 20 --lang en --motion off
+                                                 # 语言与动画强度也可给配置文件（优先级如下）：
+                                                 #   --lang/--motion > ~/.config/opet/config.toml
+                                                 #   > 环境变量 LC_ALL/LANG > 默认 zh / full
+                                                 # config.toml：
+                                                 #   [ui]
+                                                 #   lang = "ja"        # zh|en|ja|ko
+                                                 #   motion = "reduce"  # full|reduce|off
+                                                 # 菜单底部那行语言点一下就地循环（不写回文件）
+
+OPET_CARD_DUMP=1 cargo test -p overlay-wayland --lib -- card::tests::dump_each_phase_for_eyeball --ignored --nocapture
+                                                 # 把菜单与结果卡的每个相位出成 PPM 给人逐张过眼
+                                                 # （208 张：相位 × 4 语言 × 3 动画档 × 两档缩放，
+                                                 #   文件名 /tmp/opet_card_<相位>_<locale>_<motion>_s<scale>.ppm，
+                                                 #   原生物理像素，放大请在转换时做）
+python3 tools/subset_font.py --verify            # 自检入库子集与码位表是否仍然互相覆盖（缺字即红）
+
 ./target/release/opet gacha-sim --pulls 1000000 --seed 1
                                                  # 概率门禁：实测 vs 公示，末行 GATE … result=PASS/FAIL
 ./target/release/opet catalog rates              # 由引擎生成概率公示（含逐件概率）
@@ -60,3 +85,4 @@ cargo build --release
 
 - 代码：**AGPL-3.0-only**（见 [`LICENSE`](LICENSE)）。
 - 官方美术资产与付费内容包：**专有**，以 `.petpack` 资产包分发，不在本仓库内。
+- UI 字体子集（`crates/overlay-wayland/assets/fonts/ui.otf`）：**SIL Open Font License 1.1**，随包带 [`LICENSE-ui-font.txt`](crates/overlay-wayland/assets/fonts/LICENSE-ui-font.txt) 与 [`NOTICE-ui-font.txt`](crates/overlay-wayland/assets/fonts/NOTICE-ui-font.txt)。它由 Noto Sans CJK 子集化而来，按随包许可证文本**第 3 条**（"No Modified Version … may use the Reserved Font Name"）的要求**家族名已改为 `OPet UI`**（不以上游名义分发），许可条款不与 AGPL 合并。
