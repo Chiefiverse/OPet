@@ -1705,138 +1705,256 @@ mod tests {
         );
     }
 
-    /// 目视核对（M2 的教训：数字门禁看不见"少了一块"）：
-    /// `OPET_CARD_DUMP=1 cargo test -p overlay-wayland --lib -- card::tests::dump_each_phase --nocapture`
-    /// 把每个相位写成 /tmp/opet_card_*.ppm，再 `magick` 转 PNG 过眼。
+    /// 单抽那一份的档位序列（第十件 = SSR）；十连那一份最高 = SR。
+    /// 两份都要，是因为"顶到边"的两件事不同：SSR 那份测色带与白闪，SR 那份测五行明细
+    /// 加"+N 更多"在四种文字里的截断。名字一律走真实目录（[`ten_items`]），不喂英文 slug。
+    const SSR_SEQ: [(Rarity, bool); 10] = [
+        (Rarity::N, true),
+        (Rarity::N, false),
+        (Rarity::N, true),
+        (Rarity::N, false),
+        (Rarity::N, true),
+        (Rarity::N, false),
+        (Rarity::N, true),
+        (Rarity::R, false),
+        (Rarity::R, true),
+        (Rarity::SSR, false),
+    ];
+    const SR_SEQ: [(Rarity, bool); 10] = [
+        (Rarity::N, false),
+        (Rarity::N, true),
+        (Rarity::N, false),
+        (Rarity::N, true),
+        (Rarity::N, false),
+        (Rarity::N, false),
+        (Rarity::N, true),
+        (Rarity::R, false),
+        (Rarity::R, true),
+        (Rarity::SR, false),
+    ];
+
+    /// 扩散期的 `elapsed`，非 `Burst` 返回 `None`。
+    fn burst_elapsed(a: &MenuAnim) -> Option<u32> {
+        match a {
+            MenuAnim::Burst { elapsed, .. } => Some(*elapsed),
+            _ => None,
+        }
+    }
+
+    /// 走**真实相位机**取出这一档 `motion` 下会真的上屏的那几格：`pull`（点完的第一格）、
+    /// `burstA`（扩散中格）、`burstB`（色块最大那格 ⇒ 最容易压到 footer）、
+    /// `appear`（结果卡出现那格：`full`+SSR 就是白闪）、`card`（`appear` 之后三格，读得完的样子）。
+    ///
+    /// 不在测试里手挑 `elapsed`：手挑会在 `--motion off` 上骗人 —— 那一档**根本不进 `Burst`**
+    /// （[`menu::after_pull`]），硬画一帧"burst 中间"就等于给一个不存在的动画出图。
+    /// 内容相同的相邻格只留一张（`off` 的 `pull` 就是 `appear`）⇒ 少一些逐字节相同的图要过眼。
+    fn walk_phases(
+        best: Rarity,
+        lines: Vec<String>,
+        motion: Motion,
+    ) -> Vec<(&'static str, MenuAnim)> {
+        let ticks = menu::anim_spec(best, motion).burst_ticks;
+        let mut out: Vec<(&'static str, MenuAnim)> = Vec::new();
+        let mut push = |tag: &'static str, a: MenuAnim| {
+            if !out.iter().any(|(_, prev)| *prev == a) {
+                out.push((tag, a));
+            }
+        };
+        let mut anim = menu::after_pull(best, lines, motion);
+        push("pull", anim.clone());
+        if burst_elapsed(&anim).is_some() {
+            for (tag, target) in [("burstA", ticks / 2), ("burstB", ticks.saturating_sub(1))] {
+                while burst_elapsed(&anim).is_some_and(|e| e < target) {
+                    anim = menu::advance(&anim, motion);
+                }
+                push(tag, anim.clone());
+            }
+            // 末格再走一格 ⇒ 进 `Reveal{0}`
+            anim = menu::advance(&anim, motion);
+        }
+        push("appear", anim.clone());
+        for _ in 0..3 {
+            anim = menu::advance(&anim, motion);
+        }
+        push("card", anim);
+        out
+    }
+
+    /// `Menu` 相位的像素**与 `motion` 档无关** ⇒ 出图矩阵里菜单只出 `full` 那一组。
+    ///
+    /// 这条不是顺手加的：`--motion` 承诺的是"关闪烁与动画"，要是它顺手改掉了菜单版式，
+    /// 用户一关动画就看见一个**没人签收过**的长相。省掉的那几组图由这条断言顶着。
+    #[test]
+    fn menu_pixels_ignore_the_motion_tier() {
+        for &scale in &[1.0f32, 1.5] {
+            for &lang in &Lang::ALL {
+                let base =
+                    Shot::at_lang(scale, &MenuAnim::Menu, 1200, true, "", Motion::Full, lang);
+                for &m in &[Motion::Reduce, Motion::Off] {
+                    let other = Shot::at_lang(scale, &MenuAnim::Menu, 1200, true, "", m, lang);
+                    assert_eq!(
+                        base.canvas, other.canvas,
+                        "{lang:?}/{scale}×：菜单相位的像素被 motion 档改掉了"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 出图矩阵的**采样正确性**：`full`+SSR 必须采到白闪那一格，`reduce`/`off` 必须采不到；
+    /// `off` 不得出现 `burst*`。钉的是 [`walk_phases`] 本身 —— 否则"矩阵里少出一张图"和
+    /// "这一档本来就没这张图"在文件名上根本分不开，而过眼的人只会以为我没出。
+    #[test]
+    fn the_phase_walk_samples_the_flash_frame_only_where_it_exists() {
+        let lines = menu::report_lines(&[6, 3, 0, 1], &ten_items(SSR_SEQ), 160, Lang::Zh, 1.5);
+        for &motion in &Motion::ALL {
+            let phases = walk_phases(Rarity::SSR, lines.clone(), motion);
+            let flashed: Vec<&str> = phases
+                .iter()
+                .filter(|(_, a)| menu::white_flash(a, motion))
+                .map(|(t, _)| *t)
+                .collect();
+            match motion {
+                Motion::Full => assert_eq!(
+                    flashed,
+                    vec!["appear"],
+                    "full+SSR 的白闪那一格没被采样到 ⇒ 出图矩阵里没有可过眼的闪烁帧"
+                ),
+                Motion::Reduce | Motion::Off => assert!(
+                    flashed.is_empty(),
+                    "{motion:?} 档本该没有白闪，却在 {flashed:?} 上量到了"
+                ),
+            }
+            let bursts = phases
+                .iter()
+                .filter(|(t, _)| t.starts_with("burst"))
+                .count();
+            if matches!(motion, Motion::Off) {
+                assert_eq!(bursts, 0, "off 档根本不进 Burst，却采出了扩散帧");
+            } else {
+                assert_eq!(bursts, 2, "{motion:?} 档的扩散期该采到中格与末格两帧");
+            }
+        }
+    }
+
+    /// 目视核对（M2 的教训：数字门禁看不见"少了一块"）—— **出图矩阵**（`UI_REDESIGN_V2` 提交 7）
+    /// = 相位 × 4 locale × 3 motion × {1.0×, 1.5×}，逐张过眼。
+    ///
+    /// ```sh
+    /// cd /home/jun/Projects/opet && export PATH="$HOME/.cargo/bin:$PATH"
+    /// rm -f /tmp/opet_card_*.ppm /tmp/opet_card_*.png /tmp/sheet_*.png
+    /// OPET_CARD_DUMP=1 cargo test -p overlay-wayland --lib -- card::tests::dump_each_phase --ignored --nocapture
+    /// cd /tmp && for f in opet_card_*.ppm; do magick "$f" -scale 300% "${f%.ppm}.png"; done
+    /// # 拼总览：一张 = 一个 motion × scale，行=相位、列=locale
+    /// for sc in s100 s150; do for mo in full reduce off; do
+    ///   files=()
+    ///   for p in menu menuerr ssr_pull ssr_burstA ssr_burstB ssr_appear ssr_card \
+    ///            ten_pull ten_burstA ten_burstB ten_appear ten_card; do
+    ///     for lc in zh en ja ko; do
+    ///       [ -f "opet_card_${p}_${lc}_${mo}_${sc}.png" ] && files+=("opet_card_${p}_${lc}_${mo}_${sc}.png")
+    ///     done
+    ///   done
+    ///   [ ${#files[@]} -gt 0 ] && montage "${files[@]}" -tile 4x -geometry +6+6 \
+    ///     -background black -fill white -label '%f' "sheet_${mo}_${sc}.png"
+    /// done; done
+    /// ```
+    ///
+    /// 三条设计决定，都是上一版出图欠的：
+    /// ① **相位不是手挑的 tick，而是走真实相位机**（见 [`walk_phases`]）⇒ `--motion off` 那几张
+    ///    是"根本没进 burst"的真相，不是我在测试里替它编的一帧。
+    /// ② **文件名三段都带上**（`<相位>_<locale>_<motion>_<scale>`）：过眼要回答的是"ja 在 reduce
+    ///    下还分不分得出档位"这种三维问题，名字里缺一维就得重新出图。
+    /// ③ **写原生物理像素，不在 Rust 里放大**。上一版固定 3× 放大，于是 1.0× 那一档量的其实是
+    ///    "把 1.0× 的像素放大三倍"，看着比真机 1.5× 屏还清楚 ⇒ 过眼的对象和被测的对象不是同一张图。
+    ///    放大交给出图之后的 `magick -scale`：它只影响**看**，不影响**测**。
     #[test]
     #[ignore = "要 OPET_CARD_DUMP=1，且图必须人看"]
     fn dump_each_phase_for_eyeball() {
         if std::env::var("OPET_CARD_DUMP").is_err() {
             return;
         }
-        let dump = |name: &str, scale: f32, anim: &MenuAnim, balance: i64, dry: bool, err: &str| {
-            let s = Shot::at(scale, anim, balance, dry, err);
-            // 放大 3 倍出图：16 逻辑 px 的 CJK 笔画在原始尺寸下人眼读不出（判据①要的是
-            // "看得清笔画"，不是"看见有字"）
-            let (k, ow, oh) = (3i32, s.bw * 3, s.bh * 3);
-            let mut big = vec![0u8; (ow * oh * 3) as usize];
-            for yy in 0..oh {
-                for xx in 0..ow {
-                    let src = ((yy / k) as usize) * s.stride + ((xx / k) as usize) * 4;
-                    let d = ((yy as usize) * ow as usize + xx as usize) * 3;
-                    // BGRA → RGB（卡片全不透明，不需要预乘还原）
-                    big[d] = s.canvas[src + 2];
-                    big[d + 1] = s.canvas[src + 1];
-                    big[d + 2] = s.canvas[src];
+        /// 一张出图的全部输入：`Shot` 的参数 + 文件名里的相位标签。
+        /// 收成一个结构而不是八个位置参数，是因为矩阵有 168 个调用点，而 `err`/`dry` 这种
+        /// 尾部布尔在位置参数里最容易串位（串了也不会红，只会出一张看着很干净的错图）。
+        struct Frame<'a> {
+            phase: &'a str,
+            lang: Lang,
+            motion: Motion,
+            scale: f32,
+            anim: &'a MenuAnim,
+            balance: i64,
+            dry: bool,
+            err: &'a str,
+        }
+        let mut written = 0usize;
+        let mut dump = |f: &Frame| {
+            let s = Shot::at_lang(f.scale, f.anim, f.balance, f.dry, f.err, f.motion, f.lang);
+            let mut bytes = format!("P6\n{} {}\n255\n", s.bw, s.bh).into_bytes();
+            bytes.reserve((s.bw * s.bh * 3) as usize);
+            for px in s.canvas.chunks_exact(4) {
+                // BGRA → RGB（卡片全不透明，不需要预乘还原）
+                bytes.extend_from_slice(&[px[2], px[1], px[0]]);
+            }
+            let sc = (f.scale * 100.0).round() as i32;
+            let path = format!(
+                "/tmp/opet_card_{}_{}_{}_s{sc}.ppm",
+                f.phase,
+                f.lang.code(),
+                f.motion.code()
+            );
+            std::fs::write(&path, bytes).unwrap();
+            written += 1;
+        };
+        for &scale in &[1.0f32, 1.5] {
+            for &lang in &Lang::ALL {
+                // 菜单两格：`motion` 改不了它的像素（`menu_pixels_ignore_the_motion_tier`），
+                // 所以每个 (locale, scale) 只出一组，而不是三组一模一样的图。
+                dump(&Frame {
+                    phase: "menu",
+                    lang,
+                    motion: Motion::Full,
+                    scale,
+                    anim: &MenuAnim::Menu,
+                    balance: 1200,
+                    dry: true,
+                    err: "",
+                });
+                dump(&Frame {
+                    phase: "menuerr",
+                    lang,
+                    motion: Motion::Full,
+                    scale,
+                    anim: &MenuAnim::Menu,
+                    balance: 0,
+                    dry: false,
+                    err: "DB LOCKED BY ANOTHER OPEN",
+                });
+                for &motion in &Motion::ALL {
+                    // 十连（best=SR）与单抽（best=SSR）各一份，名字走**真实目录**（`ten_items`）：
+                    // 喂英文 slug 的图看着很干净，恰恰因为真正会顶到边的东西没上屏。
+                    for (key, best, counts, gained, items) in [
+                        ("ssr", Rarity::SSR, [6u32, 3, 0, 1], 160, SSR_SEQ),
+                        ("ten", Rarity::SR, [7, 2, 1, 0], 42, SR_SEQ),
+                    ] {
+                        let lines =
+                            menu::report_lines(&counts, &ten_items(items), gained, lang, scale);
+                        for (tag, anim) in walk_phases(best, lines, motion) {
+                            dump(&Frame {
+                                phase: &format!("{key}_{tag}"),
+                                lang,
+                                motion,
+                                scale,
+                                anim: &anim,
+                                balance: 140,
+                                dry: true,
+                                err: "",
+                            });
+                        }
+                    }
                 }
             }
-            let path = format!("/tmp/opet_card_{name}.ppm");
-            let mut bytes = format!("P6\n{ow} {oh}\n255\n").into_bytes();
-            bytes.extend_from_slice(&big);
-            std::fs::write(&path, bytes).unwrap();
-            println!("{path}");
-        };
-        let ten = menu::report_lines(
-            &[7, 2, 1, 0],
-            &ten_items([
-                (Rarity::N, false),
-                (Rarity::N, true),
-                (Rarity::N, false),
-                (Rarity::N, true),
-                (Rarity::N, false),
-                (Rarity::N, false),
-                (Rarity::N, true),
-                (Rarity::R, false),
-                (Rarity::R, true),
-                (Rarity::SR, false),
-            ]),
-            42,
-            Lang::Zh,
-            1.5,
-        );
-        let ssr = menu::report_lines(
-            &[6, 3, 0, 1],
-            &ten_items([
-                (Rarity::N, true),
-                (Rarity::N, false),
-                (Rarity::N, true),
-                (Rarity::N, false),
-                (Rarity::N, true),
-                (Rarity::N, false),
-                (Rarity::N, true),
-                (Rarity::R, false),
-                (Rarity::R, true),
-                (Rarity::SSR, false),
-            ]),
-            160,
-            Lang::Zh,
-            1.5,
-        );
-        dump("menu_dry", 1.5, &MenuAnim::Menu, 1200, true, "");
-        dump("menu_real", 1.5, &MenuAnim::Menu, 87, false, "");
-        dump(
-            "menu_err",
-            1.5,
-            &MenuAnim::Menu,
-            0,
-            true,
-            "DB LOCKED BY ANOTHER OPEN",
-        );
-        for t in [0u32, 3, 8, 16, 23] {
-            dump(
-                &format!("burst_ssr_{t:02}"),
-                1.5,
-                &MenuAnim::Burst {
-                    rarity: Rarity::SSR,
-                    elapsed: t,
-                    lines: ssr.clone(),
-                },
-                0,
-                true,
-                "",
-            );
         }
-        dump(
-            "burst_n",
-            1.5,
-            &MenuAnim::Burst {
-                rarity: Rarity::N,
-                elapsed: 2,
-                lines: ten.clone(),
-            },
-            0,
-            true,
-            "",
-        );
-        for (name, elapsed, lines, best) in [
-            ("flash_ssr", 0u32, ssr.clone(), Rarity::SSR),
-            ("reveal_ssr", 3, ssr.clone(), Rarity::SSR),
-            ("reveal_ten", 3, ten.clone(), Rarity::SR),
-        ] {
-            dump(
-                name,
-                1.5,
-                &MenuAnim::Reveal {
-                    elapsed,
-                    lines,
-                    best,
-                },
-                140,
-                true,
-                "",
-            );
-        }
-        dump(
-            "reveal_1x",
-            1.0,
-            &MenuAnim::Reveal {
-                elapsed: 3,
-                lines: ssr.clone(),
-                best: Rarity::SSR,
-            },
-            140,
-            true,
-            "",
-        );
+        println!("出图 {written} 张：/tmp/opet_card_<相位>_<locale>_<motion>_s<scale>.ppm");
+        println!("转 PNG 与拼总览的命令见本用例的文档注释");
     }
 }
