@@ -73,10 +73,21 @@ pub fn codes_list() -> Vec<u32> {
 /// 排 14 个汉字，目录里最长的名字是 3 字；横向由 `every_locale_fits_the_card` 逐 locale × 逐档
 /// 量，最宽的 en 行（`+999999 shards Balance 9,999,999`）占 180/224。
 ///
-/// **`menu.rs` 的四个布局常数因此一个都不用改**（§4.5 的要求成立）：这份子集 `line_gap = 0`
-/// （实测 16/24/32 px → ascent 13/19/26、descent −3/−5/−6），所以 **`line_height(px) == px`**
-/// ⇒ 一行占的逻辑高度正好等于 `LOGICAL_PX`，`LINE_STEP = 18 ≥ 16 + 2` 仍成立，`ROW_H 26`、
-/// `HEAD_H 22`、footer 的 26 px 带也都装得下一行 16。
+/// **`menu.rs` 的四个布局常数因此一个都不用改**（§4.5 的要求成立），但理由要说对：
+/// `line_height(px) == px` **不是量出来的巧合，是 ab_glyph 缩放语义的恒等式**。它的
+/// `PxScale` 是**文字像素高度（ascent − descent）而不是 per-em**，于是
+/// `line_height = round(ascent + |descent| + line_gap) = round(px + line_gap·px/1448)` ⇒
+/// 只要这份子集的 `line_gap == 0`（它确实是 0），三档都恒等于请求值。
+///
+/// ⚠️ 别把这条读成"汉字占一个 `px` 宽" —— **恰好相反**：同一份度量里
+/// `ascent/|descent|/height_unscaled = 1160/288/1448` 而 `upem = 1000`，所以
+/// 一个汉字的 advance 是 `round(1000·px/1448)` = **11/17/22**，只有 `px` 的 ≈0.69
+/// （门禁 `a_hanzi_is_narrower_than_the_line_height` 钉住这条）。方案 §4.5 那句
+/// "CJK 每字正好 1 em ⇒ 逐位相等"因此是**假的**，而它错了**没有任何测试会红** ——
+/// 截断改成只在 logical 空间按整数上界 `menu::advance_bound_log` 算，理由见那儿。
+///
+/// 布局侧的后果不变：`LINE_STEP = 18 ≥ line_height(16) + 2` 仍成立，`ROW_H 26`、
+/// `HEAD_H 22`、footer 那条带也都装得下一行 16（逐条有测试）。
 pub const LOGICAL_PX: i32 = 16;
 
 /// 物理字号档 = `round(LOGICAL_PX × scale)`，scale ∈ {1, 1.5, 2} ⇒ {16, 24, 32}。
@@ -175,7 +186,12 @@ pub fn descent(px: i32) -> i32 {
 /// 一行占多少物理像素：`ascent − descent + line_gap`，全部由字体度量给，不是常数。
 ///
 /// `menu.rs::LINE_STEP` 从"字模 7 px × scale 2 + 4 leading"改成吃这个数 ⇒ 换字体/换字号
-/// 不用重新手算一遍行距（`menu_row_step_matches_the_font` 钉住这条口径）。
+/// 不用重新手算一遍行距（`menu.rs::report_budget_fits_the_card` 钉住这条口径）。
+///
+/// ⚠️ 对**这份**子集它恰好恒等于 `px`（`PxScale` = 文字高度、`line_gap = 0`），那是 ab_glyph
+/// 的缩放语义而不是巧合 —— 但**别据此假设"汉字宽 = px"**，那正好是假的，见 [`LOGICAL_PX`]
+/// 与 `a_hanzi_is_narrower_than_the_line_height`。相等这条由
+/// `line_height_is_metric_driven_and_positive` 逐档断言，换字体会当场红。
 pub fn line_height(px: i32) -> i32 {
     face().map_or(px + px / 2, |f| {
         let sf = f.as_scaled(px as f32);
@@ -632,6 +648,10 @@ mod tests {
     }
 
     /// 行距由字体给，不是手写的常数（§4.5：`LINE_STEP` 改成吃这个数）。
+    ///
+    /// 这里**必须**把 `line_height(px) == px` 写成断言而不是注释：`menu.rs` 的四个布局常数
+    /// 是不是"一个都不用改"，整轮的前提就是这一条等式（方案 §4.5），而"写在文档里的度量假设
+    /// 错了不会有任何测试红"正是本轮踩过的那条坑（§4.5 那句"CJK 每字正好 1 em"就是这么假的）。
     #[test]
     fn line_height_is_metric_driven_and_positive() {
         for px in TIERS {
@@ -640,6 +660,12 @@ mod tests {
             assert!(
                 lh <= px * 3 / 2 + 2,
                 "{px} px 的行高 {lh} 太肥 ⇒ 卡片装不下"
+            );
+            assert_eq!(
+                lh, px,
+                "{px} px 的行高不是 {px} ⇒ 这份子集的 `line_gap` 不再是 0（或 upem/度量表被改过），\
+                 于是 `menu.rs` 的行带常量（`LINE_STEP 18` / `ROW_H 26` / `HEAD_H 22` / footer 带）\
+                 要按新度量重算，而不是继续假设相等"
             );
             assert!(
                 ascent(px) > 0,
@@ -650,6 +676,12 @@ mod tests {
                 descent(px) <= 0,
                 "descent 与 ab_glyph 同口径（负数）：{px} px 读到 {}",
                 descent(px)
+            );
+            // 恒等式成立的那条算术：行高 = ascent + |descent|（line_gap 为 0）。
+            assert_eq!(
+                lh,
+                ascent(px) - descent(px),
+                "{px} px：行高不等于 ascent − descent ⇒ line_gap 非 0"
             );
         }
         println!(
@@ -675,6 +707,31 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+    }
+
+    /// **反驳方案 §4.5 的那条前提**：`ab_glyph` 的 `PxScale` 是文字高度（ascent − descent）
+    /// 而不是 per-em，而这份子集 `upem = 1000` / `height_unscaled = 1448` ⇒ 一个汉字的
+    /// advance 只有请求档的 ≈0.69（16/24/32 px 上实测 11/17/22），**不是"正好 1 em"**。
+    ///
+    /// 为什么要把"某件事不成立"写成测试：它的假版本会推出"逐字宽 = px ⇒ 截点与缩放无关"，
+    /// 那条推理错了而**没有任何别的门禁会红**（`menu.rs` 因此改成在 logical 空间用整数上界
+    /// `advance_bound_log` 算截点，见 `report_budget_is_scale_independent`）。这一条是这个
+    /// 事实唯一的现场证据 —— 换字体（`height_unscaled` 变化）时它会第一个开口。
+    #[test]
+    fn a_hanzi_is_narrower_than_the_line_height() {
+        for px in TIERS {
+            let w = measure("白", px);
+            assert!(w > 0, "{px} px 上一个汉字都没有宽度");
+            assert!(
+                w * 10 < px * 8,
+                "{px} px 上「白」宽 {w} ⇒ 汉字已经 >= 0.8 em，`advance_bound_log` 的每字 1 px \
+                 余量论证要重看（字体度量变了：upem / height_unscaled）"
+            );
+            assert!(
+                w >= px * 2 / 3,
+                "{px} px 上「白」宽 {w}：窄到不像等宽 CJK 了 ⇒ 子集或度量漂了"
+            );
+        }
     }
 
     /// arena 是"先占死"的，所以这里要能证明它**不会**因为画了很多字而越界。

@@ -101,7 +101,8 @@ pub const CARD_H: i32 = 150;
 
 /// 降级字模（`font.rs`，5×7 ASCII 位图）的逻辑字号：**逻辑**像素/字模像素。
 /// 只有 [`crate::text::face`] 拿不到字体资产时才会用到它（那条路径在 CI 里被
-/// `the_shipped_font_loads_and_covers_the_list` 拦住，永远不执行）。留着的理由不是整洁，
+/// `text.rs::face_is_available` 与 `tests/font_assets.rs::subset_is_within_budget_pinned_and_cff`
+/// 拦住，永远不执行）。留着的理由不是整洁，
 /// 是硬约束 3「宠物崩溃不能影响桌面」：字体资产出事只能不画字/画丑字，不能炸进程。
 pub const TEXT_PX: i32 = 2;
 
@@ -112,9 +113,62 @@ pub const PAD: i32 = 8;
 pub const HEAD_H: i32 = 22;
 pub const ROW_H: i32 = 26;
 pub const ROW_STEP: i32 = 30;
-/// 结果卡行步进（logical）：字体度量给的行高是 16（`line_height == px`，见 `text::LOGICAL_PX`
-/// 那张实测表），留 2 leading。
+/// 结果卡行步进（logical）：字体度量给的行高是 16（`line_height(px) == px` 是 ab_glyph 的
+/// 缩放语义恒等式，见 `text::LOGICAL_PX` 那段），留 2 leading。
 pub const LINE_STEP: i32 = 18;
+
+// ───────────────────────── 版式（`UI_REDESIGN_V2` §4.5） ─────────────────────────
+//
+// 这四个数**只在这里定义**：`card.rs` 画圆角/强调条/色带全部从这里取。理由与行带常量同源
+// —— 画的圆角半径和断言里用的半径如果是两处各写一份，就会有一处改了另一处没改，而
+// "卡片四角是圆的还是方的"这种事只有出图过眼才看得见（判据①）。
+
+/// 底板与色带的圆角半径（logical px）。
+pub const CORNER: i32 = 3;
+/// 行底（菜单项 / 结果卡明细）的圆角半径（logical px）。
+pub const ROW_CORNER: i32 = 2;
+/// 菜单行左端的强调条宽（logical px）。它**挤占文字预算** ⇒ 标签要走 [`fit_to`]，
+/// 这条由 `menu_row_labels_fit_the_accent_indent` 逐 locale 量。
+pub const ACCENT_W: i32 = 3;
+/// 强调条与标签之间的留白（logical px）。
+pub const ACCENT_GAP: i32 = 4;
+
+/// 结果卡的**档位色带**：满宽、贴卡片顶边，装第一行（`{n} 抽 最高 {tier}`）。
+///
+/// 为什么满宽而菜单标题行只到 `CARD_W − 2×PAD`：档位是这一屏唯一要一眼读出的东西，
+/// 而"一条有底色的带"比"一行彩色字"读得快得多（N 与 R 的差别不该靠认字）。带色 =
+/// `anim_spec(best).color`，**墨色由带色算**（`ink_on`），这是上一轮"白字压金底"那条坑的
+/// 正面教训扩到 reveal 态。
+///
+/// 顶边的 1 px 描边由 `card.rs` **后画**（描边画在内容之上）⇒ 满宽不会把描边吃掉。
+pub fn band() -> RectI {
+    RectI::new(0, 0, CARD_W, HEAD_H)
+}
+
+/// 结果卡行高（logical）：等于字体行高，**不是**行步进（行步进是 18，含 2 leading）。
+pub const REVEAL_ROW_H: i32 = LINE_STEP - 2;
+
+/// 结果卡第一行明细的顶边（logical）= 色带底 + 4 px 气。
+pub const REVEAL_TOP: i32 = HEAD_H + 4;
+
+/// 结果卡的明细行矩形（**不含**色带）：`MAX_REPORT_LINES − 1` 行，从 [`REVEAL_TOP`] 起按
+/// [`LINE_STEP`] 排。带 + 这些行 = `report_lines` 给出的全部行，一一对应。
+///
+/// 为什么 draw 层要从这里取而不是自己 `PAD + i*STEP` 循环：`report_lines` 在 `Burst` 相位
+/// 也会被调用并随 `MenuAnim` 烤进字符串，而**色带只装第 0 行**这个约定一旦在两个模块各写
+/// 一遍，就会出现"明细从第 0 行开始 ⇒ 第一行被画两次（一次带上一次行）"。
+pub fn reveal_rows() -> Vec<RectI> {
+    (0..MAX_REPORT_LINES - 1)
+        .map(|i| {
+            RectI::new(
+                PAD,
+                REVEAL_TOP + (i as i32) * LINE_STEP,
+                CARD_W - 2 * PAD,
+                REVEAL_ROW_H,
+            )
+        })
+        .collect()
+}
 
 /// 底部语言行的几何：`124..140`，**右对齐**（`draw` 层按 `measure` 反推 x）。
 ///
@@ -137,6 +191,43 @@ pub fn footer() -> ItemRect {
         w: CARD_W - 2 * PAD,
         h: FOOTER_H,
     }
+}
+
+/// 菜单行左端的**强调条**矩形（logical）。
+///
+/// 它画在行底块**内侧**、离左边 `ROW_CORNER` ⇒ 不与圆角弧相切，否则一根顶到边的方条会把
+/// 圆角行底的左上/左下两个角填回直角（那种错只有出图过眼看得见，像素计数全绿）。
+///
+/// ⚠️ 这是 **draw 用的矩形，不是命中用的**：`rects()` / `hit_test` 仍然按整行算 ⇒
+/// "点在强调条上"和"点在行里"是同一件事，input region 语义一个字都没变（§4.4 那条硬约束）。
+pub fn accent_bar(row: RectI) -> RectI {
+    RectI::new(
+        row.x + ROW_CORNER,
+        row.y + ROW_CORNER,
+        ACCENT_W,
+        row.h - 2 * ROW_CORNER,
+    )
+}
+
+/// 行底**里面**的文字矩形（logical）：左右各 `PAD / 2` 的气。结果卡明细行用它。
+///
+/// 为什么气是 4 而不是 8：行底本身已经从 `PAD` 起，再来一个 `PAD` 会把 CJK 明细挤到
+/// 208 逻辑 px，而 `every_locale_fits_the_card` 量过的最宽行是按 224 预算**预截**过的 ⇒
+/// 再截一次会在本来放得下的行上凭空补一个 `…`。4 px 是"圆角行底不吞笔画"的最小气。
+pub fn row_text(row: RectI) -> RectI {
+    RectI::new(row.x + PAD / 2, row.y, (row.w - PAD).max(0), row.h)
+}
+
+/// 菜单行里**文字**的矩形（logical）= [`row_text`] 再让出左端的强调条。
+///
+/// 强调条挤占的是**文字预算**，所以标签必须按这个矩形走 [`fit_to`]，而
+/// `menu_row_labels_fit_the_accent_indent` 逐 locale × 逐档量"最坏的那个标签还装得下吗"。
+/// 这条是新几何**自己引入**的风险（§3 第 6 条：目录名字最长 3 字，但 en/ja/ko 的菜单项比中文宽），
+/// 不量就是"版式改了、预算没改"那一族。
+pub fn label_rect(row: RectI) -> RectI {
+    let t = row_text(row);
+    let indent = ACCENT_W + ACCENT_GAP;
+    RectI::new(t.x + indent, t.y, (t.w - indent).max(0), t.h)
 }
 
 /// 固定布局：3 个可点项从上到下。`layout` 与 `hit_test` 是唯一的真相源，
@@ -551,10 +642,11 @@ pub const MAX_LINE_PX: i32 = CARD_W - 2 * PAD;
 /// 结果卡最多 **6** 行：`标题 + 档位计数 + TOP_ITEMS 明细 + MORE + 碎片` = 1+1+2+1+1。
 /// （**演示标在标题行**，不占一行 —— 打两处就是把一个冗余行花在零信息上。）
 ///
-/// ⚠️ 这个数不是"卡片还能塞几行"的最大值，而是"**不许压到 footer**"的上界：行带从 `PAD`
-/// 起、每行 [`LINE_STEP`]，而 footer 从 [`FOOTER_Y`] 起 ⇒ `PAD + 6×18 = 116 ≤ 124`，
-/// 第七行会写到 134 直接盖住余额/语言行。上一版写 7 时 footer 还不存在，那条算术证明
-/// 只对着 `CARD_H` 核 ⇒ 底部带一加进来就破了（`report_budget_fits_the_card` 现在钉的是这个）。
+/// ⚠️ 这个数不是"卡片还能塞几行"的最大值，而是"**不许压到 footer**"的上界。版式重做后
+/// 第 0 行是**满宽档位色带**（[`band`]，占 `HEAD_H = 22`），其余 `MAX_REPORT_LINES − 1` 行
+/// 从 [`REVEAL_TOP`] 起按 [`LINE_STEP`] 排、行高 [`REVEAL_ROW_H`] ⇒ 底边
+/// `26 + 4×18 + 16 = 114 ≤ FOOTER_Y 124`（钉在 `report_budget_fits_the_card`）。
+/// 上一版写 7 时 footer 还不存在，那条算术证明只对着 `CARD_H` 核 ⇒ 底部带一加进来就破了。
 pub const MAX_REPORT_LINES: usize = 6;
 /// 明细最多列几条（其余并进 `+N 更多`），永远先列最高档。
 pub const TOP_ITEMS: usize = 2;
@@ -590,7 +682,18 @@ pub fn line_width(s: &str, scale: f32) -> i32 {
 
 /// 一行能占多少物理像素（`MAX_LINE_PX` 随字号档放大，见 [`tier_ratio`]）。
 pub fn line_budget_px(scale: f32) -> i32 {
-    (MAX_LINE_PX as f32 * tier_ratio(scale)).floor() as i32
+    budget_for(MAX_LINE_PX, scale)
+}
+
+/// **任意**逻辑宽度 → 该档的物理文字预算（[`line_budget_px`] 是它在 `MAX_LINE_PX` 上的特例）。
+///
+/// 为什么要开这个口子：新版式给菜单行让出了左端的强调条（[`label_rect`]），给结果卡让出了
+/// 行底（[`reveal_rows`]），这些矩形都比内容区窄 ⇒ 截断预算得按矩形算。而**换算只准有这一份**：
+/// `× scale`（真实缩放）与 `× tier_ratio`（字号档）在 1.25× 这类非整数档上是两个不同的数，
+/// draw 层若自己乘 `scale`，同一句话会在 1.25× 少截一个字（[`advance_bound_log`] 那套
+/// "截点与缩放无关"的论证随之失效）。
+pub fn budget_for(logical_w: i32, scale: f32) -> i32 {
+    (logical_w.max(0) as f32 * tier_ratio(scale)).floor() as i32
 }
 
 /// 单 char 的**逻辑宽度上界**：16 px 档的取整宽 + 1。截断只按它算 ⇒ 截点与缩放无关。
@@ -1268,10 +1371,35 @@ mod tests {
         );
         // ⚠️ 上面那条对着 `CARD_H` 的证明**不够**：底部还有一条 footer（错误行 / 语言行），
         // 结果卡不许把行写到它上面。`MAX_REPORT_LINES` 从 7 降到 6 就是这条逼出来的。
+        //
+        // 版式重做后这条证明要**按真实几何**核（色带 + 明细行），不再是"从 PAD 起等距 6 行"
+        // 的理想化算式 ⇒ 直接用 [`band`] / [`reveal_rows`] 的量。
+        let band = band();
+        let rows = reveal_rows();
+        assert_eq!(
+            rows.len(),
+            MAX_REPORT_LINES - 1,
+            "色带装第 0 行，其余行走这里"
+        );
         assert!(
-            PAD + MAX_REPORT_LINES as i32 * LINE_STEP <= FOOTER_Y,
+            band.y + band.h <= rows[0].y,
+            "色带底边 {} 压进第一行 {}",
+            band.y + band.h,
+            rows[0].y
+        );
+        let last = rows.last().unwrap();
+        assert!(
+            last.y + last.h <= FOOTER_Y,
             "结果卡最后一行的底边 {} 压进 footer {FOOTER_Y} ⇒ 余额/语言行会被明细盖住",
-            PAD + MAX_REPORT_LINES as i32 * LINE_STEP
+            last.y + last.h
+        );
+        for w in rows.windows(2) {
+            assert!(!overlaps(w[0], w[1]), "明细行相邻却相交 ⇒ 两行字叠在一起");
+        }
+        assert_eq!(
+            REVEAL_ROW_H,
+            text::line_height(text::LOGICAL_PX),
+            "行高应当正好等于字体行高（不是行步进）⇒ 行底块里文字不多不少占满"
         );
         // 拼装处也验一次：`report_lines` 在**最坏输入**（十连）下真的没超过这个数。
         assert_eq!(
@@ -1380,6 +1508,53 @@ mod tests {
                 "{s}× 拉丁截完还超预算：{}",
                 line_width(&out, s)
             );
+        }
+    }
+
+    /// **强调条挤掉的宽度不能让任何一个菜单标签被截**（§4.5 新几何自己引入的风险）。
+    ///
+    /// 三条断言不是重复，是同一个风险的三个口径，缺一条就有一种对应的错法：
+    /// ① [`line_bound_log`] ≤ [`label_rect`] 的逻辑宽 = **与缩放无关**的那条证明（1× 屏上
+    ///    字被切一半正是"只按当前档量"漏掉的，判据①）；② `line_width` ≤ `budget_for` 的物理宽
+    ///    = 这一档**真的画得下**（①是上界，不是实测宽）；③ `fit_to` 原样返回 = **屏幕上看不见
+    ///    `…`**（前两条数学上够了，但第三条是玩家实际读到的那句话，口径换了也得钉住）。
+    ///
+    /// ⚠️ 只量中文会绿得毫无意义：`Pull 10` / `閉じる` / `10회 뽑기` 都比「十连」宽（§7-R13），
+    /// 而 1.5× 那档汉字取整成 17 px（不是 1 em ⇒ 逐 char 的进位不可推算）。
+    #[test]
+    fn menu_row_labels_fit_the_accent_indent() {
+        for &lang in &Lang::ALL {
+            for row in layout() {
+                let label = row.item.label(lang);
+                let t = label_rect(row.as_rect());
+                assert!(
+                    crate::text::missing(&label).is_none(),
+                    "{lang:?} 的菜单项 {:?}「{label}」有字不在子集里：{:?} ⇒ 该重跑子集，别改测试",
+                    row.item,
+                    crate::text::missing(&label)
+                );
+                assert!(
+                    line_bound_log(&label) <= t.w,
+                    "{lang:?} 「{label}」逻辑上界 {} > 让出强调条后的 {} 逻辑 px ⇒ \
+                     这行会带上 `…`（菜单项永远不该被截：项名就是可点性的全部说明）",
+                    line_bound_log(&label),
+                    t.w
+                );
+                for &scale in &[1.0f32, 1.25, 1.5, 2.0] {
+                    let budget = budget_for(t.w, scale);
+                    assert!(
+                        line_width(&label, scale) <= budget,
+                        "{lang:?} @{scale}×「{label}」实宽 {} > 预算 {budget} ⇒ 顶穿行底右边",
+                        line_width(&label, scale),
+                    );
+                    assert_eq!(
+                        fit_to(&label, budget, scale),
+                        label,
+                        "{lang:?} @{scale}× 菜单项 {:?} 被截了 ⇒ 行底几何或字号漂了",
+                        row.item
+                    );
+                }
+            }
         }
     }
 
