@@ -151,8 +151,18 @@ pub struct Counters {
     /// `create_buffer` / attach 失败次数
     pub buffer_errors: u64,
     /// 帧回调里补投的 buffer 数。**不并进五档** —— 它由帧回调驱动、不对应任何 tick，
-    /// 混进 `commits` 就让"五档 == tick"永久读不出来（补投几次就超几次）。它自己是
-    /// 那条 P0 路径的覆盖证据：`延后 N / 补投 M`，M 应当等于 N（没补上就是丢了格）。
+    /// 混进 `commits` 就让"五档 == tick"永久读不出来（补投几次就超几次）。
+    ///
+    /// **读法（2026-10-28 实测校正，原先这里写的"M 应当等于 N"是错的判据）**：
+    /// `延后 N / 补投 M` 只要求 **M ≤ N**，`M < N` 是**设计使然**而非丢格 ——
+    /// 延后那一档只置一个布尔 `force_draw`（"绝不排队"），所以**连续几个延后的 tick 会
+    /// 塌缩成回调里的一次补投**（补的是最后那个 intent，旧的已被更新的一帧取代）；另一条
+    /// 让 M 变小的路径是看门狗先强制解锁 ⇒ 那一格由**下一个 tick** 按 `Buffer` 画上，
+    /// 不经过补投。⇒ 真要警惕的形状是 **M > N**（补投比延后还多 = 有一格被投了两遍），
+    /// 而"延后 > 0 但 M 与看门狗全 0"意味着通道锁死没解开。
+    /// 首轮非零实测 = 2026-10-28 `--motion off` 那轮（用户在运行中改了屏幕缩放）：
+    /// `延后 3 / 补投 2 / 帧回调看门狗 3`，五档仍 `== tick 总数` ⇒ 这条 P0/P1 路径
+    /// 第一次有真机证据（前十轮全是 0，那 0 是"没跑到"）。
     pub replay_commits: u64,
     /// `configure` 重配置触发的 buffer 数。同 `replay_commits`：**不并进五档**（不由 tick 驱动）。
     /// 2026-10-28 轮 3 首次撞到（5 次重配置 + 4 次看门狗），五档当场比 tick 多 5。
@@ -1249,11 +1259,17 @@ impl App {
     }
 
     /// 菜单被点：命中哪一项。`at` 是菜单 surface 的**逻辑**局部坐标。
+    ///
+    /// 分派**只走 [`menu::press`]**（命中 + 相位把关），不走 [`menu::hit_test`]：这块 surface
+    /// 是同一张 240×150，开箱那段时间（`Burst`/`Reveal`）整屏由 `card::paint` 重画，三个行项
+    /// 与语言行**一个都没画出来**，而静态命中表照样答得出 ⇒ 曾经出现"点结果卡的位置就执行
+    /// 那一行的功能"（用户 2026-10-28 报）。把关放在命中侧而不是各 `match` 分支里，是为了
+    /// **以后新增菜单项不会忘记问相位**（门禁 = `the_card_phase_opens_no_row_to_the_pointer`）。
     fn on_menu_press(&mut self, at: (f32, f32)) {
         let Some(item) = self
             .menu
             .as_ref()
-            .and_then(|m| menu::hit_test(&m.items, at))
+            .and_then(|m| menu::press(&m.items, at, &m.anim))
         else {
             return;
         };
@@ -1261,16 +1277,10 @@ impl App {
             menu::MenuItem::Close => self.close_menu(),
             menu::MenuItem::Pull1 => self.do_pull(1),
             menu::MenuItem::Pull10 => self.do_pull(10),
-            // 语言行**只在 `Menu` 相位**生效。burst/reveal 期间卡片右下那一格画的是余额行
-            // （`card::paint_footer`），语言行根本没画出来 ⇒ 画不出来的东西不许可点，否则
-            // 出现"点了没反应、下一次抽取却换了字"。已挂着的卡保持它生成那一刻的语言
-            // （§7-R10：这不是 bug，是"当前显示的卡永远与生成它时的语言一致"）。
-            menu::MenuItem::Lang => {
-                let busy = self.menu.as_ref().is_some_and(|m| m.anim.is_busy());
-                if !busy {
-                    self.cycle_lang();
-                }
-            }
+            // 语言行的相位把关现在也在 `press` 里了。留一条这里特有的口径：已挂着的卡**保持它
+            // 生成那一刻的语言**（§7-R10：这不是 bug，是"当前显示的卡永远与生成它时的语言一致"），
+            // 所以"切完语言卡片跟着换字"只在下一张卡上成立。
+            menu::MenuItem::Lang => self.cycle_lang(),
         }
     }
 

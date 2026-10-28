@@ -246,11 +246,37 @@ pub fn rects() -> Vec<ItemRect> {
 
 /// 菜单-local logical 坐标 → 命中的项。缝隙、边距、行外一律 None。
 /// 布局表由调用方持有（`MenuState` 建一次存着），不在热路径上反复重算。
+///
+/// ⚠️ **这是纯几何命中，不给相位把关** —— 分派点击的调用方要走 [`press`]，不然
+/// "卡片挡在行带上那段时间"照样能点着底下的行（2026-10-28 真机报出来的缺陷，见那儿）。
 pub fn hit_test(rects: &[ItemRect], at: (f32, f32)) -> Option<MenuItem> {
     rects
         .iter()
         .find(|r| r.contains(at.0, at.1))
         .map(|r| r.item)
+}
+
+/// **唯一许可分派点击的入口**：命中 + 相位把关。开箱（`Burst`/`Reveal`）那段时间返回 `None`。
+///
+/// 为什么必须在命中这一步、而不是在每个 `match` 分支里各问一遍：这块 surface 是**同一张
+/// 240×150**，三个行项与语言行的命中矩形**整个落在结果卡底下**（reveal 态由 `card::paint`
+/// 重画全卡，那一屏上"抽一次/十连/关闭"根本没有被画出来）。而 [`hit_test`] 用的是静态表
+/// ⇒ 画不出来的东西照样能命中。真机症状（用户 2026-10-28 报）：**结果卡还没关就去点它，
+/// 点的位置像哪一行就执行哪一行的功能 ⇒ 看着一张结果卡又能顺手抽掉十次**。
+///
+/// 这不是新立的规矩，是**补上一条已经写了但只执行了四分之一的规矩**：`MenuAnim::is_busy`
+/// 的注释原话是"菜单项这段时间不该被点"，而落地时只有 `MenuItem::Lang` 那一路问了它
+/// （当时的理由"画不出来的东西不许可点"对四个矩形全都成立）。⇒ **一个"该不该"的判断
+/// 放在分派侧 = 每加一项就要记得问一遍；放在命中侧 = 结构上问不到就点不着。**
+///
+/// 关菜单这段时间怎么走？两个既有路径都还在：**再右键**翻转菜单（D14）、或者等 dwell
+/// 放完自动回到 `Menu` 相位（N/R/SR/SSR = 90/100/130/180 tick）。不加"点卡片跳过动画"，
+/// 那是新功能、要另拍板。
+pub fn press(rects: &[ItemRect], at: (f32, f32), anim: &MenuAnim) -> Option<MenuItem> {
+    if anim.is_busy() {
+        return None;
+    }
+    hit_test(rects, at)
 }
 
 /// 整数矩形（logical），用于定位与重叠判定。
@@ -1339,6 +1365,96 @@ mod tests {
                     content_sig(&dwell, 100, "", Lang::Zh, motion),
                     content_sig(&late, 100, "", Lang::Zh, motion),
                     "{r:?}/{motion:?}：停留期像素没变而签名变了 ⇒ 又会每 tick 重投"
+                );
+            }
+        }
+    }
+
+    /// 门禁：**开箱那段时间四个命中矩形一个都不许可被点**（2026-10-28 真机报的第五条缺陷）。
+    ///
+    /// 走**真实 reducer**（`after_pull` + `advance`）遍历 `Motion::ALL × Rarity::ALL`，逐 tick 判。
+    /// 每条断言都带一份 `hit_test` 的对照，因为这条缺陷的形状正是"**几何上点得到，而那一屏
+    /// 没画那个东西**"：只断言 `press` 返回 None 的话，未来把 `press` 写成"永远 None"也能绿。
+    #[test]
+    fn the_card_phase_opens_no_row_to_the_pointer() {
+        let rects = rects();
+        // 几何前提：命中表的四个矩形**整个在卡片里** ⇒ 卡片重画这一屏时它们全被盖住。
+        // 前提没了（比如将来卡片只画半屏）这条门禁就失去意义，所以要当场量着。
+        for r in &rects {
+            assert!(
+                r.x >= 0 && r.y >= 0 && r.x + r.w <= CARD_W && r.y + r.h <= CARD_H,
+                "{r:?} 越出卡片 ⇒ 它不是被卡片盖住，而是压根不在卡里"
+            );
+        }
+        // 逐矩形取中心：前三个是行项，第四个是语言行。
+        let centers = rects
+            .iter()
+            .map(|r| ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32))
+            .collect::<Vec<_>>();
+
+        let lines = || vec!["余额 120".to_string()];
+        for &motion in &Motion::ALL {
+            for &r in Rarity::ALL.iter() {
+                let spec = anim_spec(r, motion);
+                let mut anim = after_pull(r, lines(), motion);
+                let mut busy_ticks = 0;
+                let mut reveal_ticks = 0;
+                for _ in 0..(spec.burst_ticks + spec.dwell_ticks + 400) {
+                    // 对照：**静态命中表在任何相位都答得出每一项** —— 只断言 `press` 返回
+                    // None 的话，未来把 `press` 写成"永远 None"也能绿，而这一条把它钉死成
+                    // "几何上点得到、相位上不该点"，正是原缺陷的形状。
+                    for (item, at) in MenuItem::CLICKABLE.iter().zip(&centers) {
+                        assert_eq!(
+                            hit_test(&rects, *at),
+                            Some(*item),
+                            "{r:?}/{motion:?}：静态命中表答不出 {item:?} ⇒ 对照失效，测不出东西"
+                        );
+                    }
+                    assert_eq!(
+                        hit_test(&rects, centers[3]),
+                        Some(MenuItem::Lang),
+                        "{r:?}/{motion:?}：静态命中表答不出语言行 ⇒ 对照失效"
+                    );
+                    if anim.is_busy() {
+                        busy_ticks += 1;
+                        if matches!(anim, MenuAnim::Reveal { .. }) {
+                            reveal_ticks += 1;
+                        }
+                        for (n, at) in centers.iter().enumerate() {
+                            assert_eq!(
+                                press(&rects, *at, &anim),
+                                None,
+                                "{r:?}/{motion:?}：第 {n} 格在卡片还挡着时应答了 ⇒ 看着结果卡又抽掉一次"
+                            );
+                        }
+                    }
+                    anim = advance(&anim, motion);
+                    if anim == MenuAnim::Menu {
+                        break;
+                    }
+                }
+                // 回到静止 ⇒ 同一批坐标必须又点得着（否则这条门禁就退化成"永不命中"）。
+                assert!(!anim.is_busy(), "{r:?}/{motion:?}：没走回静止");
+                for (item, at) in MenuItem::CLICKABLE.iter().zip(&centers) {
+                    assert_eq!(
+                        press(&rects, *at, &anim),
+                        Some(*item),
+                        "{r:?}/{motion:?}：静止后 {item:?} 点不着了"
+                    );
+                }
+                assert_eq!(
+                    press(&rects, centers[3], &anim),
+                    Some(MenuItem::Lang),
+                    "{r:?}/{motion:?}：静止后语言行点不着了"
+                );
+                // `--motion off` 根本不进 Burst，但它仍然有 Reveal ⇒ busy 不为 0。
+                assert!(
+                    busy_ticks > 0,
+                    "{r:?}/{motion:?}：一趟都没量到 busy ⇒ 这条门禁在这一档是白跑的"
+                );
+                assert!(
+                    reveal_ticks > 0,
+                    "{r:?}/{motion:?}：没有一 tick 停在结果卡上 ⇒ 用户报的那一幕根本没被走过"
                 );
             }
         }
