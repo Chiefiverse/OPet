@@ -494,10 +494,14 @@ pub fn after_pull(best: Rarity, lines: Vec<String>, motion: Motion) -> MenuAnim 
 
 /// 推进一格（60 Hz tick）。**返回值与原值相等就代表卡片像素一模一样** ⇒ 调用方据此
 /// 跳过 commit（省电契约：静止的 surface 不许每 tick 投新 buffer）。
+/// ⚠️ **反过来的不成立，而且这条不成立本身就是 2026-10-28 那条缺陷的形状**：`Reveal` 每格
+/// 都要 `elapsed += 1`（不等），而像素一帧不变 ⇒ "**动画状态没变**"是比"**画面没变**"更严的
+/// 条件，不能拿来当省电闸门的判据。真正的闸门是 [`content_sig`]，它混的是画面量。
 ///
 /// `motion` 是**每进程恒定**的量（CLI/配置文件在启动时一次定死，运行中没有 UI 入口能改它，
-/// 与 `dry_run` 同族）⇒ 它不进 `content_sig`（见那里的注释），但**必须**进 `advance`：
-/// 各档的 burst/dwell 边界由它决定，少了这个参数 `off` 档就只是"不白闪"而扩散期照走。
+/// 与 `dry_run` 同族）⇒ 它不作为字段进 `content_sig`（但**要传进去**算出"此刻画的是哪一帧"，
+/// 见那里的注释），也**必须**进 `advance`：各档的 burst/dwell 边界由它决定，少了这个参数
+/// `off` 档就只是"不白闪"而扩散期照走。
 pub fn advance(anim: &MenuAnim, motion: Motion) -> MenuAnim {
     match anim {
         MenuAnim::Menu => MenuAnim::Menu,
@@ -565,34 +569,51 @@ pub fn white_flash(anim: &MenuAnim, motion: Motion) -> bool {
 /// 这是菜单的省电闸门 —— 没有它，`update_menu` 每 tick 置脏，静止的菜单也会 60 次/秒
 /// 提交 180×150 的 buffer（M4 的三档口径里"无事可做"那一档就永远不会出现）。
 ///
-/// ⚠️ **`lang` 必须在 `elapsed` 之前**：切语言应当在**同一 tick 计数**下也被认成内容变化
-/// （菜单态三行的字换了，而 `elapsed` 一直是 0）。把它排在后面，`Menu` 相位的 `elapsed = 0`
-/// 会让"换了字"这件事仍然混进签名 —— 顺序在这里不影响正确性，但影响**读代码的人能不能
-/// 一眼看出 lang 不属于动画量**，所以固定这个位置并由 `switching_lang_bumps_sig_once_then_is_stable` 钉住。
-/// ⚠️ **`motion` 故意不进签名**：它和 `dry_run` 同族 —— 启动时一次定死，运行中没有任何
-/// UI 入口能改它 ⇒ "同一份输入给同一个签名"不会因为少了它而失真。对照 `lang`：语言**能**
-/// 在运行中被点着换 ⇒ 必须进。把这条区别写在这里，是因为两者长得像而语义相反，最容易顺手抄错。
+/// ⚠️ **混进去的是"画面上此刻是什么"，不是"过了几个 tick"**（2026-10-28 改成这样的，
+/// 之前这里混的是裸 `elapsed`）。那条写法在 `Reveal`（结果卡停留）里是**错的**：
+/// [`crate::card::paint`] 在 `Reveal` 期只读 `lines`/`best`/白闪布尔量、**不读 `elapsed`**
+/// （`card.rs` 里那句"`paint_reveal` 不读 `elapsed`"就是当时留下的证据），而 `dwell` 是
+/// 90/100/130/180 tick ⇒ **签名每 tick 变、像素一帧不变**，整个停留期都在重投同一张卡。
+/// 真机实测（用户 2026-10-28 那轮，100 s / 11 次抽取）= **`菜单: 1408 提交`**，而按
+/// `burst + 白闪 + 卡 + 回菜单` 算的必要量只有 **≈160** ⇒ 约 **8.8×** 是白投的，
+/// 同一轮 CPU 因此从静止档的 1.1% 涨到 2.98%。修法 = `Burst` 混 [`burst_radius`]（它
+/// 是那一帧唯一真的在变的量）、`Reveal` 混 [`white_flash`] 的布尔量（闪与不闪是两套像素，
+/// 夹在中间会把白闪丢掉 ⇒ 不能整个不混）。钉成 `the_dwell_never_bumps_the_signature`。
+///
+/// ⚠️ **`lang` 必须在动画量之前**：切语言应当在**同一 tick 计数**下也被认成内容变化
+/// （菜单态三行的字换了，而动画量一直是 0）。把它排在后面，`Menu` 相位的 0 会让"换了字"
+/// 这件事仍然混进签名 —— 顺序在这里不影响正确性，但影响**读代码的人能不能一眼看出 lang
+/// 不属于动画量**，所以固定这个位置并由 `switching_lang_bumps_sig_once_then_is_stable` 钉住。
+/// ⚠️ **`motion` 是推导动画量的输入，而不是被混进签名的字段**：它和 `dry_run` 同族 ——
+/// 启动时一次定死，运行中没有任何 UI 入口能改它 ⇒ "同一份输入给同一个签名"不会因为少了
+/// 它而失真。但本轮它**必须传进来**：白闪布尔量与扩散半径都由 `anim_spec(rarity, motion)`
+/// 决定，不传就算不出"画面上此刻是什么"。对照 `lang`：语言**能**在运行中被点着换 ⇒ 必须
+/// 进签名当字段。把这条区别写在这里，是因为两者长得像而语义相反，最容易顺手抄错。
 /// FNV-1a：不需要新依赖，且**只用来判等**，不当哈希表键、不进任何确定性契约。
-pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str, lang: Lang) -> u64 {
+pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str, lang: Lang, motion: Motion) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |b: u8| {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     };
-    let (tag, elapsed) = match anim {
+    // `frame` = 这一相位里"画面唯一真的会变的量"，不是 tick 计数（见上面那条 ⚠️）。
+    let (tag, frame) = match anim {
         MenuAnim::Menu => (0u8, 0u32),
         MenuAnim::Burst {
             rarity, elapsed, ..
-        } => (1 + rarity.index() as u8, *elapsed),
-        MenuAnim::Reveal { elapsed, best, .. } => (5 + best.index() as u8, *elapsed),
+        } => (
+            1 + rarity.index() as u8,
+            burst_radius(*elapsed, anim_spec(*rarity, motion)) as u32,
+        ),
+        MenuAnim::Reveal { best, .. } => (5 + best.index() as u8, white_flash(anim, motion) as u32),
     };
     mix(tag);
-    // 语言紧跟相位 tag、在 elapsed 前（见上面那条 ⚠️）。用 `code()` 的字节而不是枚举序号
+    // 语言紧跟相位 tag、在动画量之前（见上面那条 ⚠️）。用 `code()` 的字节而不是枚举序号
     // ⇒ 新增一档语言不需要改这里，也不可能出现"两个不同枚举值混成同一个签名"。
     for &b in lang.code().as_bytes() {
         mix(b);
     }
-    for b in elapsed.to_le_bytes() {
+    for b in frame.to_le_bytes() {
         mix(b);
     }
     for b in balance.to_le_bytes() {
@@ -1218,27 +1239,36 @@ mod tests {
     /// 都要变。
     #[test]
     fn content_sig_is_stable_when_static_and_moves_with_every_visible_input() {
-        let rest = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh);
-        assert_eq!(rest, content_sig(&MenuAnim::Menu, 100, "", Lang::Zh));
+        let rest = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, Motion::Full);
         assert_eq!(
             rest,
-            content_sig(&advance(&MenuAnim::Menu, Motion::Full), 100, "", Lang::Zh)
+            content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, Motion::Full)
+        );
+        assert_eq!(
+            rest,
+            content_sig(
+                &advance(&MenuAnim::Menu, Motion::Full),
+                100,
+                "",
+                Lang::Zh,
+                Motion::Full
+            )
         );
         assert_ne!(
             rest,
-            content_sig(&MenuAnim::Menu, 101, "", Lang::Zh),
+            content_sig(&MenuAnim::Menu, 101, "", Lang::Zh, Motion::Full),
             "余额行会变"
         );
         assert_ne!(
             rest,
-            content_sig(&MenuAnim::Menu, 100, "DB LOCKED", Lang::Zh),
+            content_sig(&MenuAnim::Menu, 100, "DB LOCKED", Lang::Zh, Motion::Full),
             "错误行会变"
         );
         // 语言行是**可见**输入：三行的字（抽一次/Pull 1/1回引く/1회 뽑기）全换了 ⇒ 必须换签名。
         for l in Lang::ALL.iter().copied().filter(|l| *l != Lang::Zh) {
             assert_ne!(
                 rest,
-                content_sig(&MenuAnim::Menu, 100, "", l),
+                content_sig(&MenuAnim::Menu, 100, "", l, Motion::Full),
                 "{l:?} 换了字却没换签名 ⇒ 静止判定会漏掉这一次像素变化"
             );
         }
@@ -1248,17 +1278,116 @@ mod tests {
             lines: vec!["X".into()],
         };
         assert_ne!(
-            content_sig(&burst, 100, "", Lang::Zh),
-            content_sig(&advance(&burst, Motion::Full), 100, "", Lang::Zh),
+            content_sig(&burst, 100, "", Lang::Zh, Motion::Full),
+            content_sig(
+                &advance(&burst, Motion::Full),
+                100,
+                "",
+                Lang::Zh,
+                Motion::Full
+            ),
             "扩散期每 tick 都在动 ⇒ 签名必须动"
         );
-        // motion 不进签名（启动定死、运行中无人能改），但**同相位的不同档**像素确实相同，
-        // 所以这里必须是等号；写成断言是为了让"顺手把 motion 混进来"当场红，而不是悄悄多一提交。
-        assert_eq!(
-            content_sig(&burst, 100, "", Lang::Zh),
-            content_sig(&burst, 100, "", Lang::Zh),
-            "签名不该看进程外的东西"
+    }
+
+    /// 2026-10-28 真机量出来的那条缺陷钉成测试：**结果卡停留期（dwell）一帧都不许多投**。
+    ///
+    /// 判据④ 说"静止仍 0 增量提交"，而当时的签名混的是裸 `elapsed` ⇒ `Reveal` 的
+    /// 90/100/130/180 tick 里签名每 tick 变、像素一帧不变（`card::paint` 在 `Reveal` 只读
+    /// `lines`/`best`/白闪）。真机那轮 11 次抽取投了 **1408** 帧，必要量 ≈160。
+    /// 这里走**真实 reducer**（`after_pull` + `advance`）数"签名变化次数"，也就是 draw 层
+    /// 会投的 buffer 数 ⇒ 上界 = 扩散 tick 数 + 白闪 1 + 卡 1 + 回菜单 1。
+    #[test]
+    fn the_dwell_never_bumps_the_signature() {
+        let lines = || vec!["余额 120".to_string()];
+        for &motion in &Motion::ALL {
+            for &r in Rarity::ALL.iter() {
+                let spec = anim_spec(r, motion);
+                let mut anim = after_pull(r, lines(), motion);
+                let mut seen = content_sig(&anim, 100, "", Lang::Zh, motion);
+                let mut commits = 1;
+                // 走到回静止为止，多给 400 tick 余量（dwell 最长 180）。
+                for _ in 0..(spec.burst_ticks + spec.dwell_ticks + 400) {
+                    anim = advance(&anim, motion);
+                    let now = content_sig(&anim, 100, "", Lang::Zh, motion);
+                    if now != seen {
+                        commits += 1;
+                        seen = now;
+                    }
+                    if anim == MenuAnim::Menu {
+                        break;
+                    }
+                }
+                let limit = spec.burst_ticks + 3;
+                assert!(
+                    commits <= limit,
+                    "{r:?}/{motion:?}：抽一次投了 {commits} 帧，必要量是 {}+闪+卡+回菜单 = {limit}",
+                    spec.burst_ticks
+                );
+                // 停留期的**最后两帧**必须同签名（这一条就是原缺陷的直接反面对照）。
+                let dwell = MenuAnim::Reveal {
+                    best: r,
+                    elapsed: spec.dwell_ticks - 2,
+                    lines: lines(),
+                };
+                let late = MenuAnim::Reveal {
+                    best: r,
+                    elapsed: spec.dwell_ticks - 1,
+                    lines: lines(),
+                };
+                assert_eq!(
+                    content_sig(&dwell, 100, "", Lang::Zh, motion),
+                    content_sig(&late, 100, "", Lang::Zh, motion),
+                    "{r:?}/{motion:?}：停留期像素没变而签名变了 ⇒ 又会每 tick 重投"
+                );
+            }
+        }
+    }
+
+    /// 白闪**必须**换签名（否则修法会走反：把 `Reveal` 的动画量整个不混 ⇒ 白闪那一帧被
+    /// 当作"和结果卡相同"而永远不上屏）。这条是上面那条的护栏。
+    #[test]
+    fn the_ssr_flash_frame_is_a_distinct_signature() {
+        let lines = || vec!["SSR!".to_string()];
+        let flash = MenuAnim::Reveal {
+            best: Rarity::SSR,
+            elapsed: 0,
+            lines: lines(),
+        };
+        let after = MenuAnim::Reveal {
+            best: Rarity::SSR,
+            elapsed: SSR_FLASH_TICKS,
+            lines: lines(),
+        };
+        assert_ne!(
+            content_sig(&flash, 100, "", Lang::Zh, Motion::Full),
+            content_sig(&after, 100, "", Lang::Zh, Motion::Full),
+            "白闪与结果卡是两套像素，签名必须分得开"
         );
+        // 同一帧内部（elapsed 0 与 1 都还在闪）⇒ 仍然不许变。
+        assert_eq!(
+            content_sig(&flash, 100, "", Lang::Zh, Motion::Full),
+            content_sig(
+                &MenuAnim::Reveal {
+                    best: Rarity::SSR,
+                    elapsed: SSR_FLASH_TICKS - 1,
+                    lines: lines()
+                },
+                100,
+                "",
+                Lang::Zh,
+                Motion::Full
+            ),
+            "闪的两 tick 是同一张白卡 ⇒ 只该投一帧"
+        );
+        // reduce/off 不闪 ⇒ 第一帧就是结果卡，签名应与"闪完"那帧相同。
+        for &m in &[Motion::Reduce, Motion::Off] {
+            assert_eq!(
+                content_sig(&flash, 100, "", Lang::Zh, m),
+                content_sig(&after, 100, "", Lang::Zh, m),
+                "{m:?} 档没有白闪，两帧应当同签名"
+            );
+        }
     }
 
     /// §4.4 的静止基线新论证：切语言 = **一次点击一次换内容 = 恰好 +1 提交**，与点 CLOSE 同族；
@@ -1266,16 +1395,16 @@ mod tests {
     /// 这对实测数字在 `lang` 进签名之后仍然成立。
     #[test]
     fn switching_lang_bumps_sig_once_then_is_stable() {
-        let mut prev = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh);
+        let mut prev = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, Motion::Full);
         let mut bumps = 0;
         for l in [Lang::En, Lang::Ja, Lang::Ko, Lang::Zh] {
-            let now = content_sig(&MenuAnim::Menu, 100, "", l);
+            let now = content_sig(&MenuAnim::Menu, 100, "", l, Motion::Full);
             if now != prev {
                 bumps += 1;
             }
             // 同一个语言再算十次都不许变（⇒ draw 层那十次一个 buffer 都不投）。
             for _ in 0..10 {
-                assert_eq!(now, content_sig(&MenuAnim::Menu, 100, "", l));
+                assert_eq!(now, content_sig(&MenuAnim::Menu, 100, "", l, Motion::Full));
             }
             prev = now;
         }

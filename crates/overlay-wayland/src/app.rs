@@ -941,8 +941,9 @@ struct MenuState {
     balance: i64,
     /// 从 `App` 抄来的演示标（每进程恒定，不进 `content_sig` 也精确）
     dry_run: bool,
-    /// 从 `App.ui.motion` 抄来的动画强度档（同 `dry_run`：每进程恒定 ⇒ 不进签名，
-    /// 但 `step`/`draw` 每格都要读它，否则 `--motion` 就是个只打印不生效的假开关）。
+    /// 从 `App.ui.motion` 抄来的动画强度档（同 `dry_run`：每进程恒定 ⇒ 不作为字段进签名，
+    /// 但要**传给** `content_sig` 去算"此刻画的是哪一帧"；`step`/`draw` 每格也都要读它，
+    /// 否则 `--motion` 就是个只打印不生效的假开关）。
     motion: Motion,
     /// 从 `App.ui.lang` 抄来的当前语言。**必须进 `content_sig`**（与 `motion` 不同族：
     /// 语言现在能在运行中被点着换，不进签名就出现"点了但卡片没换字"）。抄副本而不是
@@ -1035,7 +1036,7 @@ impl MenuState {
         if !self.configured || self.frame_pending {
             return false;
         }
-        let sig = menu::content_sig(&self.anim, self.balance, error, self.lang);
+        let sig = menu::content_sig(&self.anim, self.balance, error, self.lang, self.motion);
         if self.last_sig == Some(sig) && !self.force_draw {
             return false;
         }

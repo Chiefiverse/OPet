@@ -461,8 +461,10 @@ pub struct Ctx<'a> {
     pub dry_run: bool,
     pub error: &'a str,
     pub scale: f32,
-    /// 动画强度档。**每进程恒定**（同 `dry_run`）⇒ 不进 `menu::content_sig`，但画 burst
-    /// 与白闪时必须看它，否则 `--motion reduce/off` 就只是"读出来打印一行"的假功能。
+    /// 动画强度档。**每进程恒定**（同 `dry_run`）⇒ 它本身**不作为字段**进 `menu::content_sig`，
+    /// 但**要传进去**：burst 半径与白闪都由它定，签名得靠它算出"此刻画的是哪一帧"。不传给
+    /// 签名的话，画 burst 与白闪时也没人看它，`--motion reduce/off` 就成了"读出来打印一行"
+    /// 的假功能。
     pub motion: Motion,
     /// 生效语言。**每进程内可变**（点语言行就换）⇒ 它**必须**进 `menu::content_sig`，
     /// 否则换了字的同一帧会被判成"内容没变"而停在旧 buffer 上（省电闸门反过来把改动挡了）。
@@ -480,9 +482,11 @@ pub struct Ctx<'a> {
 /// 于是"卡片上沿没有线、左右下有线"这种不对称只有出图过眼才看得见。第 5 步同理由：burst
 /// 的扩散块和 SSR 的过白都是整卡方块填充，不统一清一次就会让那几个相位变成方卡片。
 ///
-/// `dry_run` 与 `motion` 都**不进** `menu::content_sig`：两者都是每进程恒定的量（不给
+/// `dry_run` 与 `motion` 都**不作为字段进** `menu::content_sig`：两者都是每进程恒定的量（不给
 /// `--db` 就是内存库；`--motion` 没有运行中的 UI 入口能改），所以签名相等时不可能出现
 /// "一次是演示另一次是真档"或"一次闪另一次不闪" ⇒ 漏了它们不会让静止判定错过像素变化。
+/// （`motion` 仍然要**当参数传进**签名 —— 它不区分"哪两次签名该不同"，但它决定
+/// `burst_radius`/`white_flash` 算出来的那一帧是什么。这两件事差别见 `menu::content_sig` 的头。）
 pub fn paint(canvas: &mut [u8], bw: i32, bh: i32, stride: usize, anim: &MenuAnim, ctx: Ctx) {
     let scale = ctx.scale;
     let corner = px(CORNER, scale);
