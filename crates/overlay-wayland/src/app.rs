@@ -131,24 +131,146 @@ impl Default for Options {
 }
 
 /// 省电口径的计数（§4 的三个档位 + 延后 + 失败）。
+///
+/// **五档互斥且齐**：`commits + moves + idle + deferred + buffer_errors == ticks`（落地见
+/// [`Tick`] 与 [`Counters::bump`]）。补投与菜单那块 surface 的计数**不并进五档**（理由见各自
+/// 字段注释）。这条恒等式是判据④的硬核对项，而它只在互斥时读得出来：`延后`/`buffer 错误`
+/// 那两条分支原先除了记自己那一档还走 `finish_move` 再记一次 `moves` 或 `idle`，帧回调的补投
+/// 又记进 `commits`。2026-10-28 真机轮 4 第一次让 `延后` 非零（=2），五档当场比 tick 多 3
+/// （= 补投 2 + 双记 1，那 1 就是"延后且同时挪 margin"，`仅移动` 因此是 5618 而非 5617）。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counters {
     /// 提交新 buffer（图集格真的变了）
     pub commits: u64,
     /// 只移 surface（margin 变了，没附新 buffer）
     pub moves: u64,
-    /// 整 tick 无事可做
+    /// 整 tick 无事可做（不换格、不延后、不出错）
     pub idle: u64,
     /// 内容变了但帧回调还没回来 ⇒ 本次不提交（丢帧可接受，绝不阻塞）
     pub deferred: u64,
     /// `create_buffer` / attach 失败次数
     pub buffer_errors: u64,
+    /// 帧回调里补投的 buffer 数。**不并进五档** —— 它由帧回调驱动、不对应任何 tick，
+    /// 混进 `commits` 就让"五档 == tick"永久读不出来（补投几次就超几次）。它自己是
+    /// 那条 P0 路径的覆盖证据：`延后 N / 补投 M`，M 应当等于 N（没补上就是丢了格）。
+    pub replay_commits: u64,
+    /// `configure` 重配置触发的 buffer 数。同 `replay_commits`：**不并进五档**（不由 tick 驱动）。
+    /// 2026-10-28 轮 3 首次撞到（5 次重配置 + 4 次看门狗），五档当场比 tick 多 5。
+    pub configure_commits: u64,
     /// 帧回调迟迟没回来 ⇒ 看门狗强制解锁（不解锁会永远不再附新 buffer，宠物视觉上冻住）
     pub watchdogs: u64,
     /// 菜单那块 surface 的提交数。**不并进上面三档** —— §4 的省电口径是宠物的，
     /// 第二块 surface 混进去就会让"宠物三档不劣化"这条门禁变成读不出来的混合数。
     pub menu_commits: u64,
     pub menu_watchdogs: u64,
+}
+
+impl Counters {
+    /// 记这一档：**恰好动一个字段** —— 五档互斥这条恒等式就是靠它落地，别在外面手写 `+=`。
+    fn bump(&mut self, tick: Tick) {
+        match tick {
+            Tick::Buffer => self.commits += 1,
+            Tick::Replay => self.replay_commits += 1,
+            Tick::Configure => self.configure_commits += 1,
+            Tick::Move => self.moves += 1,
+            Tick::Idle => self.idle += 1,
+            Tick::Deferred => self.deferred += 1,
+            Tick::Fault => self.buffer_errors += 1,
+        }
+    }
+
+    /// 五档加总：应当逐轮等于 `App.ticks`（`Replay` 与菜单两块计数都在之外）。
+    fn tick_accounted(&self) -> u64 {
+        self.commits + self.moves + self.idle + self.deferred + self.buffer_errors
+    }
+}
+
+/// 一次 `present` 是被谁驱动的。**只有 `Tick` 归进五档**（`Counters::tick_accounted`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    /// 60 Hz 定时的一个 tick（`on_tick` 的补帧循环里）
+    Tick,
+    /// 帧回调回来后的补投：把延后的那一格补上
+    Replay,
+    /// 合成器又发了一次 `configure` ⇒ 客户端主动重画一帧
+    Configure,
+}
+
+/// 一个 tick 归哪一档。档位与"发什么协议"是两条轴：`Deferred`/`Fault` 在 margin 动了时照样发
+/// 一个不附 buffer 的状态 commit，但那不改变归属（历史上正是这里双记让五档超了 tick）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tick {
+    /// 附了新 buffer
+    Buffer,
+    /// 帧回调补投的 buffer ⇒ 不对应任何 tick
+    Replay,
+    /// `configure` 重配置触发的 buffer ⇒ 不对应任何 tick
+    Configure,
+    /// 只发一个不附 buffer 的状态 commit（margin 变了）
+    Move,
+    /// 什么都没发
+    Idle,
+    /// 内容要换格，但在途 buffer 没回来 ⇒ 本次不提交
+    Deferred,
+    /// 出图失败（`create_buffer` / attach）
+    Fault,
+}
+
+/// 逐档遍历用（只服务测试；生产路径按具体档位分支，不需要这张表）。
+#[cfg(test)]
+const ALL_TICKS: [Tick; 7] = [
+    Tick::Buffer,
+    Tick::Replay,
+    Tick::Configure,
+    Tick::Move,
+    Tick::Idle,
+    Tick::Deferred,
+    Tick::Fault,
+];
+
+/// `present` 可能产出的**归档结果**（`Replay`/`Configure` 不是结果、是来源，见 `ALL_TICKS`）。
+#[cfg(test)]
+const ALL_OUTCOMES: [Tick; 5] = [
+    Tick::Buffer,
+    Tick::Move,
+    Tick::Idle,
+    Tick::Deferred,
+    Tick::Fault,
+];
+
+impl Tick {
+    /// 这一档要不要单独发一个"只挪位置"的状态 commit。`Buffer` 已经把它带在同一次 commit 里。
+    fn flushes_margin(self) -> bool {
+        matches!(self, Tick::Move | Tick::Deferred | Tick::Fault)
+    }
+}
+
+/// 纯判定：这一 tick 归哪一档（副作用由 `App::present` 按返回值执行）。
+///
+/// `new_cell` = 内核给了一个和已画不同的格，**或** `force_draw` 要求补画；`frame_pending` =
+/// 有 buffer 在途等帧回调。出图成不成、以及是不是补投，要等真画了才知道，故 `Fault`/`Replay`
+/// 不由这里产出。
+fn classify_tick(new_cell: bool, moved: bool, frame_pending: bool) -> Tick {
+    if !new_cell {
+        if moved { Tick::Move } else { Tick::Idle }
+    } else if frame_pending {
+        Tick::Deferred
+    } else {
+        Tick::Buffer
+    }
+}
+
+/// 归属规则（纯函数）：非 tick 来源里唯有"真发了一格 buffer"才占一个**另计**档
+/// （`replay_commits` / `configure_commits`），其余（挪 margin、无事、延后、出错）协议动作照做
+/// 但不占归属 —— 一次重配置什么都改不了，可它照样会走一遍 `present`。
+///
+/// 这条规则一天内断过两次（补投混进 `commits`、重配置混进 `idle`），所以做成表驱动、逐组合测。
+fn attribute_of(source: Source, outcome: Tick) -> Option<Tick> {
+    match source {
+        Source::Tick => Some(outcome),
+        Source::Replay => (outcome == Tick::Buffer).then_some(Tick::Replay),
+        Source::Configure => (outcome == Tick::Buffer).then_some(Tick::Configure),
+    }
 }
 
 /// 客户端侧的呈现器。`present` 的语义与 [`petcore::render::OverlayBackend`] 一致，但所有权方向
@@ -206,6 +328,10 @@ pub struct App {
     on_output: Option<WlOutput>,
     /// 必须重画一帧（首帧、configure、scale 变化、拖拽结束）
     force_draw: bool,
+    /// 本次 `present` 的**来源**：只有 `Tick` 才算"一个 tick 的归属"。默认 `Replay` 是故意的
+    /// —— 新增调用点忘了标就落进非 tick 档（五档仍然齐），反过来忘标就静默双记（2026-10-28
+    /// 一天内漏了两次：帧回调补投、`configure` 重配置）。
+    source: Source,
 
     counters: Counters,
     ticks: u64,
@@ -460,6 +586,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         pending_since: None,
         on_output: None,
         force_draw: true,
+        source: Source::Replay,
         counters: Counters::default(),
         ticks: 0,
         acc: 0.0,
@@ -1317,6 +1444,9 @@ impl App {
         self.acc += dt;
         let step = 1.0 / TICK_HZ;
         let mut budget = MAX_CATCHUP;
+        // 这一段是**唯一**算"一个 tick"的地方 ⇒ 环外一律 `Source::Replay`（默认非归属档），
+        // 免得哪个新加的调用点忘了标就静默双记（见 `Source` 的注释）。
+        self.source = Source::Tick;
         while self.acc >= step && budget > 0 {
             self.acc -= step;
             budget -= 1;
@@ -1330,6 +1460,8 @@ impl App {
                 self.present(&intent);
             }
         }
+        // 环外默认"不占归属"（帧回调与 configure 各自还会显式标一次）
+        self.source = Source::Replay;
         if self.acc >= step {
             // 积压超过补帧预算 ⇒ 丢弃，不留着下一轮连环提交
             self.acc = 0.0;
@@ -1337,6 +1469,14 @@ impl App {
     }
 
     /// 三级分派主入口（等价于 `OverlayBackend::present`）。
+    ///
+    /// 三条轴分得很清楚，别再缠在一起：
+    /// - **归档**（[`classify_tick`]）：这一趟算 `Buffer`/`Move`/`Idle`/`Deferred`/`Fault` 哪一档；
+    /// - **副作用**：发不发 buffer、发不发状态 commit。延后/出错在 margin 动了时照样发状态 commit，
+    ///   但不改变归档；
+    /// - **归属**（[`Self::attribute`]）：**只有 `Source::Tick` 才占五档**。帧回调补投和 `configure`
+    ///   重配置都不是 tick —— 补投那一笔混进 `commits` 就"补投几次超几次"，重配置那几笔混进
+    ///   `idle`/`moves` 同理（2026-10-28 轮 3 实测：5 次重配置 ⇒ 五档当场多 5）。
     pub fn present(&mut self, intent: &PresentationIntent) {
         if !self.configured {
             return;
@@ -1344,48 +1484,56 @@ impl App {
         self.last_intent = Some(intent.clone());
         let cell = intent.sprite.map(|s| (s.row as u32, s.col as u32));
         let moved = self.apply_margin(intent.surface.pos);
+        let new_cell = cell.is_some() && (cell != self.drawn_cell || self.force_draw);
 
-        let Some(cell) = cell else {
-            // 没有新格：内容不变，只看位置动没动
-            self.finish_move(moved);
-            return;
+        let outcome = match classify_tick(new_cell, moved, self.frame_pending) {
+            Tick::Move => {
+                self.layer.commit();
+                Tick::Move
+            }
+            Tick::Idle => Tick::Idle,
+            Tick::Deferred => {
+                // 一个在途 buffer 都没回来 ⇒ 延后（帧回调里补），绝不排队。
+                // ⚠️ 必须同时置 `force_draw`：帧回调只在 force_draw 为真时才重放 `last_intent`，
+                // 漏掉这步 = **这一格永久丢失**（`Sleep` 放完最后一格、一次性动画的尾帧
+                // 只会发一次 ⇒ 挂在那一格不再变）。
+                self.force_draw = true;
+                self.flush_margin_if(Tick::Deferred, moved);
+                Tick::Deferred
+            }
+            Tick::Buffer => {
+                // 走这条 ⇒ 附新 buffer，margin 的改动同一次 commit 生效
+                if matches!(cell, Some((r, c)) if self.draw_cell(r, c)) {
+                    self.drawn_cell = cell;
+                    self.force_draw = false;
+                    Tick::Buffer
+                } else {
+                    // 出图失败 ⇒ 这趟没有带 buffer 的 commit，但 `apply_margin` 已经把新
+                    // margin 排进待提交状态。补一个状态 commit 把它冲出去，否则合成器停在旧位置、
+                    // 而客户端以为已经挪了（下一趟 `moved=false` ⇒ 再也不发）。
+                    self.flush_margin_if(Tick::Fault, moved);
+                    Tick::Fault
+                }
+            }
+            // `classify_tick` 不产出这三档（`classification_partitions_the_inputs` 钉着）
+            Tick::Replay | Tick::Configure | Tick::Fault => {
+                unreachable!("这三档只在出图之后才可能成立")
+            }
         };
+        self.attribute(outcome);
+    }
 
-        if Some(cell) == self.drawn_cell && !self.force_draw {
-            self.finish_move(moved);
-            return;
-        }
-        if self.frame_pending {
-            // 一个在途 buffer 都没回来 ⇒ 延后（帧回调里补），绝不排队。
-            // ⚠️ 必须同时置 `force_draw`：帧回调只在 force_draw 为真时才重放 `last_intent`，
-            // 漏掉这步 = **这一格永久丢失**（`Sleep` 放完最后一格、一次性动画的尾帧
-            // 只会发一次 ⇒ 挂在那一格不再变）。
-            self.counters.deferred += 1;
-            self.force_draw = true;
-            self.finish_move(moved);
-            return;
-        }
-        // 走这条 ⇒ 附新 buffer，margin 的改动同一次 commit 生效
-        if self.draw_cell(cell.0, cell.1) {
-            self.counters.commits += 1;
-            self.drawn_cell = Some(cell);
-            self.force_draw = false;
-        } else {
-            // 出图失败 ⇒ 这 tick 没有带 buffer 的 commit，但 `apply_margin` 已经把新
-            // margin 排进待提交状态。补一个状态 commit 把它冲出去，否则合成器停在旧位置、
-            // 而客户端以为已经挪了（下一 tick `moved=false` ⇒ 再也不发）。
-            self.counters.buffer_errors += 1;
-            self.finish_move(moved);
+    /// 这一档若"只挪位置"也要把 margin 冲出去（`Buffer` 已把它带在同一次 commit 里，故不发）。
+    fn flush_margin_if(&mut self, tick: Tick, moved: bool) {
+        if tick.flushes_margin() && moved {
+            self.layer.commit();
         }
     }
 
-    /// "这一档最多只挪位置"的收尾：动了就发一个不附 buffer 的状态 commit。
-    fn finish_move(&mut self, moved: bool) {
-        if moved {
-            self.layer.commit();
-            self.counters.moves += 1;
-        } else {
-            self.counters.idle += 1;
+    /// 归属：交给纯函数 [`attribute_of`]，这里只负责记档。
+    fn attribute(&mut self, outcome: Tick) {
+        if let Some(hit) = attribute_of(self.source, outcome) {
+            self.counters.bump(hit);
         }
     }
 
@@ -1599,6 +1747,21 @@ impl App {
             self.counters.buffer_errors,
             self.counters.watchdogs,
         );
+        // 判据④的硬核对项直接打成结论，别让人再手加一遍（历史上"三档相加 == tick 总数"是在
+        // `延后` 恒为 0 的前提下才成立的，而那条前提没人写在读数旁边）。
+        let five = self.counters.tick_accounted();
+        println!(
+            "  核对: 五档合计 {} vs tick {} ⇒ {}｜非 tick 补画: 帧回调补投 {} / configure {}",
+            five,
+            self.ticks,
+            if five == self.ticks {
+                "OK（互斥且齐）"
+            } else {
+                "不一致：有 tick 没归进任何一档，或某档重复计数"
+            },
+            self.counters.replay_commits,
+            self.counters.configure_commits,
+        );
         println!(
             "  surface 逻辑 {}x{} ⇒ buffer {}x{}（scale {:.2}×，viewport {}）",
             self.logical.0,
@@ -1727,6 +1890,9 @@ impl CompositorHandler for App {
         if !self.force_draw {
             return;
         }
+        // 补投由帧回调驱动、不对应任何 tick ⇒ 这一趟的 commit 归 `replay_commits`，
+        // 否则"五档 == tick"永远差一个补投数（2026-10-28 轮 4 实测超 3 = 补投 2 + 双记 1）。
+        self.source = Source::Replay;
         if self.opts.test_rect {
             self.test_rect_frame();
         } else if let Some(i) = self.last_intent.clone() {
@@ -1838,11 +2004,15 @@ impl LayerShellHandler for App {
         self.configured = true;
         self.force_draw = true;
         self.clear_frame_wait();
+        // 合成器又发了一次 `configure`（重配置、改 anchor、reserved 变动都可能）⇒ 主动补画一帧。
+        // 这**不是 tick**：不标来源就会多记一笔 `idle`/`moves`（2026-10-28 轮 3 实测 5 次 ⇒ 五档超 5）。
+        self.source = Source::Configure;
         if self.opts.test_rect {
             self.test_rect_frame();
         } else if let Some(i) = self.last_intent.clone() {
             self.present(&i);
         }
+        self.source = Source::Replay;
     }
 }
 
@@ -2234,5 +2404,120 @@ mod tests {
             panic!("该建不起来");
         };
         assert!(err.starts_with("打不开存档"), "错误要带上是哪个路径: {err}");
+    }
+
+    /// 判据④"五档相加 == tick 总数"的结构前提：一档只动一个字段。
+    /// 真机上这条第一次露馅是 2026-10-28 轮 4（`延后 2` ⇒ 五档比 tick 多 3 = 补投 2 + 双记 1），
+    /// 而那条路径撞不撞得上全看合成器时序 ⇒ 没有 headless 覆盖就随时可能悄悄退回去。
+    #[test]
+    fn a_tick_bumps_exactly_one_counter() {
+        for tick in ALL_TICKS {
+            let mut c = Counters::default();
+            c.bump(tick);
+            let touched = [
+                c.commits,
+                c.moves,
+                c.idle,
+                c.deferred,
+                c.buffer_errors,
+                c.replay_commits,
+                c.configure_commits,
+            ];
+            assert_eq!(
+                touched.iter().filter(|&&n| n != 0).count(),
+                1,
+                "{tick:?} 动了不止一个字段: {touched:?}"
+            );
+            assert_eq!(
+                c.tick_accounted() == 1,
+                matches!(
+                    tick,
+                    Tick::Buffer | Tick::Move | Tick::Idle | Tick::Deferred | Tick::Fault
+                ),
+                "{tick:?} 算不算一个 tick 与五档加总不一致: {touched:?}"
+            );
+        }
+    }
+
+    /// 归属表逐组合钉死：非 tick 来源只有在真发 buffer 时才占档，且占的是**另计**那一档。
+    /// 这条断了就是判据④读不出真相（2026-10-28 一天内断过两次：补投进 `commits`、重配置进 `idle`）。
+    #[test]
+    fn attribution_is_a_table_over_source_and_outcome() {
+        for source in [Source::Tick, Source::Replay, Source::Configure] {
+            for outcome in ALL_OUTCOMES {
+                let hit = attribute_of(source, outcome);
+                let mut c = Counters::default();
+                if let Some(hit) = hit {
+                    c.bump(hit);
+                }
+                match source {
+                    Source::Tick => {
+                        assert_eq!(hit, Some(outcome), "{outcome:?} 必须原样占档");
+                        assert_eq!(c.tick_accounted(), 1, "{outcome:?} 没占上一档");
+                    }
+                    non_tick => {
+                        let want = match non_tick {
+                            Source::Configure => Some(Tick::Configure),
+                            _ => Some(Tick::Replay),
+                        };
+                        assert_eq!(
+                            hit,
+                            if outcome == Tick::Buffer { want } else { None },
+                            "{outcome:?} 在 {non_tick:?} 下判错了另计档"
+                        );
+                        // 另计档一律不碰五档
+                        assert_eq!(c.tick_accounted(), 0, "{outcome:?} 抢了一个 tick 的归属");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 回归钉：延后那一 tick 即使同时挪了 margin，协议上照发状态 commit，但**不双记**。
+    #[test]
+    fn a_deferred_tick_flushes_the_margin_without_counting_a_move() {
+        assert_eq!(classify_tick(true, true, true), Tick::Deferred);
+        assert!(
+            Tick::Deferred.flushes_margin(),
+            "延后时 margin 动了必须把状态 commit 冲出去，否则合成器停在旧位置"
+        );
+        let mut c = Counters::default();
+        c.bump(Tick::Deferred);
+        assert_eq!((c.moves, c.idle, c.deferred), (0, 0, 1));
+
+        // 出错同理（这条分支也会发状态 commit）
+        assert!(Tick::Fault.flushes_margin());
+        let mut c = Counters::default();
+        c.bump(Tick::Fault);
+        assert_eq!((c.moves, c.idle, c.buffer_errors), (0, 0, 1));
+    }
+
+    /// 归档全覆盖：8 种输入组合各自只落一档，且 `Move`/`Idle` 不可能吃掉一个"该换格"的 tick。
+    #[test]
+    fn classification_partitions_the_inputs() {
+        for new_cell in [false, true] {
+            for moved in [false, true] {
+                for frame_pending in [false, true] {
+                    let tick = classify_tick(new_cell, moved, frame_pending);
+                    // `Fault`/`Replay` 要等真出图的结果，不归这里判
+                    assert!(
+                        matches!(
+                            tick,
+                            Tick::Buffer | Tick::Move | Tick::Idle | Tick::Deferred
+                        ),
+                        "{new_cell}/{moved}/{frame_pending} 判出了 {tick:?}"
+                    );
+                    assert_eq!(
+                        matches!(tick, Tick::Move | Tick::Idle),
+                        !new_cell,
+                        "{new_cell}/{moved}/{frame_pending} ⇒ {tick:?}：不换格才会落进这两档"
+                    );
+                    assert_eq!(tick == Tick::Move, !new_cell && moved);
+                    assert_eq!(tick == Tick::Idle, !new_cell && !moved);
+                    assert_eq!(tick == Tick::Deferred, new_cell && frame_pending);
+                    assert_eq!(tick == Tick::Buffer, new_cell && !frame_pending);
+                }
+            }
+        }
     }
 }
