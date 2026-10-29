@@ -1910,6 +1910,9 @@ mod tests {
 
     /// 目视核对（M2 的教训：数字门禁看不见"少了一块"）—— **出图矩阵**（`UI_REDESIGN_V2` 提交 7）
     /// = 相位 × 4 locale × 3 motion × {1.0×, 1.5×}，逐张过眼。
+    /// 分页（本批）把**菜单那一格扩成三页**：页只改菜单相的像素 ⇒ 结果卡那些相位不加维度。
+    /// 三页 × 四 locale 是"走路/爬墙/退出这类新字在 ja/ko 下装不装得下"唯一能判的地方
+    /// （`fit` 会截断，而"截断成什么样"必须过眼）。
     ///
     /// ```sh
     /// cd /home/jun/Projects/opet && export PATH="$HOME/.cargo/bin:$PATH"
@@ -1919,7 +1922,7 @@ mod tests {
     /// # 拼总览：一张 = 一个 motion × scale，行=相位、列=locale
     /// for sc in s100 s150; do for mo in full reduce off; do
     ///   files=()
-    ///   for p in menu menuerr ssr_pull ssr_burstA ssr_burstB ssr_appear ssr_card \
+    ///   for p in menu menu_action menu_misc menuerr ssr_pull ssr_burstA ssr_burstB ssr_appear ssr_card \
     ///            ten_pull ten_burstA ten_burstB ten_appear ten_card; do
     ///     for lc in zh en ja ko; do
     ///       [ -f "opet_card_${p}_${lc}_${mo}_${sc}.png" ] && files+=("opet_card_${p}_${lc}_${mo}_${sc}.png")
@@ -1945,8 +1948,8 @@ mod tests {
             return;
         }
         /// 一张出图的全部输入：`Shot` 的参数 + 文件名里的相位标签。
-        /// 收成一个结构而不是八个位置参数，是因为矩阵有 168 个调用点，而 `err`/`dry` 这种
-        /// 尾部布尔在位置参数里最容易串位（串了也不会红，只会出一张看着很干净的错图）。
+        /// 收成一个结构而不是八个位置参数，是因为矩阵有上百个调用点，而 `err`/`dry`/`page`
+        /// 这种尾部值在位置参数里最容易串位（串了也不会红，只会出一张看着很干净的错图）。
         struct Frame<'a> {
             phase: &'a str,
             lang: Lang,
@@ -1956,10 +1959,24 @@ mod tests {
             balance: i64,
             dry: bool,
             err: &'a str,
+            /// 画哪一页。**只有菜单相位读它**（burst/reveal 画的是结果卡，`ctx.page`
+            /// 不参与那些像素）⇒ 卡片相位一律填 `MenuPage::Gacha`，别在文件名里造假维度。
+            page: MenuPage,
         }
         let mut written = 0usize;
         let mut dump = |f: &Frame| {
-            let s = Shot::at_lang(f.scale, f.anim, f.balance, f.dry, f.err, f.motion, f.lang);
+            let s = Shot::on_page(
+                f.anim,
+                Ctx {
+                    balance: f.balance,
+                    dry_run: f.dry,
+                    error: f.err,
+                    scale: f.scale,
+                    motion: f.motion,
+                    lang: f.lang,
+                    page: f.page,
+                },
+            );
             let mut bytes = format!("P6\n{} {}\n255\n", s.bw, s.bh).into_bytes();
             bytes.reserve((s.bw * s.bh * 3) as usize);
             for px in s.canvas.chunks_exact(4) {
@@ -1980,16 +1997,28 @@ mod tests {
             for &lang in &Lang::ALL {
                 // 菜单两格：`motion` 改不了它的像素（`menu_pixels_ignore_the_motion_tier`），
                 // 所以每个 (locale, scale) 只出一组，而不是三组一模一样的图。
-                dump(&Frame {
-                    phase: "menu",
-                    lang,
-                    motion: Motion::Full,
-                    scale,
-                    anim: &MenuAnim::Menu,
-                    balance: 1200,
-                    dry: true,
-                    err: "",
-                });
+                //
+                // **分页把这一组变成三组**：三页的三行是不同的字，标题条印的也是不同的字，
+                // 而"这行字在 ja/ko 下装不装得下"只有过眼才判得出来（`l10n` 的 `fit` 会截断，
+                // 截不断是另一回事）。页名因此进 `phase` 而不是新开文件名字段 ⇒ 蒙太奇命令不变。
+                for page in MenuPage::ALL {
+                    let tag = match page {
+                        MenuPage::Gacha => "menu",
+                        MenuPage::Action => "menu_action",
+                        MenuPage::Misc => "menu_misc",
+                    };
+                    dump(&Frame {
+                        phase: tag,
+                        lang,
+                        motion: Motion::Full,
+                        scale,
+                        anim: &MenuAnim::Menu,
+                        balance: 1200,
+                        dry: true,
+                        err: "",
+                        page,
+                    });
+                }
                 dump(&Frame {
                     phase: "menuerr",
                     lang,
@@ -1999,6 +2028,7 @@ mod tests {
                     balance: 0,
                     dry: false,
                     err: "DB LOCKED BY ANOTHER OPEN",
+                    page: MenuPage::Gacha,
                 });
                 for &motion in &Motion::ALL {
                     // 十连（best=SR）与单抽（best=SSR）各一份，名字走**真实目录**（`ten_items`）：
@@ -2019,6 +2049,8 @@ mod tests {
                                 balance: 140,
                                 dry: true,
                                 err: "",
+                                // 结果卡不读页 ⇒ 固定默认页，别在文件名里造一个假维度。
+                                page: MenuPage::Gacha,
                             });
                         }
                     }
