@@ -10,24 +10,33 @@ use crate::text;
 
 /// 可点的菜单项。余额行是信息，不进命中表。
 ///
-/// ⚠️ `Lang`（语言行）**不在 [`MenuItem::CLICKABLE`] 里**，但**能被命中** —— 它走
-/// [`footer`] 那一块单独的矩形，好让"三行行带 + 缝隙不命中"那条证明一行不动（§4.4）。
-/// 加了它 `on_menu_press` 的 `match` 会因穷尽性编译不过 ⇒ 新项漏分派不可能静默。
+/// ⚠️ `Lang`（语言行）**不在任何一页的行带里**，但**能被命中** —— 它走 [`footer`] 那一块
+/// 单独的矩形，好让"三行行带 + 缝隙不命中"那条证明一行不动（§4.4）。`Page`（标题条）同理
+/// 走 [`header`]：它是**跨页的翻页控件**，不属于任何一页。
+/// 新增项会让 `on_menu_press` 的 `match` 因穷尽性编译不过 ⇒ 漏分派不可能静默。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuItem {
+    // ── 盲盒页 ──
     Pull1,
     Pull10,
     Close,
+    // ── 动作页 ──
+    Walk,
+    Run,
+    Jump,
+    // ── 其它页 ──
+    Climb,
+    Pause,
+    Quit,
+    // ── 不属于任何一页的控件 ──
+    /// 标题条：点一下换到下一页。它画的字来自 [`MenuPage::header_text`]，不来自 [`Self::label`]。
+    Page,
     /// 点一下循环 zh→en→ja→ko。**只改本进程**，不写回 config.toml（§7-R15：手写 reader
     /// 保不住用户注释，读改写会把文件刷平）。
     Lang,
 }
 
 impl MenuItem {
-    /// 三行行带。常量长度是 3 而不是 4 是有意的：`layout()` 的几何证明、缝隙判定、
-    /// `ROW_STEP` 全部按这三行算，语言行不属于这一族。
-    pub const CLICKABLE: [Self; 3] = [Self::Pull1, Self::Pull10, Self::Close];
-
     /// 卡片上显示的字。**唯一来源是 `l10n`**，这里一个字面量都不写（写了就绕过
     /// `everything_the_ui_can_render_is_in_the_codes_list` 那对字体门禁）。
     /// 语言行返回 `语言 中文` 这种"标签 + 当前语言的自名"（理由见 [`l10n::lang_row`]：
@@ -37,27 +46,95 @@ impl MenuItem {
             Self::Pull1 => lang.t(Key::Pull1).to_string(),
             Self::Pull10 => lang.t(Key::Pull10).to_string(),
             Self::Close => lang.t(Key::Close).to_string(),
+            Self::Walk => lang.t(Key::Walk).to_string(),
+            Self::Run => lang.t(Key::Run).to_string(),
+            Self::Jump => lang.t(Key::Jump).to_string(),
+            Self::Climb => lang.t(Key::Climb).to_string(),
+            Self::Pause => lang.t(Key::Pause).to_string(),
+            Self::Quit => lang.t(Key::Quit).to_string(),
             Self::Lang => l10n::lang_row(lang),
+            // **空串是故意的，不是一个待填的洞**：标题条上画的是"页名 + 页码"，那是**当前页**
+            // 的函数而不是**这一项**的函数 ⇒ 正解在 [`MenuPage::header_text`]。这里随便返回
+            // 一个页名就是在给一个并不存在的状态写字。行带循环只吃 [`layout`]，所以
+            // [`crate::card::paint`] 从不走这条路 —— 真有人接上它，画出来是一行空白，
+            // 出图过眼当场看得见，比"画出一个错页名"诚实。
+            Self::Page => String::new(),
+        }
+    }
+}
+
+/// 菜单的页。**"每页恒三行"从此是类型层面的事实**（[`Self::rows`] 返回 `[MenuItem; 3]`），
+/// 不再靠一条 `assert_eq!(rows.len(), 3)` 祈祷。
+///
+/// 为什么只能分页而不能加行：卡片是 **240×150 固定尺寸**（那两个数由结果卡的排版契约定，
+/// 不是给菜单留的余地），而行带算术是 `ROW_STEP 30 × 3 + HEAD_H 22 + PAD 8 = 116`，footer 从
+/// 124 起 ⇒ 只剩 8 px 气，**第四行物理放不下**（`footer_is_below_the_rows_and_inside_the_card`
+/// 守的就是这个下界）。把卡片拉长会同时改 input region 与 `placement` ⇒ §4.4 那条硬约束。
+///
+/// [`Self::ALL`] 的顺序**就是**翻页顺序，也是标题条上页码的顺序（两处共用同一个
+/// [`Self::index`]，所以改了顺序不会让"翻页指向哪儿"和"页码写着几"分家）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuPage {
+    /// 盲盒：抽一次 / 十连 / 关闭。**右键落地的默认页** ⇒ "右键就想要抽卡"这个习惯没改。
+    Gacha,
+    /// 动作：走路 / 跑步 / 跳跃。
+    Action,
+    /// 其它：爬墙 / 暂停 / 退出。退出放最后一页最后一行 ⇒ 误触退出至少两次点击
+    /// （翻页 + 点行），而翻页本身点错免费（循环）。
+    Misc,
+}
+
+impl MenuPage {
+    pub const ALL: [Self; 3] = [Self::Gacha, Self::Action, Self::Misc];
+
+    /// 循环到下一页（`Misc → Gacha` 回卷）。
+    pub fn next(self) -> Self {
+        match self {
+            Self::Gacha => Self::Action,
+            Self::Action => Self::Misc,
+            Self::Misc => Self::Gacha,
         }
     }
 
-    /// 这一项占的矩形（行带里的三项 + 底部语言行）。`layout()` 与 [`footer`] 的并集就是
-    /// 命中表 ⇒ 两处共用同一份几何，draw 与 hit_test 不可能各算一套。
-    pub fn rect(self) -> ItemRect {
-        if self == Self::Lang {
-            return footer();
-        }
-        let i = Self::CLICKABLE
+    /// 在 [`Self::ALL`] 里的下标。页码 `n/N` 的 `n` 由它 + 1 得出 ⇒ 顺序与页码不可能漂移。
+    pub fn index(self) -> usize {
+        Self::ALL
             .iter()
-            .position(|&it| it == self)
-            .expect("CLICKABLE 覆盖三个行项");
-        ItemRect {
-            item: self,
-            x: PAD,
-            y: PAD + HEAD_H + (i as i32) * ROW_STEP,
-            w: CARD_W - 2 * PAD,
-            h: ROW_H,
+            .position(|&p| p == self)
+            .expect("ALL 覆盖全部页")
+    }
+
+    /// 这一页的三行。长度 3 是**类型**，不是断言。
+    pub fn rows(self) -> [MenuItem; 3] {
+        match self {
+            Self::Gacha => [MenuItem::Pull1, MenuItem::Pull10, MenuItem::Close],
+            Self::Action => [MenuItem::Walk, MenuItem::Run, MenuItem::Jump],
+            Self::Misc => [MenuItem::Climb, MenuItem::Pause, MenuItem::Quit],
         }
+    }
+
+    /// 页名的文案键。
+    pub fn key(self) -> Key {
+        match self {
+            Self::Gacha => Key::PageGacha,
+            Self::Action => Key::PageAction,
+            Self::Misc => Key::PageMisc,
+        }
+    }
+
+    /// 标题条**左端**的字：页名 + ASCII 页码（`盲盒 1/3`）。
+    ///
+    /// 页码是"标题条是个控件"的**唯一**视觉线索 —— 这块 surface 不吃键盘、没有 hover、
+    /// 换不了 cursor 形状（D14），所以只能把线索画在字上（§9.2 第 14 条那一族）。
+    /// 右侧已被碎片/演示占住 ⇒ 页码跟在页名后面，不另起一行。
+    /// `n/N` 全 ASCII ⇒ 零字体成本，这条由 `header_page_indicator_is_ascii_only` 钉住。
+    pub fn header_text(self, lang: Lang) -> String {
+        format!(
+            "{} {}/{}",
+            lang.t(self.key()),
+            self.index() + 1,
+            Self::ALL.len()
+        )
     }
 }
 
@@ -230,17 +307,55 @@ pub fn label_rect(row: RectI) -> RectI {
     RectI::new(t.x + indent, t.y, (t.w - indent).max(0), t.h)
 }
 
-/// 固定布局：3 个可点项从上到下。`layout` 与 `hit_test` 是唯一的真相源，
-/// `draw_menu` 画矩形、`menu_pointer_event` 判命中都从这张表取，不许各处再算一份。
-pub fn layout() -> Vec<ItemRect> {
-    MenuItem::CLICKABLE.iter().map(|&it| it.rect()).collect()
+/// 第 `i` 行的矩形。**行带算术逐字从旧的 `MenuItem::rect()` 搬来** ⇒ 分页一个像素都没动
+/// 行带几何，改的只是"哪三项占这三行"。`layout` / `hit_test` / `draw` 仍共用这一份真相源。
+pub fn row_rect(i: usize, item: MenuItem) -> ItemRect {
+    ItemRect {
+        item,
+        x: PAD,
+        y: PAD + HEAD_H + (i as i32) * ROW_STEP,
+        w: CARD_W - 2 * PAD,
+        h: ROW_H,
+    }
 }
 
-/// 命中表 = 三行 + 语言行。语言行走 `footer()` 这条路，所以行带的四个常量与
-/// "缝隙不命中"那条证明（`hit_test_hits_centers_and_misses_gaps_and_margins`）一行没动。
-pub fn rects() -> Vec<ItemRect> {
-    let mut v = layout();
+/// 标题条的矩形 = **翻页控件**。占的就是画标题的那一条（`PAD..PAD + HEAD_H`）。
+///
+/// 它能被点而 input region **一个字都不用改**：菜单整块 surface 的 region 一直是整张卡片
+/// 矩形（`app.rs` 的 `region.add(0, 0, logical)`），标题条本来就在这块里面。
+/// 与行带的关系是"恰好相接、不相交"（`header` 底边 = `PAD + HEAD_H` = 第 0 行顶边），
+/// 这条由 `page_switch_is_the_header_and_hits_nothing_else` 用现成的 [`overlaps`] 量着。
+pub fn header() -> ItemRect {
+    ItemRect {
+        item: MenuItem::Page,
+        x: PAD,
+        y: PAD,
+        w: CARD_W - 2 * PAD,
+        h: HEAD_H,
+    }
+}
+
+/// 当前页的三行行带。`layout` 与 `hit_test` 是唯一的真相源，`card.rs` 画矩形、`app.rs`
+/// 判命中都从这张表取，不许各处再算一份。
+pub fn layout(page: MenuPage) -> Vec<ItemRect> {
+    page.rows()
+        .iter()
+        .enumerate()
+        .map(|(i, &it)| row_rect(i, it))
+        .collect()
+}
+
+/// 命中表 = 三行 + 语言行 + 标题条。语言行走 [`footer`]、标题条走 [`header`]，所以行带的
+/// 四个常量与"缝隙不命中"那条证明（`hit_test_hits_centers_and_misses_gaps_and_margins`）
+/// 一行没动。
+///
+/// ⚠️ **顺序是有约束的：footer 必须留在下标 3**。`the_card_phase_opens_no_row_to_the_pointer`
+/// 里那句 `centers[3] == 语言行` 是第五条缺陷验收的对照之一；把标题条插在中间会让那个索引
+/// 漂移成"指向另一个东西"，而**断言照样绿**（它比的仍是 `centers[3]`）⇒ 新项一律**追加在尾**。
+pub fn rects(page: MenuPage) -> Vec<ItemRect> {
+    let mut v = layout(page);
     v.push(footer());
+    v.push(header());
     v
 }
 
@@ -259,15 +374,17 @@ pub fn hit_test(rects: &[ItemRect], at: (f32, f32)) -> Option<MenuItem> {
 /// **唯一许可分派点击的入口**：命中 + 相位把关。开箱（`Burst`/`Reveal`）那段时间返回 `None`。
 ///
 /// 为什么必须在命中这一步、而不是在每个 `match` 分支里各问一遍：这块 surface 是**同一张
-/// 240×150**，三个行项与语言行的命中矩形**整个落在结果卡底下**（reveal 态由 `card::paint`
-/// 重画全卡，那一屏上"抽一次/十连/关闭"根本没有被画出来）。而 [`hit_test`] 用的是静态表
-/// ⇒ 画不出来的东西照样能命中。真机症状（用户 2026-10-28 报）：**结果卡还没关就去点它，
-/// 点的位置像哪一行就执行哪一行的功能 ⇒ 看着一张结果卡又能顺手抽掉十次**。
+/// 240×150**，三个行项、语言行与标题条的命中矩形**整个落在结果卡底下**（reveal 态由
+/// `card::paint` 重画全卡，那一屏上"抽一次/十连/关闭"和页名根本没被画出来）。而 [`hit_test`]
+/// 用的是静态表 ⇒ 画不出来的东西照样能命中。真机症状（用户 2026-10-28 报）：**结果卡还没关
+/// 就去点它，点的位置像哪一行就执行哪一行的功能 ⇒ 看着一张结果卡又能顺手抽掉十次**。
 ///
 /// 这不是新立的规矩，是**补上一条已经写了但只执行了四分之一的规矩**：`MenuAnim::is_busy`
 /// 的注释原话是"菜单项这段时间不该被点"，而落地时只有 `MenuItem::Lang` 那一路问了它
-/// （当时的理由"画不出来的东西不许可点"对四个矩形全都成立）。⇒ **一个"该不该"的判断
+/// （当时的理由"画不出来的东西不许可点"对当时那四个矩形全都成立）。⇒ **一个"该不该"的判断
 /// 放在分派侧 = 每加一项就要记得问一遍；放在命中侧 = 结构上问不到就点不着。**
+/// 分页把命中表从 4 张加到 5 张（多了标题条）而这里**一个字没加**，正是这条修法买来的东西：
+/// 新控件自动被同一个闸门管着，门禁 `the_card_phase_opens_no_row_to_the_pointer` 逐格验收。
 ///
 /// 关菜单这段时间怎么走？两个既有路径都还在：**再右键**翻转菜单（D14）、或者等 dwell
 /// 放完自动回到 `Menu` 相位（N/R/SR/SSR = 90/100/130/180 tick）。不加"点卡片跳过动画"，
@@ -606,17 +723,30 @@ pub fn white_flash(anim: &MenuAnim, motion: Motion) -> bool {
 /// 是那一帧唯一真的在变的量）、`Reveal` 混 [`white_flash`] 的布尔量（闪与不闪是两套像素，
 /// 夹在中间会把白闪丢掉 ⇒ 不能整个不混）。钉成 `the_dwell_never_bumps_the_signature`。
 ///
-/// ⚠️ **`lang` 必须在动画量之前**：切语言应当在**同一 tick 计数**下也被认成内容变化
-/// （菜单态三行的字换了，而动画量一直是 0）。把它排在后面，`Menu` 相位的 0 会让"换了字"
-/// 这件事仍然混进签名 —— 顺序在这里不影响正确性，但影响**读代码的人能不能一眼看出 lang
-/// 不属于动画量**，所以固定这个位置并由 `switching_lang_bumps_sig_once_then_is_stable` 钉住。
+/// ⚠️ **`lang` 与 `page` 必须在动画量之前**：切语言 / 翻页应当在**同一 tick 计数**下也被认成
+/// 内容变化（菜单态三行的字换了、行带里换成了另一组项，而动画量一直是 0）。把它排在后面，
+/// `Menu` 相位的 0 会让"换了内容"这件事仍然混进签名 —— 顺序在这里不影响正确性，但影响
+/// **读代码的人能不能一眼看出这两条不属于动画量**，所以固定这个位置，并由
+/// `switching_lang_bumps_sig_once_then_is_stable` 与
+/// `a_page_switch_bumps_the_signature_exactly_once_and_a_dwell_never_does` 钉住。
 /// ⚠️ **`motion` 是推导动画量的输入，而不是被混进签名的字段**：它和 `dry_run` 同族 ——
 /// 启动时一次定死，运行中没有任何 UI 入口能改它 ⇒ "同一份输入给同一个签名"不会因为少了
 /// 它而失真。但本轮它**必须传进来**：白闪布尔量与扩散半径都由 `anim_spec(rarity, motion)`
-/// 决定，不传就算不出"画面上此刻是什么"。对照 `lang`：语言**能**在运行中被点着换 ⇒ 必须
-/// 进签名当字段。把这条区别写在这里，是因为两者长得像而语义相反，最容易顺手抄错。
+/// 决定，不传就算不出"画面上此刻是什么"。对照 `lang`/`page`：两者**能**在运行中被点着换 ⇒
+/// 必须进签名当字段。把这条区别写在这里，是因为两者长得像而语义相反，最容易顺手抄错。
+/// ⚠️ **`page` 必须被下游读到**（`card::Ctx::page` ⇒ `paint_menu` 拿它算行像素与标题像素）。
+/// 漏了它 = `69fd158` 那条缺陷的**镜像形状**：点了翻页、命中表换了、卡片还画旧页（省电闸门
+/// 反过来把改动挡了）。反过来"页不进签名会不会多投"也不会：页**只可能在 `Menu` 相被改**
+/// （[`press`] 在 busy 时返回 `None`），所以它给 burst/dwell 增加的提交数是零。
 /// FNV-1a：不需要新依赖，且**只用来判等**，不当哈希表键、不进任何确定性契约。
-pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str, lang: Lang, motion: Motion) -> u64 {
+pub fn content_sig(
+    anim: &MenuAnim,
+    balance: i64,
+    error: &str,
+    lang: Lang,
+    page: MenuPage,
+    motion: Motion,
+) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |b: u8| {
         h ^= b as u64;
@@ -639,6 +769,10 @@ pub fn content_sig(anim: &MenuAnim, balance: i64, error: &str, lang: Lang, motio
     for &b in lang.code().as_bytes() {
         mix(b);
     }
+    // 页与语言同属"运行中用户可改"那一族 ⇒ 与它为邻。这里用序号而不是字符串：页名是**文案**，
+    // 换语言时字也换了，而那件事已经由上面的 `lang` 混进签名，用序号不会与它撞车，也不会
+    // 让"三页的页名恰好相同"这种未来的文案改动把两页混成一个签名。
+    mix(page.index() as u8);
     for b in frame.to_le_bytes() {
         mix(b);
     }
@@ -856,38 +990,182 @@ mod tests {
     use super::*;
     use petcore::gacha::Catalog;
 
+    /// 逐页核对命中表：**每页五张**（三行 + 语言行 + 标题条），而且每页占那三行的正是
+    /// `rows()` 给的三项。这张表必须与 draw 共用 ⇒ 漏一项就是"画得出来却点不到"。
     #[test]
     fn layout_rects_are_disjoint_and_inside_the_card() {
-        // 四张矩形（三行 + 语言行）都在命中表里 ⇒ 这张表**必须**是 draw 与 hit_test 共用的
-        // 那一份；漏了第 4 项，语言行画得出来却点不到。
-        let rects = rects();
-        assert_eq!(rects.len(), 4, "三行 + 语言行 = 四张命中矩形");
-        assert_eq!(
-            rects.iter().map(|r| r.item).collect::<Vec<_>>(),
-            vec![
-                MenuItem::Pull1,
-                MenuItem::Pull10,
-                MenuItem::Close,
-                MenuItem::Lang
-            ]
-        );
-        for r in &rects {
-            assert!(r.x >= 0 && r.y >= 0 && r.x + r.w <= CARD_W && r.y + r.h <= CARD_H);
-        }
-        for w in rects.windows(2) {
-            assert!(
-                !overlaps(w[0].as_rect(), w[1].as_rect()),
-                "相邻行矩形不许重叠"
+        for page in MenuPage::ALL {
+            let rects = rects(page);
+            assert_eq!(
+                rects.len(),
+                5,
+                "{page:?}：三行 + 语言行 + 标题条 = 五张命中矩形"
             );
+            let mut want: Vec<MenuItem> = page.rows().to_vec();
+            want.push(MenuItem::Lang);
+            want.push(MenuItem::Page);
+            assert_eq!(
+                rects.iter().map(|r| r.item).collect::<Vec<_>>(),
+                want,
+                "{page:?}：命中表的项序就是 `rows()` + footer + header ⇒ footer 必须留在下标 3"
+            );
+            for r in &rects {
+                assert!(r.x >= 0 && r.y >= 0 && r.x + r.w <= CARD_W && r.y + r.h <= CARD_H);
+            }
+            for w in rects.windows(2) {
+                assert!(
+                    !overlaps(w[0].as_rect(), w[1].as_rect()),
+                    "{page:?}：相邻行矩形不许重叠"
+                );
+            }
+        }
+    }
+
+    /// 分页不许改变行带：每页三行、第 `i` 行的 y 恰为 `PAD + HEAD_H + i * ROW_STEP`（这正是
+    /// 旧的 `MenuItem::rect()` 那道算术），三行中心各自命中自己那一行，而**行缝还是打不中**
+    /// （"缝隙不命中"那条证明换了页也必须成立），一切都在 `CARD_H` 内。
+    ///
+    /// ⚠️ "恒三行"从这一版起是**类型**保证的（[`MenuPage::rows`] 返回 `[MenuItem; 3]`），这里
+    /// 量的是"这三行确实落在行带那三个位置、并且点得到" —— 那才是加页时真正会塌的东西。
+    #[test]
+    fn every_page_lays_three_rows_and_the_seam_stays_dead() {
+        for page in MenuPage::ALL {
+            let rows = layout(page);
+            assert_eq!(rows.len(), 3, "{page:?}：行带必须还是三行");
+            for (i, r) in rows.iter().enumerate() {
+                assert_eq!(
+                    r.y,
+                    PAD + HEAD_H + (i as i32) * ROW_STEP,
+                    "{page:?} 第 {i} 行的 y 漂了 ⇒ 行带算术被分页改动了"
+                );
+                assert_eq!(r.x, PAD, "{page:?}：左右留边与页无关");
+                assert_eq!(r.w, CARD_W - 2 * PAD, "{page:?}：行宽与页无关");
+            }
+            let table = rects(page);
+            for r in &rows {
+                assert_eq!(
+                    hit_test(&table, ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)),
+                    Some(r.item),
+                    "{page:?}：行 {:?} 的中心点不到",
+                    r.item
+                );
+            }
+            // 行缝（第 0 行底边 + 1）在每一页都必须还是打不中的那道缝。
+            let seam = rows[0].y + rows[0].h + 1;
+            assert!(
+                hit_test(&table, (CARD_W as f32 / 2.0, seam as f32)).is_none(),
+                "{page:?}：行缝应答了 ⇒ ROW_STEP > ROW_H 那道证明在这页不成立"
+            );
+            // 最后一行的底边不许出卡片（加页最容易撞的地方）。
+            let last = rows.last().unwrap();
+            assert!(
+                last.y + last.h <= CARD_H,
+                "{page:?}：第三行底边 {} 出卡 {CARD_H}",
+                last.y + last.h
+            );
+        }
+    }
+
+    /// 一个项绝不能同时挂在两页 ⇒ "退出"能从两个位置点到、或者某个动作在别页也能点，
+    /// 都是这张表不该有的形状（它会让"误触退出至少两次点击"那条代价失效）。
+    #[test]
+    fn no_item_lives_on_two_pages() {
+        let mut all: Vec<MenuItem> = Vec::new();
+        for page in MenuPage::ALL {
+            for it in page.rows() {
+                assert!(!all.contains(&it), "{it:?} 同时挂在 {page:?} 和更早的页上");
+                all.push(it);
+                // footer/header 是每页共用的控件，不参与"行"的去重。
+                assert_ne!(it, MenuItem::Lang, "语言行走 footer，不该占一行");
+                assert_ne!(it, MenuItem::Page, "标题条是控件，不该占一行");
+            }
+        }
+        assert_eq!(all.len(), 9, "三页 × 三行 = 九个互不相同的可点项");
+    }
+
+    /// 翻页这个控件**只有标题条**：它的中心命中 `Page`，而它的矩形与任意页的任意一行、
+    /// 以及 footer 都不相交（`overlaps` 现成的判定，不另立一套几何）。
+    ///
+    /// 标题条与第 0 行是"恰好相接"（`header` 底边 = `PAD + HEAD_H` = 第 0 行顶边）⇒
+    /// 半开区间下边界互不认领，这条也一并钉住（正好在边界上的那次点击归第 0 行）。
+    #[test]
+    fn page_switch_is_the_header_and_hits_nothing_else() {
+        let h = header();
+        assert_eq!(h.item, MenuItem::Page);
+        assert_eq!(
+            hit_test(
+                &rects(MenuPage::Gacha),
+                ((h.x + h.w / 2) as f32, (h.y + h.h / 2) as f32)
+            ),
+            Some(MenuItem::Page),
+            "标题条点不到 ⇒ 分页这个功能在屏幕上不存在"
+        );
+        for page in MenuPage::ALL {
+            for r in layout(page) {
+                assert!(
+                    !overlaps(h.as_rect(), r.as_rect()),
+                    "{page:?}：标题条与行 {:?} 相交 ⇒ 一次点击会同时属于两个项",
+                    r.item
+                );
+            }
+            assert!(
+                !overlaps(h.as_rect(), footer().as_rect()),
+                "标题条与语言行相交"
+            );
+        }
+        // 相接而不相交：标题条底边就是第 0 行顶边。
+        assert_eq!(h.y + h.h, PAD + HEAD_H);
+        assert_eq!(h.y + h.h, row_rect(0, MenuItem::Pull1).y);
+        assert_eq!(
+            hit_test(
+                &rects(MenuPage::Gacha),
+                ((h.x + h.w / 2) as f32, (h.y + h.h) as f32)
+            ),
+            Some(MenuItem::Pull1),
+            "边界上的点击归第 0 行（半开区间）"
+        );
+    }
+
+    /// 页码 `n/N` 必须全 ASCII ⇒ 分页**不引入任何新码位**（字体子集那份清单是唯一事实源，
+    /// 加字要重裁字体并重钉三处数，这条把成本挡在门外）。页名本身走四语言文案表，由
+    /// `everything_the_ui_can_render_is_in_the_codes_list` 那条门禁管。
+    #[test]
+    fn header_page_indicator_is_ascii_only() {
+        for page in MenuPage::ALL {
+            for lang in Lang::ALL {
+                let text = page.header_text(lang);
+                let tail = text.rsplit(' ').next().expect("标题里必有页码那一段");
+                assert!(
+                    tail.chars().all(|c| c.is_ascii_digit() || c == '/')
+                        && tail.contains('/')
+                        && !tail.starts_with('/')
+                        && !tail.ends_with('/'),
+                    "{lang:?} {page:?}：页码段「{tail}」含非 ASCII 字符 ⇒ 要重裁字体"
+                );
+                assert_eq!(
+                    tail,
+                    format!("{}/{}", page.index() + 1, MenuPage::ALL.len()),
+                    "页码必须来自 `index()` ⇒ 页名顺序与写着的数不许分家"
+                );
+            }
         }
     }
 
     /// 语言行的几何证明（§4.4）：它在三行**之下**、在卡片**之内**，而且与行带不相交 ——
     /// 这条取代了"footer 只在 layout 里"的那种假前提。
+    ///
+    /// ⚠️ **footer 的几何与页无关**（三页共用同一条带）⇒ 下面这段算术逐字不动，只有
+    /// "恒三行"那一句搬进了页循环（它现在由 `[MenuItem; 3]` 保证）。
     #[test]
     fn footer_is_below_the_rows_and_inside_the_card() {
-        let rows = layout();
-        assert_eq!(rows.len(), 3, "CLICKABLE 恒三行：语言行走 footer 那条路");
+        for page in MenuPage::ALL {
+            assert_eq!(
+                page.rows().len(),
+                3,
+                "{page:?}：语言行走 footer 那条路，行带恒三行"
+            );
+        }
+        let rows = layout(MenuPage::Gacha);
         let f = footer();
         let last = rows.last().unwrap();
         assert_eq!(
@@ -915,34 +1193,41 @@ mod tests {
 
     #[test]
     fn hit_test_hits_centers_and_misses_gaps_and_margins() {
-        // 用 [`rects`]（三行 + 语言行）而不是 [`layout`]：命中表**必须**与 draw 用的是同一份，
-        // 否则语言行画得出来却点不到 —— 而这只有真机能发现。
-        let rects = rects();
-        for r in &rects {
+        // 用 [`rects`]（三行 + 语言行 + 标题条）而不是 [`layout`]：命中表**必须**与 draw 用的是
+        // 同一份，否则语言行画得出来却点不到 —— 而这只有真机能发现。逐页跑：分页后每一页
+        // 都有自己的一张表，"这一页点得到"是逐页的性质不是总表的性质。
+        for page in MenuPage::ALL {
+            let rects = rects(page);
+            for r in &rects {
+                assert_eq!(
+                    hit_test(&rects, ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)),
+                    Some(r.item),
+                    "{page:?}：{:?} 中心必须命中",
+                    r.item
+                );
+                // 半开区间：右/下边界外 1px 不命中，左上角内 1px 命中。
+                assert_eq!(
+                    hit_test(&rects, ((r.x + r.w) as f32, (r.y + r.h / 2) as f32)),
+                    None
+                );
+                assert_eq!(hit_test(&rects, (r.x as f32, r.y as f32)), Some(r.item));
+            }
             assert_eq!(
-                hit_test(&rects, ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32)),
-                Some(r.item),
-                "{:?} 中心必须命中",
-                r.item
+                hit_test(&rects, (0.0, 0.0)),
+                None,
+                "{page:?}：边距上的点击穿透到背后"
             );
-            // 半开区间：右/下边界外 1px 不命中，左上角内 1px 命中。
             assert_eq!(
-                hit_test(&rects, ((r.x + r.w) as f32, (r.y + r.h / 2) as f32)),
-                None
+                hit_test(&rects, (4.0, CARD_H as f32 - 4.0)),
+                None,
+                "{page:?}：卡片下方余量不命中"
             );
-            assert_eq!(hit_test(&rects, (r.x as f32, r.y as f32)), Some(r.item));
+            let seam_y = rects[0].y + rects[0].h + 1;
+            assert!(
+                hit_test(&rects, (CARD_W as f32 / 2.0, seam_y as f32)).is_none(),
+                "{page:?}：行缝隙不命中"
+            );
         }
-        assert_eq!(hit_test(&rects, (0.0, 0.0)), None, "边距上的点击穿透到背后");
-        assert_eq!(
-            hit_test(&rects, (4.0, CARD_H as f32 - 4.0)),
-            None,
-            "卡片下方余量不命中"
-        );
-        let seam_y = rects[0].y + rects[0].h + 1;
-        assert!(
-            hit_test(&rects, (CARD_W as f32 / 2.0, seam_y as f32)).is_none(),
-            "行缝隙不命中"
-        );
     }
 
     #[test]
@@ -1265,10 +1550,24 @@ mod tests {
     /// 都要变。
     #[test]
     fn content_sig_is_stable_when_static_and_moves_with_every_visible_input() {
-        let rest = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, Motion::Full);
+        let rest = content_sig(
+            &MenuAnim::Menu,
+            100,
+            "",
+            Lang::Zh,
+            MenuPage::Gacha,
+            Motion::Full,
+        );
         assert_eq!(
             rest,
-            content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, Motion::Full)
+            content_sig(
+                &MenuAnim::Menu,
+                100,
+                "",
+                Lang::Zh,
+                MenuPage::Gacha,
+                Motion::Full
+            )
         );
         assert_eq!(
             rest,
@@ -1277,24 +1576,39 @@ mod tests {
                 100,
                 "",
                 Lang::Zh,
+                MenuPage::Gacha,
                 Motion::Full
             )
         );
         assert_ne!(
             rest,
-            content_sig(&MenuAnim::Menu, 101, "", Lang::Zh, Motion::Full),
+            content_sig(
+                &MenuAnim::Menu,
+                101,
+                "",
+                Lang::Zh,
+                MenuPage::Gacha,
+                Motion::Full
+            ),
             "余额行会变"
         );
         assert_ne!(
             rest,
-            content_sig(&MenuAnim::Menu, 100, "DB LOCKED", Lang::Zh, Motion::Full),
+            content_sig(
+                &MenuAnim::Menu,
+                100,
+                "DB LOCKED",
+                Lang::Zh,
+                MenuPage::Gacha,
+                Motion::Full
+            ),
             "错误行会变"
         );
         // 语言行是**可见**输入：三行的字（抽一次/Pull 1/1回引く/1회 뽑기）全换了 ⇒ 必须换签名。
         for l in Lang::ALL.iter().copied().filter(|l| *l != Lang::Zh) {
             assert_ne!(
                 rest,
-                content_sig(&MenuAnim::Menu, 100, "", l, Motion::Full),
+                content_sig(&MenuAnim::Menu, 100, "", l, MenuPage::Gacha, Motion::Full),
                 "{l:?} 换了字却没换签名 ⇒ 静止判定会漏掉这一次像素变化"
             );
         }
@@ -1304,12 +1618,13 @@ mod tests {
             lines: vec!["X".into()],
         };
         assert_ne!(
-            content_sig(&burst, 100, "", Lang::Zh, Motion::Full),
+            content_sig(&burst, 100, "", Lang::Zh, MenuPage::Gacha, Motion::Full),
             content_sig(
                 &advance(&burst, Motion::Full),
                 100,
                 "",
                 Lang::Zh,
+                MenuPage::Gacha,
                 Motion::Full
             ),
             "扩散期每 tick 都在动 ⇒ 签名必须动"
@@ -1330,12 +1645,12 @@ mod tests {
             for &r in Rarity::ALL.iter() {
                 let spec = anim_spec(r, motion);
                 let mut anim = after_pull(r, lines(), motion);
-                let mut seen = content_sig(&anim, 100, "", Lang::Zh, motion);
+                let mut seen = content_sig(&anim, 100, "", Lang::Zh, MenuPage::Gacha, motion);
                 let mut commits = 1;
                 // 走到回静止为止，多给 400 tick 余量（dwell 最长 180）。
                 for _ in 0..(spec.burst_ticks + spec.dwell_ticks + 400) {
                     anim = advance(&anim, motion);
-                    let now = content_sig(&anim, 100, "", Lang::Zh, motion);
+                    let now = content_sig(&anim, 100, "", Lang::Zh, MenuPage::Gacha, motion);
                     if now != seen {
                         commits += 1;
                         seen = now;
@@ -1362,100 +1677,122 @@ mod tests {
                     lines: lines(),
                 };
                 assert_eq!(
-                    content_sig(&dwell, 100, "", Lang::Zh, motion),
-                    content_sig(&late, 100, "", Lang::Zh, motion),
+                    content_sig(&dwell, 100, "", Lang::Zh, MenuPage::Gacha, motion),
+                    content_sig(&late, 100, "", Lang::Zh, MenuPage::Gacha, motion),
                     "{r:?}/{motion:?}：停留期像素没变而签名变了 ⇒ 又会每 tick 重投"
                 );
             }
         }
     }
 
-    /// 门禁：**开箱那段时间四个命中矩形一个都不许可被点**（2026-10-28 真机报的第五条缺陷）。
+    /// 门禁：**卡片挡着的那段时间，命中表里五格一个都不许可被点**（2026-10-28 真机报的第五条缺陷）。
     ///
     /// 走**真实 reducer**（`after_pull` + `advance`）遍历 `Motion::ALL × Rarity::ALL`，逐 tick 判。
     /// 每条断言都带一份 `hit_test` 的对照，因为这条缺陷的形状正是"**几何上点得到，而那一屏
     /// 没画那个东西**"：只断言 `press` 返回 None 的话，未来把 `press` 写成"永远 None"也能绿。
+    ///
+    /// ⚠️ 分页把命中表从四张加到五张（多了标题条）而这里**一道把关都不用新加** —— 把关在
+    /// [`press`] 这个唯一入口里，不在分派侧。逐页跑的理由：每一页是另一张表，"这一页的五格
+    /// 全被挡住"是逐页的性质；新加的第 5 格（标题）也一起判，否则"卡片挂着时能翻页"这个
+    /// 形状会漏掉 —— 那等于在动画期把页翻走、回到菜单发现行带换了一屏。
     #[test]
     fn the_card_phase_opens_no_row_to_the_pointer() {
-        let rects = rects();
-        // 几何前提：命中表的四个矩形**整个在卡片里** ⇒ 卡片重画这一屏时它们全被盖住。
-        // 前提没了（比如将来卡片只画半屏）这条门禁就失去意义，所以要当场量着。
-        for r in &rects {
-            assert!(
-                r.x >= 0 && r.y >= 0 && r.x + r.w <= CARD_W && r.y + r.h <= CARD_H,
-                "{r:?} 越出卡片 ⇒ 它不是被卡片盖住，而是压根不在卡里"
+        for page in MenuPage::ALL {
+            let rects = rects(page);
+            // 几何前提：命中表的矩形**整个在卡片里** ⇒ 卡片重画这一屏时它们全被盖住。
+            // 前提没了（比如将来卡片只画半屏）这条门禁就失去意义，所以要当场量着。
+            for r in &rects {
+                assert!(
+                    r.x >= 0 && r.y >= 0 && r.x + r.w <= CARD_W && r.y + r.h <= CARD_H,
+                    "{page:?} {r:?} 越出卡片 ⇒ 它不是被卡片盖住，而是压根不在卡里"
+                );
+            }
+            // 逐矩形取中心：前三个是这一页的行项，第四个是语言行，第五个是标题条。
+            let centers = rects
+                .iter()
+                .map(|r| ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                centers.len(),
+                5,
+                "{page:?}：命中表必须是三行 + 语言行 + 标题条"
             );
-        }
-        // 逐矩形取中心：前三个是行项，第四个是语言行。
-        let centers = rects
-            .iter()
-            .map(|r| ((r.x + r.w / 2) as f32, (r.y + r.h / 2) as f32))
-            .collect::<Vec<_>>();
 
-        let lines = || vec!["余额 120".to_string()];
-        for &motion in &Motion::ALL {
-            for &r in Rarity::ALL.iter() {
-                let spec = anim_spec(r, motion);
-                let mut anim = after_pull(r, lines(), motion);
-                let mut busy_ticks = 0;
-                let mut reveal_ticks = 0;
-                for _ in 0..(spec.burst_ticks + spec.dwell_ticks + 400) {
-                    // 对照：**静态命中表在任何相位都答得出每一项** —— 只断言 `press` 返回
-                    // None 的话，未来把 `press` 写成"永远 None"也能绿，而这一条把它钉死成
-                    // "几何上点得到、相位上不该点"，正是原缺陷的形状。
-                    for (item, at) in MenuItem::CLICKABLE.iter().zip(&centers) {
+            let lines = || vec!["余额 120".to_string()];
+            for &motion in &Motion::ALL {
+                for &r in Rarity::ALL.iter() {
+                    let spec = anim_spec(r, motion);
+                    let mut anim = after_pull(r, lines(), motion);
+                    let mut busy_ticks = 0;
+                    let mut reveal_ticks = 0;
+                    for _ in 0..(spec.burst_ticks + spec.dwell_ticks + 400) {
+                        // 对照：**静态命中表在任何相位都答得出每一项** —— 只断言 `press` 返回
+                        // None 的话，未来把 `press` 写成"永远 None"也能绿，而这一条把它钉死成
+                        // "几何上点得到、相位上不该点"，正是原缺陷的形状。
+                        for (item, at) in page.rows().iter().zip(&centers[..3]) {
+                            assert_eq!(
+                                hit_test(&rects, *at),
+                                Some(*item),
+                                "{page:?} {r:?}/{motion:?}：静态命中表答不出 {item:?} ⇒ 对照失效，测不出东西"
+                            );
+                        }
                         assert_eq!(
-                            hit_test(&rects, *at),
+                            hit_test(&rects, centers[3]),
+                            Some(MenuItem::Lang),
+                            "{page:?} {r:?}/{motion:?}：静态命中表答不出语言行 ⇒ 对照失效"
+                        );
+                        assert_eq!(
+                            hit_test(&rects, centers[4]),
+                            Some(MenuItem::Page),
+                            "{page:?} {r:?}/{motion:?}：静态命中表答不出标题条 ⇒ 对照失效"
+                        );
+                        if anim.is_busy() {
+                            busy_ticks += 1;
+                            if matches!(anim, MenuAnim::Reveal { .. }) {
+                                reveal_ticks += 1;
+                            }
+                            for (n, at) in centers.iter().enumerate() {
+                                assert_eq!(
+                                    press(&rects, *at, &anim),
+                                    None,
+                                    "{page:?} {r:?}/{motion:?}：第 {n} 格在卡片还挡着时应答了 ⇒ 看着结果卡又抽掉一次"
+                                );
+                            }
+                        }
+                        anim = advance(&anim, motion);
+                        if anim == MenuAnim::Menu {
+                            break;
+                        }
+                    }
+                    // 回到静止 ⇒ 同一批坐标必须又点得着（否则这条门禁就退化成"永不命中"）。
+                    assert!(!anim.is_busy(), "{page:?} {r:?}/{motion:?}：没走回静止");
+                    for (item, at) in page.rows().iter().zip(&centers[..3]) {
+                        assert_eq!(
+                            press(&rects, *at, &anim),
                             Some(*item),
-                            "{r:?}/{motion:?}：静态命中表答不出 {item:?} ⇒ 对照失效，测不出东西"
+                            "{page:?} {r:?}/{motion:?}：静止后 {item:?} 点不着了"
                         );
                     }
                     assert_eq!(
-                        hit_test(&rects, centers[3]),
+                        press(&rects, centers[3], &anim),
                         Some(MenuItem::Lang),
-                        "{r:?}/{motion:?}：静态命中表答不出语言行 ⇒ 对照失效"
+                        "{page:?} {r:?}/{motion:?}：静止后语言行点不着了"
                     );
-                    if anim.is_busy() {
-                        busy_ticks += 1;
-                        if matches!(anim, MenuAnim::Reveal { .. }) {
-                            reveal_ticks += 1;
-                        }
-                        for (n, at) in centers.iter().enumerate() {
-                            assert_eq!(
-                                press(&rects, *at, &anim),
-                                None,
-                                "{r:?}/{motion:?}：第 {n} 格在卡片还挡着时应答了 ⇒ 看着结果卡又抽掉一次"
-                            );
-                        }
-                    }
-                    anim = advance(&anim, motion);
-                    if anim == MenuAnim::Menu {
-                        break;
-                    }
-                }
-                // 回到静止 ⇒ 同一批坐标必须又点得着（否则这条门禁就退化成"永不命中"）。
-                assert!(!anim.is_busy(), "{r:?}/{motion:?}：没走回静止");
-                for (item, at) in MenuItem::CLICKABLE.iter().zip(&centers) {
                     assert_eq!(
-                        press(&rects, *at, &anim),
-                        Some(*item),
-                        "{r:?}/{motion:?}：静止后 {item:?} 点不着了"
+                        press(&rects, centers[4], &anim),
+                        Some(MenuItem::Page),
+                        "{page:?} {r:?}/{motion:?}：静止后标题条点不着了 ⇒ 分页成了假功能"
+                    );
+                    // `--motion off` 根本不进 Burst，但它仍然有 Reveal ⇒ busy 不为 0。
+                    assert!(
+                        busy_ticks > 0,
+                        "{page:?} {r:?}/{motion:?}：一趟都没量到 busy ⇒ 这条门禁在这一档是白跑的"
+                    );
+                    assert!(
+                        reveal_ticks > 0,
+                        "{page:?} {r:?}/{motion:?}：没有一 tick 停在结果卡上 ⇒ 用户报的那一幕根本没被走过"
                     );
                 }
-                assert_eq!(
-                    press(&rects, centers[3], &anim),
-                    Some(MenuItem::Lang),
-                    "{r:?}/{motion:?}：静止后语言行点不着了"
-                );
-                // `--motion off` 根本不进 Burst，但它仍然有 Reveal ⇒ busy 不为 0。
-                assert!(
-                    busy_ticks > 0,
-                    "{r:?}/{motion:?}：一趟都没量到 busy ⇒ 这条门禁在这一档是白跑的"
-                );
-                assert!(
-                    reveal_ticks > 0,
-                    "{r:?}/{motion:?}：没有一 tick 停在结果卡上 ⇒ 用户报的那一幕根本没被走过"
-                );
             }
         }
     }
@@ -1476,13 +1813,13 @@ mod tests {
             lines: lines(),
         };
         assert_ne!(
-            content_sig(&flash, 100, "", Lang::Zh, Motion::Full),
-            content_sig(&after, 100, "", Lang::Zh, Motion::Full),
+            content_sig(&flash, 100, "", Lang::Zh, MenuPage::Gacha, Motion::Full),
+            content_sig(&after, 100, "", Lang::Zh, MenuPage::Gacha, Motion::Full),
             "白闪与结果卡是两套像素，签名必须分得开"
         );
         // 同一帧内部（elapsed 0 与 1 都还在闪）⇒ 仍然不许变。
         assert_eq!(
-            content_sig(&flash, 100, "", Lang::Zh, Motion::Full),
+            content_sig(&flash, 100, "", Lang::Zh, MenuPage::Gacha, Motion::Full),
             content_sig(
                 &MenuAnim::Reveal {
                     best: Rarity::SSR,
@@ -1492,6 +1829,7 @@ mod tests {
                 100,
                 "",
                 Lang::Zh,
+                MenuPage::Gacha,
                 Motion::Full
             ),
             "闪的两 tick 是同一张白卡 ⇒ 只该投一帧"
@@ -1499,8 +1837,8 @@ mod tests {
         // reduce/off 不闪 ⇒ 第一帧就是结果卡，签名应与"闪完"那帧相同。
         for &m in &[Motion::Reduce, Motion::Off] {
             assert_eq!(
-                content_sig(&flash, 100, "", Lang::Zh, m),
-                content_sig(&after, 100, "", Lang::Zh, m),
+                content_sig(&flash, 100, "", Lang::Zh, MenuPage::Gacha, m),
+                content_sig(&after, 100, "", Lang::Zh, MenuPage::Gacha, m),
                 "{m:?} 档没有白闪，两帧应当同签名"
             );
         }
@@ -1511,20 +1849,96 @@ mod tests {
     /// 这对实测数字在 `lang` 进签名之后仍然成立。
     #[test]
     fn switching_lang_bumps_sig_once_then_is_stable() {
-        let mut prev = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, Motion::Full);
+        let mut prev = content_sig(
+            &MenuAnim::Menu,
+            100,
+            "",
+            Lang::Zh,
+            MenuPage::Gacha,
+            Motion::Full,
+        );
         let mut bumps = 0;
         for l in [Lang::En, Lang::Ja, Lang::Ko, Lang::Zh] {
-            let now = content_sig(&MenuAnim::Menu, 100, "", l, Motion::Full);
+            let now = content_sig(&MenuAnim::Menu, 100, "", l, MenuPage::Gacha, Motion::Full);
             if now != prev {
                 bumps += 1;
             }
             // 同一个语言再算十次都不许变（⇒ draw 层那十次一个 buffer 都不投）。
             for _ in 0..10 {
-                assert_eq!(now, content_sig(&MenuAnim::Menu, 100, "", l, Motion::Full));
+                assert_eq!(
+                    now,
+                    content_sig(&MenuAnim::Menu, 100, "", l, MenuPage::Gacha, Motion::Full)
+                );
             }
             prev = now;
         }
         assert_eq!(bumps, 4, "转一圈 = 四次内容变化，不多不少");
+    }
+
+    /// 翻页要**恰好**换签名，而"开着菜单不动"一次都不许多换。
+    ///
+    /// 这条是 `69fd158` 那条方法论换到分页上的两面，缺一个都对应一种真会发生的错法：
+    /// ① 页**必须**进签名 ⇒ 否则"点了翻页、命中表换了、卡片还画旧页"（与第五条缺陷同族的
+    ///    **镜像**形状：一边是"没画的东西应答点击"，一边是"该画的东西不肯提交"）。
+    /// ② 页**不许**让静止菜单每 tick 重投 ⇒ 门面上唯一有预算约束的那一档就是"静止 = 1 提交"。
+    /// 配套两件（单靠签名这条不够）：`card::Ctx` 里那个 `page` 字段在编译期就要求画师读它，
+    /// card.rs 的 `menu_phase_inks_the_header_and_every_row` 逐张比标题带像素。
+    #[test]
+    fn a_page_switch_bumps_the_signature_exactly_once_and_a_dwell_never_does() {
+        // ① 三页两两互不相等（同页两次必须相等 ⇒ 签名是纯函数）。
+        for a in MenuPage::ALL {
+            for b in MenuPage::ALL {
+                let sa = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, a, Motion::Full);
+                let sb = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, b, Motion::Full);
+                if a == b {
+                    assert_eq!(sa, sb, "{a:?}：同一页两次算出两个签名 ⇒ 签名不是纯函数");
+                } else {
+                    assert_ne!(sa, sb, "{a:?} → {b:?} 没换签名 ⇒ 点了翻页卡片还印旧页");
+                }
+            }
+        }
+        // 转一圈（Action → Misc → 回卷 Gacha）= 三次变化，不多不少（与 lang 那条同形）。
+        let mut prev = content_sig(
+            &MenuAnim::Menu,
+            100,
+            "",
+            Lang::Zh,
+            MenuPage::Gacha,
+            Motion::Full,
+        );
+        let mut bumps = 0;
+        for p in [MenuPage::Action, MenuPage::Misc, MenuPage::Gacha] {
+            let now = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, p, Motion::Full);
+            if now != prev {
+                bumps += 1;
+            }
+            prev = now;
+        }
+        assert_eq!(bumps, 3, "转一圈三页 = 三次内容变化，不多不少");
+
+        // ② 停在 `Menu` 相放 300 tick：签名一个 bit 都不许动。
+        for p in MenuPage::ALL {
+            let mut anim = MenuAnim::Menu;
+            let mut seen = content_sig(&anim, 1_200, "", Lang::Zh, p, Motion::Full);
+            let mut commits = 0;
+            for _ in 0..300 {
+                anim = advance(&anim, Motion::Full);
+                let now = content_sig(&anim, 1_200, "", Lang::Zh, p, Motion::Full);
+                if now != seen {
+                    commits += 1;
+                    seen = now;
+                }
+            }
+            assert_eq!(
+                anim,
+                MenuAnim::Menu,
+                "{p:?}：`Menu` 相自己走掉了 ⇒ 静止档不在这里"
+            );
+            assert_eq!(
+                commits, 0,
+                "{p:?}：静止菜单放着 300 tick 换了 {commits} 次签名 ⇒ 每 tick 重投同一帧"
+            );
+        }
     }
 
     #[test]
@@ -1766,38 +2180,44 @@ mod tests {
     ///
     /// ⚠️ 只量中文会绿得毫无意义：`Pull 10` / `閉じる` / `10회 뽑기` 都比「十连」宽（§7-R13），
     /// 而 1.5× 那档汉字取整成 17 px（不是 1 em ⇒ 逐 char 的进位不可推算）。
+    ///
+    /// 分页把可点行从三条变成**九条**（走路/跑步/跳跃/爬墙/暂停/退出都在其中）⇒ 这里必须
+    /// 逐页量。这一条同时是"新字都在子集里"的现场证据：`text::missing` 在 {lang} 那一档
+    /// 报的就是"该重跑子集"，不是"该改测试"。
     #[test]
     fn menu_row_labels_fit_the_accent_indent() {
         for &lang in &Lang::ALL {
-            for row in layout() {
-                let label = row.item.label(lang);
-                let t = label_rect(row.as_rect());
-                assert!(
-                    crate::text::missing(&label).is_none(),
-                    "{lang:?} 的菜单项 {:?}「{label}」有字不在子集里：{:?} ⇒ 该重跑子集，别改测试",
-                    row.item,
-                    crate::text::missing(&label)
-                );
-                assert!(
-                    line_bound_log(&label) <= t.w,
-                    "{lang:?} 「{label}」逻辑上界 {} > 让出强调条后的 {} 逻辑 px ⇒ \
-                     这行会带上 `…`（菜单项永远不该被截：项名就是可点性的全部说明）",
-                    line_bound_log(&label),
-                    t.w
-                );
-                for &scale in &[1.0f32, 1.25, 1.5, 2.0] {
-                    let budget = budget_for(t.w, scale);
+            for page in MenuPage::ALL {
+                for row in layout(page) {
+                    let label = row.item.label(lang);
+                    let t = label_rect(row.as_rect());
                     assert!(
-                        line_width(&label, scale) <= budget,
-                        "{lang:?} @{scale}×「{label}」实宽 {} > 预算 {budget} ⇒ 顶穿行底右边",
-                        line_width(&label, scale),
+                        crate::text::missing(&label).is_none(),
+                        "{lang:?} 的菜单项 {:?}「{label}」有字不在子集里：{:?} ⇒ 该重跑子集，别改测试",
+                        row.item,
+                        crate::text::missing(&label)
                     );
-                    assert_eq!(
-                        fit_to(&label, budget, scale),
-                        label,
-                        "{lang:?} @{scale}× 菜单项 {:?} 被截了 ⇒ 行底几何或字号漂了",
-                        row.item
+                    assert!(
+                        line_bound_log(&label) <= t.w,
+                        "{lang:?} 「{label}」逻辑上界 {} > 让出强调条后的 {} 逻辑 px ⇒ \
+                     这行会带上 `…`（菜单项永远不该被截：项名就是可点性的全部说明）",
+                        line_bound_log(&label),
+                        t.w
                     );
+                    for &scale in &[1.0f32, 1.25, 1.5, 2.0] {
+                        let budget = budget_for(t.w, scale);
+                        assert!(
+                            line_width(&label, scale) <= budget,
+                            "{lang:?} @{scale}×「{label}」实宽 {} > 预算 {budget} ⇒ 顶穿行底右边",
+                            line_width(&label, scale),
+                        );
+                        assert_eq!(
+                            fit_to(&label, budget, scale),
+                            label,
+                            "{lang:?} @{scale}× {page:?} 菜单项 {:?} 被截了 ⇒ 行底几何或字号漂了",
+                            row.item
+                        );
+                    }
                 }
             }
         }

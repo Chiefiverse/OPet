@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use petcore::assets::Manifest;
-use petcore::behavior::config::BehaviorConfig;
+use petcore::behavior::config::{Action, BehaviorConfig};
 use petcore::behavior::machine::Command;
 use petcore::gacha::{Catalog, Currency, GachaParams, Rarity};
 use petcore::geom::{Rect, Vec2};
@@ -942,8 +942,14 @@ struct MenuState {
     /// 宠物 scale 的镜像（开菜单时取一次，之后每 tick 同步）
     scale_num: u32,
     logical: (i32, i32),
-    /// 布局表只算一次：`hit_test` 与 draw 共用同一份矩形
+    /// 当前页的布局表：`hit_test` 与 draw 共用同一份矩形。**"只算一次"现在是"每翻一页算一次"**
+    /// —— 分页把这里变成了一件有状态的东西：`items` 必须与 `page` 同步，否则命中表是这一页、
+    /// 画出来是那一页（这正是 `69fd158` 那条"签名与下游读的字段不配对"的第三种形状）。
+    /// 唯一改 `page` 的地方是 `on_menu_press` 的 `Page` 臂，它同时重建 `items`。
     items: Vec<ItemRect>,
+    /// 现在显示哪一页。**必须进 `content_sig` 且必须被 `card::Ctx` 读到**（两件事缺一半都不行，
+    /// 理由逐条见 `menu::content_sig` 与 `card::Ctx::page` 上那两段注释）。
+    page: menu::MenuPage,
     anim: MenuAnim,
     /// 余额行。**只在事件上刷新**（开菜单时、每次抽取后），不每 tick 查库：
     /// §4 的省电契约明写"事件驱动，禁止定时轮询"，而 60 Hz 一条 `SELECT` 正是轮询。
@@ -1046,7 +1052,14 @@ impl MenuState {
         if !self.configured || self.frame_pending {
             return false;
         }
-        let sig = menu::content_sig(&self.anim, self.balance, error, self.lang, self.motion);
+        let sig = menu::content_sig(
+            &self.anim,
+            self.balance,
+            error,
+            self.lang,
+            self.page,
+            self.motion,
+        );
         if self.last_sig == Some(sig) && !self.force_draw {
             return false;
         }
@@ -1054,6 +1067,7 @@ impl MenuState {
         let balance = self.balance;
         let motion = self.motion;
         let lang = self.lang;
+        let page = self.page;
         let bw = self.to_phys(self.logical.0 as f32).max(1);
         let bh = self.to_phys(self.logical.1 as f32).max(1);
         let stride = bw * 4;
@@ -1084,6 +1098,7 @@ impl MenuState {
                 scale,
                 motion,
                 lang,
+                page,
             },
         );
         // 句柄克隆（不是对象克隆）：下面的 `self.arm()` 要可变借 self，不能同时留引用
@@ -1204,6 +1219,9 @@ impl App {
                 return;
             }
         };
+        // 右键就想要抽卡 ⇒ 菜单**固定从盲盒页起**，不记住上一次翻到哪。真记住的话就成了
+        // 一个运行中状态，而它既不进签名也不进任何持久化 = 一个没人负责的漂移源。
+        let page = menu::MenuPage::Gacha;
         self.menu = Some(MenuState {
             layer,
             surface,
@@ -1211,7 +1229,8 @@ impl App {
             pool,
             scale_num,
             logical,
-            items: menu::rects(),
+            items: menu::rects(page),
+            page,
             anim: MenuAnim::Menu,
             balance,
             dry_run,
@@ -1265,6 +1284,10 @@ impl App {
     /// 与语言行**一个都没画出来**，而静态命中表照样答得出 ⇒ 曾经出现"点结果卡的位置就执行
     /// 那一行的功能"（用户 2026-10-28 报）。把关放在命中侧而不是各 `match` 分支里，是为了
     /// **以后新增菜单项不会忘记问相位**（门禁 = `the_card_phase_opens_no_row_to_the_pointer`）。
+    ///
+    /// ⚠️ 这一条注释在分页之前是**已经写了但只执行了四分之一**的规矩（当时只有 `Lang` 那一路
+    /// 问了 `is_busy`）。分页把命中表加到 5 张（多了标题条）而这个函数**一行把关都不用加** ——
+    /// 这就是"放在命中侧"买到的东西。
     fn on_menu_press(&mut self, at: (f32, f32)) {
         let Some(item) = self
             .menu
@@ -1281,6 +1304,63 @@ impl App {
             // 生成那一刻的语言**（§7-R10：这不是 bug，是"当前显示的卡永远与生成它时的语言一致"），
             // 所以"切完语言卡片跟着换字"只在下一张卡上成立。
             menu::MenuItem::Lang => self.cycle_lang(),
+            menu::MenuItem::Page => self.cycle_page(),
+            menu::MenuItem::Quit => self.quit_pet(),
+            menu::MenuItem::Walk => self.send_action(Action::Walk),
+            menu::MenuItem::Run => self.send_action(Action::Run),
+            menu::MenuItem::Jump => self.send_action(Action::Jump),
+            menu::MenuItem::Climb => self.send_action(Action::Climb),
+            menu::MenuItem::Pause => self.send_action(Action::Sleep),
+        }
+    }
+
+    /// 点标题条：翻到下一页，并**当场重建命中表**。
+    ///
+    /// `items` 与 `page` 必须一起改：`items` 是点击的唯一依据而 `page` 是绘制的唯一依据，
+    /// 分开改就会出现"点的是这一页的行、画的是那一页的字"。这里不加 `force_draw` ——
+    /// **页进 `menu::content_sig`**（`69fd158` 那条教训的正用：把会变的东西交给闸门去认，
+    /// 而不是靠调用方在每个改它的地方补一句"记得重画"）。`force_draw` 的合法领地只有签名
+    /// 看不见的那些像素（scale 镜像、看门狗、configure）。
+    fn cycle_page(&mut self) {
+        let Some(m) = self.menu.as_mut() else {
+            return;
+        };
+        let next = m.page.next();
+        m.page = next;
+        m.items = menu::rects(next);
+    }
+
+    /// 点"退出"：**这是 `exit` 的第二个写入点**（第一个是 `--seconds` 到点）。
+    ///
+    /// 两步的顺序是有意的：先 `close_menu()`（`teardown()` 已按 region → viewport → layer →
+    /// surface 的次序收回，菜单不会活得比决定久），再置 `exit`。下一个 `on_tick` 读到它就
+    /// `signal.stop()`，而 `report()` 在事件循环**之后** ⇒ **退出摘要照打**（`菜单: N 提交`、
+    /// 五档核对行、VmHWM/CPU 一条不少）。抽取在点击那一刻就同步落库 ⇒ 不需要额外拆库。
+    ///
+    /// **不做确认步骤**：这块 surface 没有对话框、也没有 click-outside（D14），"确认"会变成
+    /// 又一个页状态 + 又一批假按钮风险；而"退出"放在最后一页最后一行，误触至少要两次点击
+    /// （翻页 + 点行），而翻页点错是免费的（三页循环）。误触退出的代价 = 重启一次，零数据损失。
+    fn quit_pet(&mut self) {
+        self.close_menu();
+        self.exit = true;
+        eprintln!("ui: 菜单请求退出 ⇒ 收尾并打退出摘要");
+    }
+
+    /// 动作页四行 + 暂停那一行 ⇒ 一条 `Command::Go`，**不在客户端预判内核会不会响应**。
+    ///
+    /// 为什么不预过滤（为什么不灰掉"现在点没用"的行）：那要求每次绘制都读 `sim.state`/`world`
+    /// ⇒ **内核几何变成绘图的输入** ⇒ "落地了吗？""这动作开着吗？"每个判据都要变成签名的一个
+    /// 字段，而"灰掉的行"正是本项目禁止的假按钮形状反过来 —— 画一个客户端读不到的、而且
+    /// 在绘制与点击之间内核自己就能改掉的状态。内核本来就把这些全吸收了：下坠中 `Go(Walk)`
+    /// 被 `handle_go` 丢掉；睡着时任何别的动作先 `goto(Idle, Wakeup)`（⇒ **"点动作页任意一行
+    /// = 唤醒它"是内核既有语义，不是权宜**）；睡着再点"暂停"无副作用。这和 CLI 的形状一致
+    /// （CLI 是盲发的），也是 §3.3"指令目标不预剪枝"那条原则换到 UI 面。
+    ///
+    /// 连带后果，**明写而不是藏起来**：宠物正在下坠时点"走路"就是什么都不发生。真机门禁里
+    /// 有这一条，要用户判它可不可接受（计划 §验证 第 3 条）。
+    fn send_action(&mut self, action: Action) {
+        if let Some(sim) = self.sim.as_mut() {
+            sim.send(Command::Go(action));
         }
     }
 

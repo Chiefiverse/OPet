@@ -819,7 +819,7 @@ mod tests {
             Key, header_shards, lang_row, line_balance, line_error, line_item, line_more,
             line_pulled, line_shards, line_tiers,
         };
-        use crate::menu::{CARD_W, PAD};
+        use crate::menu::{CARD_W, MenuPage, PAD};
         use petcore::gacha::Rarity;
 
         let budget_logical = CARD_W - 2 * PAD;
@@ -838,7 +838,7 @@ mod tests {
             report.push(format!("  @{px:>2} px（预算 {budget} px）："));
             let mut worst = (0i32, String::new(), Lang::Zh);
             for &l in &Lang::ALL {
-                let solo: Vec<String> = vec![
+                let mut solo: Vec<String> = vec![
                     l.t(Key::Pull1).into(),
                     l.t(Key::Pull10).into(),
                     l.t(Key::Close).into(),
@@ -853,11 +853,30 @@ mod tests {
                     // 错误行的正文会被 `fit` 截（同一行还有语言行），前缀必须自己站得住。
                     line_error(l, ""),
                 ];
+                // 分页后三页各有三行 + 一个页名标题 ⇒ 逐页逐行都单独量一次。
+                // （页码 ` n/N` 全 ASCII，宽度上只是三个字符的成本，不用单列。）
+                for page in MenuPage::ALL {
+                    solo.push(page.header_text(l));
+                    solo.extend(page.rows().iter().map(|&it| it.label(l)));
+                }
                 // 同一行挤两段的最坏情况：标题行 = 标题 + `碎片 余额 演示`，底行 = 碎片 + 余额。
                 // 中间只留一个空格的缝 —— 这是**下界**，真排版留得比它宽，所以这条只会更严。
                 let joined: Vec<String> = vec![
-                    format!("{} {}", l.t(Key::Title), header_shards(l, 9_999_999, true)),
-                    format!("{} {}", l.t(Key::Title), header_shards(l, 9_999_999, false)),
+                    format!(
+                        "{} {}",
+                        MenuPage::Gacha.header_text(l),
+                        header_shards(l, 9_999_999, true)
+                    ),
+                    format!(
+                        "{} {}",
+                        MenuPage::Action.header_text(l),
+                        header_shards(l, 9_999_999, false)
+                    ),
+                    format!(
+                        "{} {}",
+                        MenuPage::Misc.header_text(l),
+                        header_shards(l, 9_999_999, true)
+                    ),
                     format!("{} {}", line_shards(l, 999_999), line_balance(l, 9_999_999)),
                 ];
                 let mut local = (0i32, String::new());

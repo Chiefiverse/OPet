@@ -18,7 +18,9 @@ use petcore::gacha::Rarity;
 
 use crate::font;
 use crate::l10n::{self, Key, Lang};
-use crate::menu::{self, CARD_H, CARD_W, CORNER, FOOTER_GAP, MenuAnim, PAD, RectI, TEXT_PX};
+use crate::menu::{
+    self, CARD_H, CARD_W, CORNER, FOOTER_GAP, MenuAnim, MenuPage, PAD, RectI, TEXT_PX,
+};
 use crate::settings::Motion;
 use crate::text;
 
@@ -470,6 +472,14 @@ pub struct Ctx<'a> {
     /// 否则换了字的同一帧会被判成"内容没变"而停在旧 buffer 上（省电闸门反过来把改动挡了）。
     /// 结果卡上的字不受它影响：那些串在抽取那一刻就烤好了（§7-R10）。
     pub lang: Lang,
+    /// 当前页。**运行中用户可改**（点标题条翻页）⇒ 与 `lang` 同族，**必须**进
+    /// `menu::content_sig`，而且**必须被下游读到**：这里读两次 —— `menu::layout(ctx.page)`
+    /// 决定画哪三行的像素，`header_text(ctx.page)` 决定标题那一格的像素。
+    ///
+    /// ⚠️ 这条字段的存在理由就是 `69fd158` 那句"凡内容变了才提交这类闸门，必须问这个字段
+    /// 被下游读过了吗"。**页不进签名 = 点了翻页、命中表换了、卡片还画旧页** —— 那是那条
+    /// 缺陷的镜像形状（一个是"签名变了而画面不读"，这个是"画面读了而签名不变"）。
+    pub page: MenuPage,
 }
 
 /// 画一帧卡片。`bw`/`bh` 是物理宽高，`stride` 是每行字节数（= bw×4）。
@@ -532,7 +542,13 @@ pub fn paint(canvas: &mut [u8], bw: i32, bh: i32, stride: usize, anim: &MenuAnim
     clip_to_plate(canvas, bw, bh, stride, corner);
 }
 
-/// 菜单态：标题行（左＝本语言的"盲盒"，右＝碎片 + 演示标）、三行按钮、底部语言行。
+/// 菜单态：**标题行（左＝当前页的页名 + 页码，右＝碎片 + 演示标）**、当前页的三行按钮、
+/// 底部语言行。
+///
+/// 标题行左端画的不再是常量：`ctx.page` 决定"盲盒 1/3 / 动作 2/3 / 其它 3/3"里的哪一个
+/// （[`MenuPage::header_text`]）。**页码是这一版里"标题条是个控件"的唯一视觉线索** ——
+/// 这块 surface 不吃键盘、也没有 hover（D14），不印页码就没有任何东西告诉用户"这里点下去
+/// 会翻页"。这就是 §9.2 第 14 条那一族（"没有可点线索"）在分页上的形状。
 ///
 /// 标题行右端的徽标（演示）来自 [`l10n::header_shards`]：渲染层一个字面量都不写，否则就
 /// 绕过了"会渲染的 ⊆ 清单 ⊆ 真 cmap"那三条字体门禁（§4.2）。徽标放标题行而不是单独一行，
@@ -540,30 +556,30 @@ pub fn paint(canvas: &mut [u8], bw: i32, bh: i32, stride: usize, anim: &MenuAnim
 ///
 /// 三行的版式（§4.5）= 圆角行底 `ROW` + 左端 3 px 强调条 + 让出强调条之后的标签。行底/强调条/
 /// 文字矩形全部从 [`menu`] 的几何函数取，**这里不重算**：`hit_test` 按整行命中，而 draw 按
-/// `label_rect` 画字，两套各算一份就会出现"字的位置和点的位置差一格"。
+/// `label_rect` 画字，两套各算一份就会出现"字的位置和点的位置差一格"。**分页之后这条更要紧**：
+/// 行带几何唯一的来源是 `menu::layout(ctx.page)`，画哪三行与点哪三行必须是同一个函数的输出。
 fn paint_menu(canvas: &mut [u8], stride: usize, ctx: Ctx) {
     let scale = ctx.scale;
-    let head = RectI::new(PAD, PAD, CARD_W - 2 * PAD, menu::HEAD_H);
+    let head = menu::header().as_rect();
     // 标题在左、余额在右：两头都贴同一张矩形的边，中间的空隙随内容自然变。
+    let right = l10n::header_shards(ctx.lang, ctx.balance, ctx.dry_run);
     draw_in(
         canvas,
         stride,
         head,
         scale,
         if ctx.dry_run { WARN } else { FG_DIM },
-        &l10n::header_shards(ctx.lang, ctx.balance, ctx.dry_run),
+        &right,
         Align::Right,
     );
-    draw_in(
-        canvas,
-        stride,
-        head,
-        scale,
-        FG,
-        ctx.lang.t(Key::Title),
-        Align::Left,
-    );
-    for r in menu::layout() {
+    // 左段也过 `fit_to`（同 `paint_footer` 的右段）：`every_locale_fits_the_card` 量的是
+    // **当前**文案，而页名以后要跟着 §9.2 的设置页一起加 ⇒ 让出右段宽度截一次，结构上就
+    // 不可能顶穿出界。页名被截是可读的（`盲盒 1/…`），标题压到碎片行上才是读不出。
+    let budget =
+        (menu::line_budget_px(scale) - line_w(&right, scale) - px(FOOTER_GAP, scale)).max(0);
+    let title = menu::fit_to(&ctx.page.header_text(ctx.lang), budget, scale);
+    draw_in(canvas, stride, head, scale, FG, &title, Align::Left);
+    for r in menu::layout(ctx.page) {
         let row = r.as_rect();
         row_plate(canvas, stride, row, scale);
         row_accent(canvas, stride, row, scale);
@@ -787,14 +803,9 @@ mod tests {
             motion: Motion,
             lang: Lang,
         ) -> Self {
-            let (bw, bh) = (px(CARD_W, scale).max(1), px(CARD_H, scale).max(1));
-            let stride = (bw * 4) as usize;
-            let mut canvas = vec![0u8; stride * bh as usize];
-            paint(
-                &mut canvas,
-                bw,
-                bh,
-                stride,
+            // 默认页 = 盲盒页：分页之前的全部像素断言画的都是那一页（右键落点也是它），
+            // 所以"这一轮没改掉已签收的观感"这条判据继续从这里取。要看别的页走 [`Shot::on_page`]。
+            Self::on_page(
                 anim,
                 Ctx {
                     balance,
@@ -803,8 +814,22 @@ mod tests {
                     scale,
                     motion,
                     lang,
+                    page: MenuPage::Gacha,
                 },
-            );
+            )
+        }
+
+        /// 逐**页**出图：`ctx.page` 决定画哪三行与标题那一格印哪个页名，所以分页那几条断言
+        /// 必须从这里取，而不是复用默认档的 helper（那等于"换了页而测试还在画同一页"）。
+        ///
+        /// 收 `Ctx` 而不是八个位置参数：`Ctx` 本来就是"这一帧要画的一切"，把它拆成参数表
+        /// 会踩 clippy 的 `too_many_arguments`（同一个理由见 `Ctx` 那处注释）。
+        fn on_page(anim: &MenuAnim, ctx: Ctx) -> Self {
+            let scale = ctx.scale;
+            let (bw, bh) = (px(CARD_W, scale).max(1), px(CARD_H, scale).max(1));
+            let stride = (bw * 4) as usize;
+            let mut canvas = vec![0u8; stride * bh as usize];
+            paint(&mut canvas, bw, bh, stride, anim, ctx);
             Shot {
                 canvas,
                 bw,
@@ -1204,54 +1229,94 @@ mod tests {
     }
 
     #[test]
+    /// 逐页验收：**每一页的三行都必须真的有墨**（行底 + 强调条 + 字），而标题那一格必须印
+    /// **那一页自己的页名**。
+    ///
+    /// 分页把"画哪三行"变成了一件有状态的事 ⇒ 只测盲盒页等于另外两页在像素面上从来没被画过。
+    /// 那条"三页的标题带两两不同"是 `card::Ctx::page` **被画师读到**的唯一直接证据：签名里混了页
+    /// 而画师不读它，出的就是"点了翻页、命中表换了、卡片还画旧页"（`69fd158` 的镜像形状），而
+    /// "有墨"这种存在性断言对它完全无感 —— 三页都印"盲盒 1/3"照样全绿。
     fn menu_phase_inks_the_header_and_every_row() {
         for scale in [1.0, 1.5] {
-            let s = Shot::at(scale, &MenuAnim::Menu, 1200, false, "");
-            assert!(
-                s.has_ink((PAD, PAD, CARD_W - 2 * PAD, 10)),
-                "scale {scale}：余额行是空的"
-            );
-            // 三行：行底 + 强调条 + 字都要有（`layout()` = 只有那三个可点行，footer 另算）
-            for r in menu::layout() {
-                let row = r.as_rect();
-                let band = (row.x, row.y, row.w, row.h);
+            let shots: Vec<(MenuPage, Shot)> = MenuPage::ALL
+                .iter()
+                .map(|&page| {
+                    let s = Shot::on_page(
+                        &MenuAnim::Menu,
+                        Ctx {
+                            balance: 1200,
+                            dry_run: false,
+                            error: "",
+                            scale,
+                            motion: Motion::Full,
+                            lang: Lang::DEFAULT,
+                            page,
+                        },
+                    );
+                    (page, s)
+                })
+                .collect();
+            let head = menu::header();
+            for (page, s) in &shots {
                 assert!(
-                    s.has_ink(band),
-                    "scale {}：项 {:?} 这一行是空的（字号或行距漂了）",
-                    scale,
-                    r.item
+                    s.has_ink((head.x, head.y, head.w, 10)),
+                    "{page:?} scale {scale}：标题带顶端那一截是空的 ⇒ 页名或碎片行没画出来"
                 );
-                assert!(
-                    s.count((row.x + 2, row.y + 2, row.w - 4, row.h - 4), ROW) > 0,
-                    "scale {scale}：项 {:?} 的行底没落在行矩形里 ⇒ 画的是一整块卡片",
-                    r.item
-                );
-                // 强调条（§4.5 的新几何）：它**在行底里**、离左边 `ROW_CORNER`，画在圆角行底
-                // 之内而不是顶上 ⇒ 顶到边会把角填回直角（`row_accent` 那段）。
-                let bar = menu::accent_bar(row);
-                assert!(
-                    s.count((bar.x, bar.y, bar.w, bar.h), ACCENT) > 0,
-                    "scale {scale}：项 {:?} 没有强调条 ⇒ 版式没真的换",
-                    r.item
-                );
-                assert!(
-                    bar.x > row.x
-                        && bar.y > row.y
-                        && bar.x + bar.w < row.x + row.w
-                        && bar.y + bar.h < row.y + row.h,
-                    "scale {scale}：项 {:?} 的强调条顶到了行边 ⇒ 会把圆角行底左上/左下角填回直角",
-                    r.item
-                );
+                // 三行：行底 + 强调条 + 字都要有（`layout(page)` = 只有那一页那三个可点行）
+                for r in menu::layout(*page) {
+                    let row = r.as_rect();
+                    let band = (row.x, row.y, row.w, row.h);
+                    assert!(
+                        s.has_ink(band),
+                        "{page:?} scale {scale}：项 {:?} 这一行是空的（字号或行距漂了）",
+                        r.item
+                    );
+                    assert!(
+                        s.count((row.x + 2, row.y + 2, row.w - 4, row.h - 4), ROW) > 0,
+                        "{page:?} scale {scale}：项 {:?} 的行底没落在行矩形里 ⇒ 画的是一整块卡片",
+                        r.item
+                    );
+                    // 强调条（§4.5 的新几何）：它**在行底里**、离左边 `ROW_CORNER`，画在圆角行底
+                    // 之内而不是顶上 ⇒ 顶到边会把角填回直角（`row_accent` 那段）。
+                    let bar = menu::accent_bar(row);
+                    assert!(
+                        s.count((bar.x, bar.y, bar.w, bar.h), ACCENT) > 0,
+                        "{page:?} scale {scale}：项 {:?} 没有强调条 ⇒ 版式没真的换",
+                        r.item
+                    );
+                    assert!(
+                        bar.x > row.x
+                            && bar.y > row.y
+                            && bar.x + bar.w < row.x + row.w
+                            && bar.y + bar.h < row.y + row.h,
+                        "{page:?} scale {scale}：项 {:?} 的强调条顶到了行边 ⇒ 会把圆角行底左上/左下角填回直角",
+                        r.item
+                    );
+                }
+            }
+            // 标题带逐页两两不同 ⇒ `ctx.page` 确实被读到了（理由见函数头）。
+            for (i, (pa, sa)) in shots.iter().enumerate() {
+                for (pb, sb) in shots.iter().skip(i + 1) {
+                    let a: Vec<[u8; 4]> = sa.pixels((head.x, head.y, head.w, head.h)).collect();
+                    let b: Vec<[u8; 4]> = sb.pixels((head.x, head.y, head.w, head.h)).collect();
+                    assert_ne!(
+                        a, b,
+                        "scale {scale}：{pa:?} 与 {pb:?} 的标题带逐位相同 ⇒ 画师没读 `ctx.page`\
+                         （翻页只换了命中表，卡片还印旧页名）"
+                    );
+                }
             }
             // 语言行：它**没有行底**（footer 直接画在卡片底色上），所以这里只查"画了字"。
             // 这条是"用户能自己设语言"在像素面的唯一证据 —— 矩形在却空白 = 假功能。
+            // ⚠️ footer 的几何与页无关（三页共用同一条带）⇒ 这一段不进页循环，逐字不动。
             let f = menu::footer();
+            let s0 = &shots[0].1;
             assert!(
-                s.has_ink((f.x, f.y, f.w, f.h)),
+                s0.has_ink((f.x, f.y, f.w, f.h)),
                 "scale {scale}：footer 那条带是空的 ⇒ 语言行没画出来"
             );
             assert_eq!(
-                s.count((f.x, f.y, f.w, f.h), ROW),
+                s0.count((f.x, f.y, f.w, f.h), ROW),
                 0,
                 "scale {scale}：语言行不该有行底（它不是那三行之一）"
             );
@@ -1676,6 +1741,8 @@ mod tests {
             scale: 1.0,
             motion: Motion::Full,
             lang: Lang::Zh,
+            // 病理画布只验"裁而不炸"，与页无关 ⇒ 用默认页（分页前那些断言画的就是它）
+            page: MenuPage::Gacha,
         };
         paint(&mut tiny, 1, 1, 4, &MenuAnim::Menu, ctx);
         let mut zero: Vec<u8> = vec![];

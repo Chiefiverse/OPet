@@ -116,8 +116,8 @@ impl Lang {
 /// 词表的所有键。加一个键 = 四列都要填 + 重跑 `ui_strings` 门禁 + 重裁字体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
-    /// 标题行左端 = **盲盒页的页名**。分页后由 `MenuPage::key()` 选，不再是常量。
-    Title,
+    /// 盲盒页的页名。三个页名一律 `Page*` ⇒ 标题条由 `MenuPage::key()` 选，不是常量。
+    PageGacha,
     /// 动作页的页名
     PageAction,
     /// 其它页的页名
@@ -154,7 +154,7 @@ pub enum Key {
 
 impl Key {
     pub const ALL: [Self; 20] = [
-        Self::Title,
+        Self::PageGacha,
         Self::PageAction,
         Self::PageMisc,
         Self::Pull1,
@@ -181,10 +181,10 @@ impl Key {
 /// 这个 `match` 没有 `_` 分支，加键不填全编译不过。
 fn translations(k: Key, l: Lang) -> &'static str {
     match (k, l) {
-        (Key::Title, Lang::Zh) => "盲盒",
-        (Key::Title, Lang::En) => "Gacha",
-        (Key::Title, Lang::Ja) => "ガチャ",
-        (Key::Title, Lang::Ko) => "가챠",
+        (Key::PageGacha, Lang::Zh) => "盲盒",
+        (Key::PageGacha, Lang::En) => "Gacha",
+        (Key::PageGacha, Lang::Ja) => "ガチャ",
+        (Key::PageGacha, Lang::Ko) => "가챠",
 
         (Key::PageAction, Lang::Zh) => "动作",
         (Key::PageAction, Lang::En) => "Actions",
