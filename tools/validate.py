@@ -26,7 +26,7 @@ RSS_BUDGET_MB = 120.0  # §6.1 性能门禁
 FULL_GRID_ROWS = 40  # 全量清单的行数，用于外推
 COVERAGE_MIN_PCT = 2.0  # 低于 ⇒ 判"拍空"（相机没对准，就是 TRACK_TO 那个坑）
 COVERAGE_MAX_PCT = 98.0  # 高于 ⇒ 判"背景没抠干净"（film_transparent 失效）
-IDLE_BOTTOM_JITTER_PX = 2  # 待机时脚不该滑动
+IDLE_BOTTOM_JITTER_PX = 2  # @96 基准档的"待机时脚不该滑动"；格子提档后按 w/96 同比放大
 
 
 class Report:
@@ -130,6 +130,10 @@ def main():
     #   太空猫参数化骨骼 idle         跨帧 2 px（开 --plant-feet）/ 4 px（不开）
     #   太空猫套现成人类 HumanDrunkIdle 跨帧 8 px
     # ⇒ 新轴仍然会红（剪辑那条就是），只是不再把投影差误判成抖动。
+    #
+    # 阈值单位是"格子的百分之几"，裸 px 会随格子漂（1 px 在 @96 是 1/96、在 @192 是 1/192），
+    # 所以下面按 w/96 同比走。@192 重标定（2026-10-29 idle 子集实测）：老虎 **0 px**、兔子 **0 px**
+    # —— 两只在 @96 也都是 0 px ⇒ 这条门禁的判定序没被提档改变，只是刻度跟着格子走。
     if "idle" in manifest["states"]:
         grid = {}
         for row in manifest["states"]["idle"]["rows"]:
@@ -142,6 +146,7 @@ def main():
             by_col.setdefault(col, []).append(y)
         frame_spread = {col: max(v) - min(v) for col, v in by_col.items()}
         worst = max(frame_spread.values())
+        jitter_gate = IDLE_BOTTOM_JITTER_PX * w / 96.0
         by_row = {}
         for (row, col), y in grid.items():
             by_row.setdefault(row, []).append(y)
@@ -149,8 +154,8 @@ def main():
         rep.add(
             "idle 底边帧间抖动",
             "最大 %d px (逐朝向 %s)" % (worst, dict(sorted(frame_spread.items()))),
-            "<= %d px" % IDLE_BOTTOM_JITTER_PX,
-            worst <= IDLE_BOTTOM_JITTER_PX,
+            "<= %.0f px" % jitter_gate,
+            worst <= jitter_gate,
             "同朝向跨帧；同帧跨朝向极差 %s 是俯视投影差，不算抖动" % dict(sorted(face_spread.items())),
         )
 

@@ -995,6 +995,10 @@ def check_framing(cam, cell, spec, states, columns, pose, samples):
     所以每一帧姿态都能查。
     """
     tiny, clipped, tight = {}, {}, {}
+    # 下面两条门禁的阈值原本是裸 px，而"1 px 占格子多少"随格子变 ⇒ 提档后同一个构图
+    # 会被判得比 @96 更松（1/192 比 1/96 细一倍）。基准档 = 96，阈值按 cell/96 同比走，
+    # 于是 cell=96 时逐位等于历史值（--check-only 的旧输出文本仍可当回归判据）。
+    unit = cell / 96.0
     for state in states:
         frames = len(spec["states"][state]["rows"])
         loop = spec["states"][state].get("loop", True)
@@ -1014,12 +1018,12 @@ def check_framing(cam, cell, spec, states, columns, pose, samples):
                     clearance = (-over * cell) if over > 0.005 else min(
                         min(xs), 1.0 - max(xs), min(ys), 1.0 - max(ys)
                     ) * cell
-                    if clearance < 1.0:
+                    if clearance < 1.0 * unit:
                         clipped[key] = min(clipped.get(key, 9e9), clearance)
                     tight[key] = min(tight.get(key, 9e9), clearance)
     problems = []
     for key, size in sorted(tiny.items()):
-        if size < 2.0:
+        if size < 2.0 * unit:
             problems.append("%s 整组姿态里投影最大只有 %.1f px ⇒ 基本看不见" % (key, size))
     for key, px in sorted(clipped.items()):
         problems.append("%s 离格边只剩 %.1f px（会被裁或已经裁掉）" % (key, px))
@@ -1046,7 +1050,7 @@ def main():
     args = parse_args()
     spec = load_fixture()
     cell = args.cell or spec["grid"]["w"]
-    if cell != spec["grid"]["h"]:
+    if spec["grid"]["w"] != spec["grid"]["h"]:
         sys.exit("fixture 的 grid.w/h 不相等（%s/%s），本脚本按方格写" % (spec["grid"]["w"], spec["grid"]["h"]))
 
     states = [s.strip() for s in args.state.split(",") if s.strip()]

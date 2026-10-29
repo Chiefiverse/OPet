@@ -45,8 +45,19 @@ fn pointer_hits_the_pet_but_not_the_surface_margin() {
         !intent.hit_test_world(corner),
         "包围盒左上角的空白余量应穿透，否则桌面点不动"
     );
-    let above = Vec2::new(intent.anchor.x, intent.anchor.y - 200.0);
-    assert!(!intent.hit_test_world(above), "宠物头顶上方不应命中");
+    // 探针按格子相对，不用绝对 200 px：@96 时那次上探距帧上边界还有 94 px 余量，
+    // @192 只剩 4 px ⇒ 再提一档就假红。配一条帧内 1 px 的正面对照，防"永远不命中也绿"。
+    let feet_y = manifest().feet_anchor()[1];
+    let above_frame = Vec2::new(intent.anchor.x, intent.anchor.y - feet_y - 1.0);
+    assert!(
+        !intent.hit_test_world(above_frame),
+        "帧上边界之外不该吃输入（feet_y={feet_y}）"
+    );
+    let inside_frame = Vec2::new(intent.anchor.x, intent.anchor.y - feet_y + 1.0);
+    assert!(
+        intent.hit_test_world(inside_frame),
+        "正面对照：帧内靠上 1 px 必须命中，否则上面那条断言是假绿"
+    );
 }
 
 /// M3-b：按钮维度必须能穿过契约。三个平台后端各自有原始按键码

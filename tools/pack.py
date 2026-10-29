@@ -117,9 +117,10 @@ def main():
     if meta["cell"]["h"] != cell:
         sys.exit("meta.json 的 cell 非方格: %s" % meta["cell"])
     if cell != fixture["grid"]["w"]:
-        sys.exit(
-            "烘焙格子 %d 与 fixture grid.w %d 不一致（bake.py 读的是 fixture，这里不该发生）"
-            % (cell, fixture["grid"]["w"])
+        print(
+            "PACK 提示：烘焙格子 %d 与 fixture grid.w %d 不一致 ⇒ 产物 grid.w/h 按 %d 写；"
+            "fixture 仍是行布局（states.*.rows）的唯一事实源"
+            % (cell, fixture["grid"]["w"], cell)
         )
 
     states = discover_states(frames_dir, fixture)

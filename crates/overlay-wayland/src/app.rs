@@ -555,7 +555,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         .map(|m| m.get_fractional_scale(&surface, &qh, ()));
     layer.commit();
 
-    // 池按 2× 预留（128 逻辑 ⇒ 256 物理 = 256 KiB × 3 槽），更大尺寸由 `SlotPool` 自己扩。
+    // 池按 2× 预留（@192：224 逻辑 ⇒ 448 物理 = 784 KiB × 3 槽），更大尺寸由 `SlotPool` 自己扩。
     let phys = (logical.0 * 2, logical.1 * 2);
     let initial = phys.0 as usize * phys.1 as usize * 4 * 3;
     let pool = SlotPool::new(initial, &shm).map_err(|e| format!("shm 池建不起来: {e}"))?;

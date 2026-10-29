@@ -172,6 +172,13 @@ impl Manifest {
             if !off[0].is_finite() || !off[1].is_finite() {
                 return bad(format!("outfit anchor {slot} 含非有限值"));
             }
+            if off[0] < 0.0
+                || off[1] < 0.0
+                || off[0] > self.grid.w as f32
+                || off[1] > self.grid.h as f32
+            {
+                return bad(format!("outfit anchor {slot} {off:?} 不在帧内"));
+            }
         }
         match self.input_polygon.as_deref() {
             None | Some("auto_from_alpha") => {}
@@ -288,6 +295,25 @@ mod tests {
     fn rejects_unknown_input_polygon_mode() {
         let json = MINIMAL.replace("auto_from_alpha", "from_depth_buffer");
         assert!(Manifest::parse(&json).is_err());
+    }
+
+    /// 挂点必须落在帧内：挂件的贴图是按这些坐标定位的，越界就是"配件画到帧外"，
+    /// 而图集之外的像素不存在 ⇒ 客户端只能画空。§9.2 第 13 条"挂件看不见"的地基。
+    #[test]
+    fn rejects_outfit_anchor_outside_the_frame() {
+        let with_anchor = MINIMAL.replace(
+            "\"input_polygon\"",
+            "\"outfit_anchors\": {\"head\": [64, 20]}, \"input_polygon\"",
+        );
+        Manifest::parse(&with_anchor).expect("帧内的挂点必须放行（正面对照）");
+        for out_of_frame in ["[129, 20]", "[-1, 20]", "[64, 129]", "[64, -1]"] {
+            let json = with_anchor.replace("[64, 20]", out_of_frame);
+            let err = Manifest::parse(&json)
+                .err()
+                .unwrap_or_else(|| panic!("越界挂点 {out_of_frame} 被放行了（grid 是 128×128）"));
+            let msg = err.to_string();
+            assert!(msg.contains("head"), "错误要点名是哪个挂点: {msg}");
+        }
     }
 
     #[test]

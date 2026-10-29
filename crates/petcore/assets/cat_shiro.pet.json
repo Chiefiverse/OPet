@@ -3,7 +3,7 @@
   "slug": "cat_shiro",
   "display_name": "小白",
   "sheet": "sheet.webp",
-  "grid": { "cols": 8, "rows": 40, "w": 96, "h": 96 },
+  "grid": { "cols": 8, "rows": 40, "w": 192, "h": 192 },
   "states": {
     "idle":  { "rows": [0, 1, 2, 3], "fps": 8, "loop": true },
     "walk":  { "rows": [4, 5, 6, 7, 8, 9, 10, 11], "fps": 12, "loop": true },
@@ -16,8 +16,8 @@
     "react": { "rows": [37, 38, 39], "fps": 12, "loop": false }
   },
   "facing": "sprite_rows_are_right_facing",
-  "anchor": { "feet": [48, 90] },
-  "outfit_anchors": { "head": [48, 20], "neck": [48, 52], "hand": [69, 59] },
+  "anchor": { "feet": [96, 180] },
+  "outfit_anchors": { "head": [96, 40], "neck": [96, 104], "hand": [138, 118] },
   "input_polygon": "auto_from_alpha",
   "petdex_compatible": true
 }
