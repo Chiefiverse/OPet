@@ -35,10 +35,11 @@ const NOTICE: &str = include_str!("../assets/fonts/NOTICE-ui-font.txt");
 
 /// `--verify` 三次连续重建逐字节一致后钉下来的摘要。改任何文案 → 重跑 `--emit-codes` +
 /// `--build` + `--verify` → **这里的常数必须一起改**（它就是"资产与清单漂移"的证据）。
-const FONT_SHA256: &str = "99ae9411f2d656bc2b82948c9466a45c1365927c70169d0d51cb2a87fc0182a1";
+const FONT_SHA256: &str = "8400976ab130783d64074963ea11414f741f45dc900fae72989124b7dc93991d";
 /// 源 .ttc 的摘要，与 `tools/subset_font.py` 的 `SOURCE_SHA256` 同一个数。
 const SOURCE_SHA256: &str = "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a";
-/// §4.2 的体积门禁（i18n 把子集从"只中文"涨到四 locale 并集后重算的档）。实测 35,316 B。
+/// §4.2 的体积门禁（i18n 把子集从"只中文"涨到四 locale 并集后重算的档）。实测 43,404 B
+/// （283 码位：分页那批新标签 +46）。预算留的是**加一整批文案**的余量，不是当前余量。
 const FONT_BUDGET: usize = 320 * 1024;
 
 /// 码位清单：每行 `U+XXXX # 来源`。**唯一事实源**，Rust 侧不留第二份清单。

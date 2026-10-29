@@ -2,10 +2,11 @@ NOTICE — OPet UI 字体子集
 =========================
 
 产物：crates/overlay-wayland/assets/fonts/ui.otf
-  大小     35,316 B（34.5 KiB）
-  sha256   99ae9411f2d656bc2b82948c9466a45c1365927c70169d0d51cb2a87fc0182a1
+  大小     43,404 B（42.4 KiB）
+  sha256   8400976ab130783d64074963ea11414f741f45dc900fae72989124b7dc93991d
   家族名   OPet UI（name ID 1）／唯一标识 OPetUI-Regular（ID 6）
-  码位     237 个：ASCII 95 + 汉字 99 + 谚文 29 + 假名 12 + 标点 2（… U+2026、：U+FF1A）
+  码位     283 个：ASCII 95 + 汉字 122 + 谚文 45 + 假名 19 + 标点 2（… U+2026、：U+FF1A）
+           （2026-10-29 菜单分页新增 46 个：动作/其它页名 + 走跑跳爬暂停退出行标签）
   轮廓     CFF（Type 2 charstring）—— 本机所有中文字体都是这个形状，栅格器必须能吃它
 
 来源（下面每一行都是 2026-10-26 用 `python3 tools/subset_font.py --name-report` 从字体

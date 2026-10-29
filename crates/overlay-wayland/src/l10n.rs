@@ -116,11 +116,26 @@ impl Lang {
 /// 词表的所有键。加一个键 = 四列都要填 + 重跑 `ui_strings` 门禁 + 重裁字体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
-    /// 卡片标题行左端
+    /// 标题行左端 = **盲盒页的页名**。分页后由 `MenuPage::key()` 选，不再是常量。
     Title,
+    /// 动作页的页名
+    PageAction,
+    /// 其它页的页名
+    PageMisc,
     Pull1,
     Pull10,
     Close,
+    /// 动作页三行。发到内核是 `Command::Go(Action::*)`，**标签是静态的**：客户端不读
+    /// 内核状态，所以不做"暂停/唤醒"那种两态字面（画一个客户端读不到的状态就是假按钮）。
+    Walk,
+    Run,
+    Jump,
+    Climb,
+    /// "暂停"那一行 ⇒ 内核 `Action::Sleep`。叫暂停不叫睡觉是有意的：这一行对用户是
+    /// "让它安静一会儿"，而唤醒它 = 点动作页任意一行（内核 `handle_go` 的既有语义）。
+    Pause,
+    /// 退出宠物进程（`exit = true` ⇒ 走正常收尾，退出摘要照打）。
+    Quit,
     /// 语言行的标签
     Lang,
     /// 新获得标
@@ -138,11 +153,19 @@ pub enum Key {
 }
 
 impl Key {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 20] = [
         Self::Title,
+        Self::PageAction,
+        Self::PageMisc,
         Self::Pull1,
         Self::Pull10,
         Self::Close,
+        Self::Walk,
+        Self::Run,
+        Self::Jump,
+        Self::Climb,
+        Self::Pause,
+        Self::Quit,
         Self::Lang,
         Self::New,
         Self::Dup,
@@ -163,6 +186,16 @@ fn translations(k: Key, l: Lang) -> &'static str {
         (Key::Title, Lang::Ja) => "ガチャ",
         (Key::Title, Lang::Ko) => "가챠",
 
+        (Key::PageAction, Lang::Zh) => "动作",
+        (Key::PageAction, Lang::En) => "Actions",
+        (Key::PageAction, Lang::Ja) => "動作",
+        (Key::PageAction, Lang::Ko) => "동작",
+
+        (Key::PageMisc, Lang::Zh) => "其它",
+        (Key::PageMisc, Lang::En) => "Other",
+        (Key::PageMisc, Lang::Ja) => "その他",
+        (Key::PageMisc, Lang::Ko) => "기타",
+
         (Key::Pull1, Lang::Zh) => "抽一次",
         (Key::Pull1, Lang::En) => "Pull 1",
         (Key::Pull1, Lang::Ja) => "1回引く",
@@ -177,6 +210,38 @@ fn translations(k: Key, l: Lang) -> &'static str {
         (Key::Close, Lang::En) => "Close",
         (Key::Close, Lang::Ja) => "閉じる",
         (Key::Close, Lang::Ko) => "닫기",
+
+        // 动作页与退出。日语动词用辞书形（歩く/走る）而不是"歩き"：这一行是**命令**，
+        // 而菜单里其余各行（引く/閉じる/終了）也全是辞书形，同一张表里不许两种体。
+        (Key::Walk, Lang::Zh) => "走路",
+        (Key::Walk, Lang::En) => "Walk",
+        (Key::Walk, Lang::Ja) => "歩く",
+        (Key::Walk, Lang::Ko) => "걷기",
+
+        (Key::Run, Lang::Zh) => "跑步",
+        (Key::Run, Lang::En) => "Run",
+        (Key::Run, Lang::Ja) => "走る",
+        (Key::Run, Lang::Ko) => "달리기",
+
+        (Key::Jump, Lang::Zh) => "跳跃",
+        (Key::Jump, Lang::En) => "Jump",
+        (Key::Jump, Lang::Ja) => "ジッャンプ",
+        (Key::Jump, Lang::Ko) => "점프",
+
+        (Key::Climb, Lang::Zh) => "爬墙",
+        (Key::Climb, Lang::En) => "Climb",
+        (Key::Climb, Lang::Ja) => "壁登り",
+        (Key::Climb, Lang::Ko) => "등반",
+
+        (Key::Pause, Lang::Zh) => "暂停",
+        (Key::Pause, Lang::En) => "Pause",
+        (Key::Pause, Lang::Ja) => "一時停止",
+        (Key::Pause, Lang::Ko) => "일시 정지",
+
+        (Key::Quit, Lang::Zh) => "退出",
+        (Key::Quit, Lang::En) => "Quit",
+        (Key::Quit, Lang::Ja) => "終了",
+        (Key::Quit, Lang::Ko) => "종료",
 
         (Key::Lang, Lang::Zh) => "语言",
         (Key::Lang, Lang::En) => "Language",
