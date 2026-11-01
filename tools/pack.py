@@ -100,6 +100,48 @@ def column_spans(alpha):
     return spans
 
 
+def load_outfit_anchors(frames_dir, cell):
+    """读 <frames>/outfit.json 的 col 0 读数，写成清单里的 outfit_anchors。
+
+    schema 是 `HashMap<String,[f32;2]>` —— 每个 slot 只有一对数、没有朝向维 ⇒ 只能对一个格子。
+    这里选 col 0（`Facing::East`），与 `anchor.feet` 同一个约定（那也是 columns[0] 的读数），
+    完整的八列 × 逐行数组留在 outfit.json 里，那才是事实源。值为 null 的 slot 直接不放
+    （没有几何来源的挂点写进去就是魔数）。
+    """
+    path = os.path.join(frames_dir, "outfit.json")
+    if not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if data.get("cell") != cell:
+        sys.exit(
+            "outfit.json 记录的是 cell=%s，而这次的帧是 cell=%d ⇒ 那批挂点是在另一档格子上量的，"
+            "写进清单会当场被内核的『挂点必须落在帧内』拒掉或放行错值。重跑 --outfit-measure-only。"
+            % (data.get("cell"), cell)
+        )
+    anchors = {}
+    for slot, pair in sorted((data.get("anchor") or {}).items()):
+        if pair is None:
+            continue
+        point = [int(round(pair[0])), int(round(pair[1]))]
+        if not (0 <= point[0] <= cell and 0 <= point[1] <= cell):
+            sys.exit("挂点 %s=%s 不在 %dx%d 帧内，内核会拒绝（出处 %s）" % (slot, point, cell, cell, path))
+        anchors[slot] = point
+    if anchors:
+        origin = data.get("anchor_from") or ["?", 0, 0]
+        print(
+            "PACK 挂点出处：%s（%s 取自状态 %s 第 %d 帧第 %d 列；其余 slot 无几何来源，省略）"
+            % (
+                path,
+                " ".join("%s=%s" % kv for kv in sorted(anchors.items())),
+                origin[0],
+                origin[1],
+                origin[2],
+            )
+        )
+    return anchors
+
+
 def main():
     ap = argparse.ArgumentParser(description="OPet 图集打包")
     ap.add_argument("--pet", default="cat_shiro")
@@ -154,8 +196,11 @@ def main():
         "anchor": {"feet": anchor},
         "input_polygon": "auto_from_alpha",
     }
-    # outfit_anchors 本轮省略：head/neck/hand 三个挂点都需要几何来源，
-    # 占位模型没有配件挂点，硬写就是魔数。该字段在 Rust 侧是 serde(default)。
+    # outfit_anchors 的唯一生产者：tools/bake.py --outfit-measure-only 写出的 outfit.json。
+    # 没有那份文件就省略这个字段（serde(default) 合法），别手抄数字 —— validate 第 15 项会查出处。
+    anchors = load_outfit_anchors(frames_dir, cell)
+    if anchors:
+        manifest["outfit_anchors"] = anchors
 
     sheet_path = os.path.join(out_dir, "sheet.webp")
     sheet.save(sheet_path, format="WEBP", lossless=True, quality=90)

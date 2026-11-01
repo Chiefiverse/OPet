@@ -120,6 +120,77 @@ def main():
     ok_anchor = bool(feet) and 0 <= feet[0] <= w and 0 <= feet[1] <= h
     rep.add("anchor.feet 在帧内", str(feet), "x∈[0,%d] y∈[0,%d]" % (w, h), ok_anchor, "越界则内核判'不在帧内'并拒绝清单")
 
+    # 第 15 项：挂点的**出处**。这条存在的理由是一条已经发生过的事故 —— 内核里那条"挂点必须
+    # 落在帧内"的校验（manifest.rs）守的是 cat_shiro.pet.json 里三个手写从没量过的数，而八份
+    # 烘出的 pet.json 的 outfit_anchors 全是 null（pack.py 当时根本没有产出它的路径）。
+    # ⇒ "我给 X 加了校验"必须一起问"X 有没有生产者"，而生产者产了就要能被追到。
+    #
+    # 三个方向都查：清单有而 outfit.json 没有 ⇒ 红（手抄的数再也混不进产物）；
+    # outfit.json 在而清单没写出该字段 ⇒ 也红（产了没接）；逐 slot 落在帧内；
+    # 再加一条**方向 sanity**：head.y < neck.y < feet.y —— 帧内检查对 y 和 h−y 同样放行，
+    # "整组挂点上下翻面"这种错现在没人抓得住。
+    anchors = manifest.get("outfit_anchors") or {}
+    outfit_path = os.path.join(frames_dir, "outfit.json")
+    outfit = load_json(outfit_path) if os.path.exists(outfit_path) else None
+    if anchors and outfit is None:
+        rep.add(
+            "outfit_anchors 有出处",
+            "清单写了 %s，而 %s 不存在" % (sorted(anchors), outfit_path),
+            "两者同时存在或同时不存在",
+            False,
+            "没有 outfit.json 就等于这几个数是手抄的 ⇒ 重跑 bake.py --outfit-measure-only 再 pack.py",
+        )
+    elif outfit is not None and not anchors:
+        rep.add(
+            "outfit_anchors 有出处",
+            "%s 存在，而清单里没写出该字段" % outfit_path,
+            "两者同时存在或同时不存在",
+            False,
+            "生产者产了、打包器没接（pack.py 的 load_outfit_anchors）；或那份 outfit.json 是旧批次的",
+        )
+    elif outfit is None:
+        rep.add(
+            "outfit_anchors 有出处",
+            "清单与该文件都没有",
+            "两者同时存在或同时不存在",
+            True,
+            "这只宠物没量挂点（合法：字段是 serde(default)，省略即'无配件'）",
+        )
+    else:
+        reported = {k: v for k, v in sorted((outfit.get("anchor") or {}).items()) if v is not None}
+        bad_range = [
+            "%s=%s" % (slot, pair)
+            for slot, pair in sorted(anchors.items())
+            if not (0 <= pair[0] <= w and 0 <= pair[1] <= h)
+        ]
+        same = all(k in anchors and [int(round(v[0])), int(round(v[1]))] == list(anchors[k]) for k, v in reported.items())
+        where = outfit.get("anchor_from") or ["?", "?", "?"]
+        rep.add(
+            "outfit_anchors 与出处逐位相符",
+            "%s vs %s" % (dict(sorted(anchors.items())), reported),
+            "整数化后相等且都在帧内",
+            same and not bad_range,
+            "越界项 %s；出处 cell=%s，取自状态 %s 第 %s 帧第 %s 列"
+            % (bad_range or "无", outfit.get("cell"), where[0], where[1], where[2]),
+        )
+        # y 在帧内是"越大越低"（屏幕坐标）⇒ 头顶必须比脖子高、脖子必须比脚高。
+        ys = {slot: pair[1] for slot, pair in anchors.items()}
+        if feet:
+            ys["feet"] = feet[1]
+        chain = [("head", "neck"), ("neck", "feet")]
+        inverted = [
+            "%s.y=%s 不在 %s.y=%s 上方" % (a, ys[a], b, ys[b])
+            for a, b in chain
+            if a in ys and b in ys and not (ys[a] < ys[b])
+        ]
+        rep.add(
+            "挂点上下序 head<neck<feet",
+            " ".join("%s.y=%s" % (k, ys[k]) for k in ("head", "neck", "feet") if k in ys),
+            "严格递增",
+            not inverted,
+            "; ".join(inverted) or "'落在帧内'对 y 与 h−y 同样放行 ⇒ 翻面那种错只有这条抓得住",
+        )
+
     # 待机底边抖动：anchor 不等于底行（四足在俯视下腿投影低于原点），所以查帧间抖动。
     #
     # ⚠️ 比较轴必须是"同一朝向、跨帧"，不是"同一帧、跨朝向"。后者量的是 15° 俯视把
