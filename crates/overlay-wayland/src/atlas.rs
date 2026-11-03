@@ -153,6 +153,53 @@ impl Atlas {
         dst_h: u32,
         dst_stride: usize,
     ) -> Result<(), AtlasError> {
+        self.paint_cell(row, col, dst, dst_w, dst_h, dst_stride, |src, d| {
+            d.copy_from_slice(&src);
+        })
+    }
+
+    /// 把 `(row, col)` 格**叠**进 `dst`（source-over，见 [`composite_over`]）。
+    ///
+    /// 与 [`Self::blit`] 的唯一区别是那一次逐像素合并 —— 取样、边界、最近邻全部共用
+    /// [`Self::paint_cell`]。**这是刻意的**：`paint_cell` 里 `src_take` 用格宽而不是 sheet
+    /// 跨距、`dst_take` 用 `dst_w`，两条都是真机撞出来才修对的；复制一份循环 = 下一次只修
+    /// 其中一份，而"配件画在最底行假报越界"这种症状在屏上只是缺一块，不会告诉你是哪份错了。
+    ///
+    /// ⚠️ 前提由 [`petcore::assets::AccessoryManifest::validate_against`] 在装备那一刻保证：**配件 sheet 与
+    /// 本体 sheet 同 `cols/w/h`** ⇒ 同一个 `(row, col)` 在两块缓冲里落在屏幕上同一块矩形，
+    /// 所以这里**不需要任何偏移参数**。偏移恒为 0 是被校验的性质，不是假设。
+    pub fn blit_over(
+        &self,
+        row: u32,
+        col: u32,
+        dst: &mut [u8],
+        dst_w: u32,
+        dst_h: u32,
+        dst_stride: usize,
+    ) -> Result<(), AtlasError> {
+        self.paint_cell(row, col, dst, dst_w, dst_h, dst_stride, |src, d| {
+            let out = composite_over(src, [d[0], d[1], d[2], d[3]]);
+            d.copy_from_slice(&out);
+        })
+    }
+
+    /// `blit` / `blit_over` 共用的逐格取样：`put` 决定源像素怎么落到目标上。
+    // 八个参数就是一次二维 blit 的全部事实：源格 `(row, col)` + 目标矩形 `(w, h, stride)` +
+    // 混合方式。包成结构体只会让这两个唯一的调用点各跳一次定义，而换不来任何一个新错误形状。
+    #[allow(clippy::too_many_arguments)]
+    fn paint_cell<F>(
+        &self,
+        row: u32,
+        col: u32,
+        dst: &mut [u8],
+        dst_w: u32,
+        dst_h: u32,
+        dst_stride: usize,
+        mut put: F,
+    ) -> Result<(), AtlasError>
+    where
+        F: FnMut([u8; 4], &mut [u8]),
+    {
         let base = self
             .cell_offset(row, col)
             .ok_or_else(|| AtlasError::Bounds {
@@ -186,11 +233,20 @@ impl Atlas {
                     detail: format!("目标缓冲在第 {y} 行不够 {} 字节", dst.len()),
                 });
             }
-            for x in 0..dst_w {
-                let sx = (x * self.cell_w) / dst_w;
+            // `chunks_exact_mut` 而不是手写 `di`：`dst_take == dst_w × 4` ⇒ 恰好 `dst_w`
+            // 个块，每块直接是 `&mut [u8; 4]`（`put` 要的形状），少一处下标算术。
+            for (x, d) in dst[drow..drow + dst_take].chunks_exact_mut(4).enumerate() {
+                let sx = (x as u32 * self.cell_w) / dst_w;
                 let si = srow + (sx as usize) * 4;
-                let di = drow + (x as usize) * 4;
-                dst[di..di + 4].copy_from_slice(&self.pixels[si..si + 4]);
+                put(
+                    [
+                        self.pixels[si],
+                        self.pixels[si + 1],
+                        self.pixels[si + 2],
+                        self.pixels[si + 3],
+                    ],
+                    d,
+                );
             }
         }
         Ok(())
@@ -208,6 +264,28 @@ impl Atlas {
 pub fn premultiplied_bgra(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     let mul = |c: u8| (c as u32 * a as u32).div_ceil(256) as u8;
     [mul(b), mul(g), mul(r), a]
+}
+
+/// 预乘 BGRA 的 **source-over**：`out = src + dst × (1 − src.a)`，alpha 同式。
+///
+/// 全整数、无浮点、就近取整（`+127`）。`a == 255` 时 `keep == 0` ⇒ 精确等于 `src`；
+/// `a == 0` 时精确等于 `dst`。这两个端点是叠加路径最常用的两档（帽子实体 / 透明背景），
+/// 所以它们各自有单测，不留给"一般情况也对"推断。
+///
+/// ⚠️ **不 clamp，因为溢出对预乘输入不可能发生**：预乘 ⇒ `src ≤ src.a`，而
+/// `(dst×(255−a)+127)/255 ≤ 255−a`，两项相加 `≤ a + (255−a) = 255`。⇒ **前提写在这里，
+/// 判据钉在 `composite_over_never_overflows_premultiplied_source`（上界逐 `a` 取到）与
+/// `premultiply_keeps_channel_below_alpha`（生产端确实满足 `src ≤ a`）两条**。
+/// 传一份**直通**（未预乘）像素进来是调用方的错，症状是回绕成一个错色点而不是报错。
+pub fn composite_over(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+    let keep = 255u32 - src[3] as u32;
+    let one = |s: u8, d: u8| (s as u32 + (d as u32 * keep + 127) / 255) as u8;
+    [
+        one(src[0], dst[0]),
+        one(src[1], dst[1]),
+        one(src[2], dst[2]),
+        one(src[3], dst[3]),
+    ]
 }
 
 /// 测试用：把 RGBA 编成 lossless WebP（`image-webp` 的编码器只出 VP8L）。
@@ -359,5 +437,161 @@ mod tests {
             dst.chunks_exact(4).all(|p| p == [0, 255, 0, 255]),
             "缩小取样必须留在自己格内"
         );
+    }
+
+    /// 一格左半不透明、右半全透明的图集 —— 叠加路径唯一有意义的形状（帽实体 + 透明背景）。
+    ///
+    /// 像素已是 BGRA **预乘**，所以透明那半是四个 0 而不是"颜色 + a=0"。
+    fn half_transparent_atlas() -> Atlas {
+        let (w, h) = (8u32, 8u32);
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                if x >= 2 {
+                    continue; // 右半保持全 0 = 全透明
+                }
+                let i = ((y * w + x) * 4) as usize;
+                pixels[i..i + 4].copy_from_slice(&[30, 20, 10, 255]);
+            }
+        }
+        Atlas {
+            pixels,
+            width: w,
+            height: h,
+            cell_w: 4,
+            cell_h: 4,
+            cols: 2,
+            rows: 2,
+            decode_ms: 0,
+            encoded_bytes: 0,
+        }
+    }
+
+    /// 空底子上"叠加"必须逐字节等于"拷贝" ⇒ 一次性钉住两条路径共用同一套几何
+    /// （取格偏移、最近邻取样、边界判定），把合并数学单独留给 [`composite_over`] 那几条。
+    #[test]
+    fn blit_over_on_an_empty_destination_is_bit_equal_to_blit() {
+        for &(dw, dh) in &[(4u32, 4u32), (8, 8), (2, 2)] {
+            let a = atlas_from_synthetic();
+            let stride = (dw * 4) as usize;
+            let n = (dw * dh * 4) as usize;
+            for row in 0..a.rows {
+                for col in 0..a.cols {
+                    let mut copy = vec![0u8; n];
+                    let mut over = vec![0u8; n];
+                    a.blit(row, col, &mut copy, dw, dh, stride)
+                        .expect("blit 这格");
+                    a.blit_over(row, col, &mut over, dw, dh, stride)
+                        .expect("blit_over 这格");
+                    assert_eq!(
+                        copy, over,
+                        "dst {dw}x{dh} 格 ({row},{col})：叠加与拷贝取到的像素分岔了"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blit_over_leaves_the_transparent_part_of_the_cell_untouched() {
+        // 这条是叠加功能的正面判据：帽子的透明背景**不许**在本体身上打洞。
+        let a = half_transparent_atlas();
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        for px in dst.chunks_exact_mut(4) {
+            px.copy_from_slice(&[7, 8, 9, 255]); // 假设本体已经画好（不透明）
+        }
+        a.blit_over(0, 0, &mut dst, 4, 4, 4 * 4).expect("blit_over");
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let i = (y * 4 + x) as usize * 4;
+                if x < 2 {
+                    assert_eq!(&dst[i..i + 4], &[30, 20, 10, 255], "第 ({y},{x}) 该被盖住");
+                } else {
+                    assert_eq!(&dst[i..i + 4], &[7, 8, 9, 255], "第 ({y},{x}) 不许打洞");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blit_over_reports_the_same_bounds_errors_as_blit() {
+        let a = atlas_from_synthetic();
+        // 目标太小：两条路径必须同样拒绝（叠加分支最容易写成"失败就悄悄不叠"）
+        let mut dst = vec![0u8; 4 * 4 * 4 - 1];
+        assert!(matches!(
+            a.blit(0, 0, &mut dst, 4, 4, 4 * 4),
+            Err(AtlasError::Bounds { .. })
+        ));
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        assert!(
+            matches!(
+                a.blit_over(9, 0, &mut dst, 4, 4, 4 * 4),
+                Err(AtlasError::Bounds { .. })
+            ),
+            "越界行也要拒绝，不能当'这格没配件'放过"
+        );
+    }
+
+    #[test]
+    fn composite_over_is_exact_at_the_two_alpha_extremes() {
+        // 叠加实际只会撞上这两档：实体（不透明）与背景（全透明）
+        assert_eq!(
+            composite_over([1, 2, 3, 255], [9, 9, 9, 255]),
+            [1, 2, 3, 255],
+            "a=255 必须完全盖住"
+        );
+        assert_eq!(
+            composite_over([0, 0, 0, 0], [9, 8, 7, 200]),
+            [9, 8, 7, 200],
+            "a=0 必须原样留下底色"
+        );
+    }
+
+    #[test]
+    fn composite_over_rounds_to_nearest_not_down() {
+        // a=128 ⇒ keep=127；RGB = 64 + (200×127 + 127)/255 = 64 + 100 = 164，
+        // alpha 同式 = 128 + 100 = 228（预乘结果 164 ≤ 228，仍是合法预乘像素）。
+        // RGB 真值 163.6 ⇒ 截断会给 163，所以这条区分的是"取整方向"而不只是"大致对"。
+        assert_eq!(
+            composite_over([64, 64, 64, 128], [200, 200, 200, 200]),
+            [164, 164, 164, 228]
+        );
+    }
+
+    #[test]
+    fn composite_over_never_overflows_premultiplied_source() {
+        // 函数里那句 `as u8` 不带 clamp，靠的是这条上界：src ≤ a ⇒ s + (d·keep+127)/255
+        // ≤ a + (255−a) = 255。取**每个 a 的最坏合法输入**（s = a、d = 255）在 u32 里算，
+        // 确认它从不越过 255 ⇒ 转换无损、clamp 是给不可能发生的情况做的错误处理。
+        for a in 0u32..=255 {
+            let keep = 255 - a;
+            let want = a + (255 * keep + 127) / 255;
+            assert!(
+                want <= 255,
+                "a={a} 最坏合法输入算出 {want} ⇒ 那时才需要 clamp"
+            );
+            assert_eq!(
+                composite_over([a as u8; 4], [255; 4]),
+                [want as u8; 4],
+                "a={a}"
+            );
+        }
+    }
+
+    #[test]
+    fn premultiply_keeps_channel_below_alpha() {
+        // 上面那条的前提是"源是预乘的"。这里穷举 (通道值, alpha) 证明**生产端**确实交付
+        // 了它 —— 两条合起来才是不溢出的完整论证，只留上一条等于把前提当假设。
+        for a in 0u32..=255 {
+            for c in 0u32..=255 {
+                let [b, g, r, al] = premultiplied_bgra(c as u8, c as u8, c as u8, a as u8);
+                for ch in [b, g, r] {
+                    assert!(
+                        ch as u32 <= al as u32,
+                        "c={c} a={a} 时通道 {ch} 大于 alpha {al} ⇒ 不是预乘"
+                    );
+                }
+            }
+        }
     }
 }

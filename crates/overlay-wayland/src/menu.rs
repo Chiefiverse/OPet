@@ -28,6 +28,36 @@ pub enum MenuItem {
     Climb,
     Pause,
     Quit,
+    // ── 换装页 ──
+    /// 换到配件库里的下一件。**只在内存里挪一个下标**：没穿 ⇒ 什么都不重画；穿着 ⇒ 当场
+    /// 换成新选那件（一次释放 + 一次解码，内存档 M1 的"一次一件"不因此变成"一次两件"）。
+    /// 配件**由菜单选**而不是由命令行选 ⇒ 命令行只说"用哪个库"，具体穿哪件是屏上的活。
+    NextOutfit,
+    /// 把当前选中的那件叠上去（内存档 M1 = 一次一件 ⇒ 配件 sheet 到这一步才解码）。
+    Equip,
+    /// 丢掉配件、把穿透轮廓换回本体那份。
+    Unequip,
+    // ── 收藏册页 ──
+    /// 把"每档各拥有几种 / 共几种 + 重复 + 碎片"打到 stderr。**纯读**：不掷骰、不花钱、不改库。
+    Owned,
+    /// 把 catalog 里还没拿到的名字打到 stderr。名字来自 catalog ⇒ 这些字**已经在子集里**
+    /// （`everything_the_ui_can_render_is_in_the_codes_list` 那条门禁把 catalog 也纳进去了），
+    /// 所以这一行是换装页那条"配件名盖不住"的反面：它能上卡片，但本批仍只出 stderr，
+    /// 因为把变长的一列名字塞进 240×150 的卡片要动的是版式而不是这一行。
+    Missing,
+    /// 把账本最近若干次抽取打到 stderr（读 `gacha_pull`，不写）。
+    Recent,
+    // ── 设置页 ──
+    /// 循环 `full → reduce → off`。**只改本进程**，不写回 config.toml —— 与 [`Self::Lang`] 同一
+    /// 条理由（§7-R15：手写 reader 保不住用户注释）。
+    MotionTier,
+    /// 把公示概率打到 stderr。读的是 `rates.json` 那份**引擎推导**的公示（不掷骰 ⇒ 这一行
+    /// 跟"这次抽到了什么"无关，它读的是"承诺了什么"）。
+    Rates,
+    /// 跑一遍审计链复核并把结论打到 stderr。`Store::verify` 只读 ⇒ 这一行不需要确认步骤，
+    /// 这也是它进设置页而 `redeem_ssr` **不进**的唯一分界：后者花掉 120 碎片不可回退，
+    /// 而这块 surface 没有对话框（D14）。
+    Verify,
     // ── 不属于任何一页的控件 ──
     /// 标题条：点一下换到下一页。它画的字来自 [`MenuPage::header_text`]，不来自 [`Self::label`]。
     Page,
@@ -52,6 +82,15 @@ impl MenuItem {
             Self::Climb => lang.t(Key::Climb).to_string(),
             Self::Pause => lang.t(Key::Pause).to_string(),
             Self::Quit => lang.t(Key::Quit).to_string(),
+            Self::NextOutfit => lang.t(Key::NextOutfit).to_string(),
+            Self::Equip => lang.t(Key::Equip).to_string(),
+            Self::Unequip => lang.t(Key::Unequip).to_string(),
+            Self::Owned => lang.t(Key::Owned).to_string(),
+            Self::Missing => lang.t(Key::Missing).to_string(),
+            Self::Recent => lang.t(Key::Recent).to_string(),
+            Self::MotionTier => lang.t(Key::MotionTier).to_string(),
+            Self::Rates => lang.t(Key::Rates).to_string(),
+            Self::Verify => lang.t(Key::Verify).to_string(),
             Self::Lang => l10n::lang_row(lang),
             // **空串是故意的，不是一个待填的洞**：标题条上画的是"页名 + 页码"，那是**当前页**
             // 的函数而不是**这一项**的函数 ⇒ 正解在 [`MenuPage::header_text`]。这里随便返回
@@ -79,20 +118,45 @@ pub enum MenuPage {
     Gacha,
     /// 动作：走路 / 跑步 / 跳跃。
     Action,
-    /// 其它：爬墙 / 暂停 / 退出。退出放最后一页最后一行 ⇒ 误触退出至少两次点击
-    /// （翻页 + 点行），而翻页本身点错免费（循环）。
+    /// 其它：爬墙 / 暂停 / 退出。退出不在第一页 ⇒ 误触退出至少要两次点击（翻页 + 点行），
+    /// 而翻页本身点错免费（循环）。
     Misc,
+    /// 换装：换一件 / 穿上 / 脱下。三行**都真做事**，而"回到第一页"这件事交给标题条
+    /// ⇒ 不再占一行。
+    /// ⚠️ 它**不再**是"下一页就是首页"的那一页（六页里那一格现在是 [`Self::Settings`]），
+    /// 这句话的唯一用途曾经是解释"为什么没有第四行是返回"，而 `MenuItem::Back` 已经删了。
+    Dress,
+    /// 收藏册：已获得 / 还缺 / 最近。三行**全是读**（读 owned、读 catalog−owned、读账本尾 N 条），
+    /// 所以这一页没有"要不要确认"这个问题：按下去只可能多打几行 stderr，不可能花钱、
+    /// 不可能改库、不可能抽卡。
+    Collection,
+    /// 设置：动画 / 概率 / 复核。**明确不含**两件事，因为它们不是"一行字"能诚实表达的：
+    /// ① 保存设置到 `config.toml`（要 `toml_edit` writer，§9.2 第 19 条，还没建）；
+    /// ② 兑换 SSR（花 120 碎片不可回退，而这块 surface 没有对话框 ⇒ D14）。
+    /// 语言**也不在这一页** —— 它在 footer（`MenuItem::Lang`），复制一份进 rows 就是
+    /// `no_item_lives_on_two_pages` 那条门禁防的那个形状。
+    Settings,
 }
 
 impl MenuPage {
-    pub const ALL: [Self; 3] = [Self::Gacha, Self::Action, Self::Misc];
+    pub const ALL: [Self; 6] = [
+        Self::Gacha,
+        Self::Action,
+        Self::Misc,
+        Self::Dress,
+        Self::Collection,
+        Self::Settings,
+    ];
 
-    /// 循环到下一页（`Misc → Gacha` 回卷）。
+    /// 循环到下一页（`Settings → Gacha` 回卷）。
     pub fn next(self) -> Self {
         match self {
             Self::Gacha => Self::Action,
             Self::Action => Self::Misc,
-            Self::Misc => Self::Gacha,
+            Self::Misc => Self::Dress,
+            Self::Dress => Self::Collection,
+            Self::Collection => Self::Settings,
+            Self::Settings => Self::Gacha,
         }
     }
 
@@ -110,6 +174,9 @@ impl MenuPage {
             Self::Gacha => [MenuItem::Pull1, MenuItem::Pull10, MenuItem::Close],
             Self::Action => [MenuItem::Walk, MenuItem::Run, MenuItem::Jump],
             Self::Misc => [MenuItem::Climb, MenuItem::Pause, MenuItem::Quit],
+            Self::Dress => [MenuItem::NextOutfit, MenuItem::Equip, MenuItem::Unequip],
+            Self::Collection => [MenuItem::Owned, MenuItem::Missing, MenuItem::Recent],
+            Self::Settings => [MenuItem::MotionTier, MenuItem::Rates, MenuItem::Verify],
         }
     }
 
@@ -119,10 +186,14 @@ impl MenuPage {
             Self::Gacha => Key::PageGacha,
             Self::Action => Key::PageAction,
             Self::Misc => Key::PageMisc,
+            Self::Dress => Key::PageDress,
+            Self::Collection => Key::PageCollection,
+            Self::Settings => Key::PageSettings,
         }
     }
 
-    /// 标题条**左端**的字：页名 + ASCII 页码（`盲盒 1/3`）。
+    /// 标题条**左端**的字：页名 + ASCII 页码（`盲盒 1/6`）。分母取 [`Self::ALL`] 的长度 ⇒
+    /// 加一页不会留下一个没人改的 `3`。
     ///
     /// 页码是"标题条是个控件"的**唯一**视觉线索 —— 这块 surface 不吃键盘、没有 hover、
     /// 换不了 cursor 形状（D14），所以只能把线索画在字上（§9.2 第 14 条那一族）。
@@ -771,7 +842,7 @@ pub fn content_sig(
     }
     // 页与语言同属"运行中用户可改"那一族 ⇒ 与它为邻。这里用序号而不是字符串：页名是**文案**，
     // 换语言时字也换了，而那件事已经由上面的 `lang` 混进签名，用序号不会与它撞车，也不会
-    // 让"三页的页名恰好相同"这种未来的文案改动把两页混成一个签名。
+    // 让"各页的页名恰好相同"这种未来的文案改动把两页混成一个签名。
     mix(page.index() as u8);
     for b in frame.to_le_bytes() {
         mix(b);
@@ -1080,7 +1151,50 @@ mod tests {
                 assert_ne!(it, MenuItem::Page, "标题条是控件，不该占一行");
             }
         }
-        assert_eq!(all.len(), 9, "三页 × 三行 = 九个互不相同的可点项");
+        // 写死 12 而不是 `ALL.len() × 3`：后者在 `rows()` 返回 `[MenuItem; 3]` 之后是恒等式，
+        // 什么也不判。这个常量的作用是"**加一页就得来看过这张表**"—— 上面那条去重断言抓的是
+        // "同一项挂两页"，而这条抓的是"页变了而没人承认项的总数变了"。
+        assert_eq!(
+            all.len(),
+            18,
+            "六页 × 三行 = 十八个互不相同的可点项（盲盒 3 + 动作 3 + 其它 3 + 帽子 3 + 收藏 3 + 设置 3）"
+        );
+    }
+
+    /// 同一屏上不许有两个名字长得一样 —— **逐 locale 的字符串两两不等**，而不是"两个枚举值
+    /// 不同"（后者永远成立而读的人仍然看见两个一模一样的词）。
+    ///
+    /// 为什么要钉这条：**页名与行标签共用一张屏的两条带**，重复的词让人无法从文字判断
+    /// "点这行会做什么"，而翻页那个控件的目标就是一行文字。这条门禁直接逼出第 4 页改名的
+    /// 决定（页名取 `帽子` 而不是 `换装`，因为第一行是 `换一件` ⇒ 同屏两个"换"字开头）。
+    ///
+    /// ⚠️ 判据是**精确相等**，不是"包含"：`帽子` 与 `换一件` 该过，而 `语言 中文`（footer 整行）
+    /// 与 `语言`（键名单独看）也该过 —— 用子串规则会在第一秒就把合法文案判红，那种门禁会被
+    /// 人当噪音拆掉，比没有更糟。
+    #[test]
+    fn no_two_menu_names_are_the_same_word_in_any_locale() {
+        for lang in Lang::ALL {
+            // 六页页名 + 十八个行标签 + footer 那一行 = 25 个"此刻在屏幕上读得出的词"。
+            let mut names: Vec<(&'static str, String)> = Vec::new();
+            for page in MenuPage::ALL {
+                names.push(("page", lang.t(page.key()).to_string()));
+            }
+            for page in MenuPage::ALL {
+                for it in page.rows() {
+                    names.push(("row", it.label(lang)));
+                }
+            }
+            names.push(("footer", l10n::lang_row(lang)));
+
+            for (i, (kind_a, a)) in names.iter().enumerate() {
+                for (kind_b, b) in names.iter().skip(i + 1) {
+                    assert_ne!(
+                        a, b,
+                        "{lang:?}：{kind_a}「{a}」与 {kind_b}「{b}」同名 ⇒ 同一屏上两个词读起来是一件事"
+                    );
+                }
+            }
+        }
     }
 
     /// 翻页这个控件**只有标题条**：它的中心命中 `Page`，而它的矩形与任意页的任意一行、
@@ -1154,7 +1268,7 @@ mod tests {
     /// 语言行的几何证明（§4.4）：它在三行**之下**、在卡片**之内**，而且与行带不相交 ——
     /// 这条取代了"footer 只在 layout 里"的那种假前提。
     ///
-    /// ⚠️ **footer 的几何与页无关**（三页共用同一条带）⇒ 下面这段算术逐字不动，只有
+    /// ⚠️ **footer 的几何与页无关**（各页共用同一条带）⇒ 下面这段算术逐字不动，只有
     /// "恒三行"那一句搬进了页循环（它现在由 `[MenuItem; 3]` 保证）。
     #[test]
     fn footer_is_below_the_rows_and_inside_the_card() {
@@ -1885,7 +1999,7 @@ mod tests {
     /// card.rs 的 `menu_phase_inks_the_header_and_every_row` 逐张比标题带像素。
     #[test]
     fn a_page_switch_bumps_the_signature_exactly_once_and_a_dwell_never_does() {
-        // ① 三页两两互不相等（同页两次必须相等 ⇒ 签名是纯函数）。
+        // ① 逐页两两互不相等（同页两次必须相等 ⇒ 签名是纯函数）。
         for a in MenuPage::ALL {
             for b in MenuPage::ALL {
                 let sa = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, a, Motion::Full);
@@ -1897,7 +2011,10 @@ mod tests {
                 }
             }
         }
-        // 转一圈（Action → Misc → 回卷 Gacha）= 三次变化，不多不少（与 lang 那条同形）。
+        // 转一圈 = 每页一次变化，不多不少（与 lang 那条同形）。**路径由 `next()` 走**而不是写死
+        // 页名列表（写死的话，加一页而忘改 `next()` 会在这里静默少跑一页），而**次数写死 6**
+        // （`ALL.len()` 是恒等式，什么也不判）⇒ 加一页必须来看过这一条。
+        let mut page = MenuPage::Gacha;
         let mut prev = content_sig(
             &MenuAnim::Menu,
             100,
@@ -1907,14 +2024,20 @@ mod tests {
             Motion::Full,
         );
         let mut bumps = 0;
-        for p in [MenuPage::Action, MenuPage::Misc, MenuPage::Gacha] {
-            let now = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, p, Motion::Full);
+        for _ in 0..6 {
+            page = page.next();
+            let now = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, page, Motion::Full);
             if now != prev {
                 bumps += 1;
             }
             prev = now;
         }
-        assert_eq!(bumps, 3, "转一圈三页 = 三次内容变化，不多不少");
+        assert_eq!(
+            page,
+            MenuPage::Gacha,
+            "按六次标题条没回到第一页 ⇒ `next()` 的回卷与 `ALL` 脱节了"
+        );
+        assert_eq!(bumps, 6, "转一圈六页 = 六次内容变化，不多不少");
 
         // ② 停在 `Menu` 相放 300 tick：签名一个 bit 都不许动。
         for p in MenuPage::ALL {
@@ -1939,6 +2062,52 @@ mod tests {
                 "{p:?}：静止菜单放着 300 tick 换了 {commits} 次签名 ⇒ 每 tick 重投同一帧"
             );
         }
+    }
+
+    /// 翻页与换装页那一行钉死四件事，每件各自对应一种**加页时会塌而屏上不报错**的错法：
+    /// ① [`MenuPage::ALL`] 的第 0 项必须是 `Gacha`。菜单**开在第 0 页**是 `App` 里写死的
+    ///    `MenuPage::Gacha`（不是"取 `ALL[0]`"），而标题条的页码 `1/N` 又由 [`MenuPage::index`]
+    ///    得出 ⇒ 枚举顺序一改，"开在哪一页"和"页码写着几"就分家，而它照样换页、照样有像素，
+    ///    屏幕上没有任何一行会说出"第一页不是盲盒了"。
+    /// ② **每一页的签名必须互不相同** ⇒ "翻到了而画面不动"在结构上不可能。这一条抓的是
+    ///    `page` 没进 [`content_sig`]，而它一旦没进去，翻页就是一个能点而看不见的控件。
+    /// ③ `NextOutfit` 只许挂在 `Dress` ⇒ 别页不许有第二个"换一件"的入口。它是**换装这一页
+    ///    存在的理由**（配件由菜单选，不由命令行选），挂在两页上就是同一件事有两个入口。
+    /// ④ `Quit` 不许在 `Gacha` 上 —— 那是右键落地的默认页，"一次点击就退出"是这条决定想避免的
+    ///    那件事本身（`no_item_lives_on_two_pages` 抓的是重复挂载，抓不住"搬家搬到第一页"）。
+    #[test]
+    fn page_one_is_first_and_the_outfit_cycle_lives_on_one_page() {
+        assert_eq!(
+            MenuPage::ALL[0],
+            MenuPage::Gacha,
+            "`ALL[0]` 不再是 `Gacha` ⇒ 菜单开在第 0 页而标题条写着『1/N』的那一页不是第一页了"
+        );
+        for a in MenuPage::ALL {
+            let sig_a = content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, a, Motion::Full);
+            for b in MenuPage::ALL {
+                if a == b {
+                    continue;
+                }
+                assert_ne!(
+                    content_sig(&MenuAnim::Menu, 100, "", Lang::Zh, b, Motion::Full),
+                    sig_a,
+                    "{a:?} 与 {b:?} 签名相同 ⇒ 翻页没有画面变化（`page` 没进签名）"
+                );
+            }
+        }
+        let on: Vec<MenuPage> = MenuPage::ALL
+            .into_iter()
+            .filter(|p| p.rows().contains(&MenuItem::NextOutfit))
+            .collect();
+        assert_eq!(
+            on,
+            vec![MenuPage::Dress],
+            "`NextOutfit` 的挂载页必须恰好是 {on:?} ⇒ 它现在挂在换装页"
+        );
+        assert!(
+            !MenuPage::Gacha.rows().contains(&MenuItem::Quit),
+            "`Quit` 挪到了右键落地的默认页 ⇒ 一次点击就能退出，那条'至少两次点击'的代价没了"
+        );
     }
 
     #[test]

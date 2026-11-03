@@ -18,6 +18,14 @@
 /assets/pets/*/pet.json
 /assets/pets/*/polygon.json
 
+# 配件（D16 路线 B）烘焙产物：与本体那一族同理，可由 tools/bake.py --outfit-only +
+# tools/pack.py --accessory 完整重现，且走的是同一条专有 EULA 分发渠道（D8/D9）。
+# 名字与本体不同是因为 `app.rs::load_accessory` 要的清单叫 accessory.json。
+/assets/accessories/*/frames/
+/assets/accessories/*/sheet.webp
+/assets/accessories/*/accessory.json
+/assets/accessories/*/polygon.json
+
 # CLI 会话在本项目目录里落的工作产物，与代码无关
 /.qoder/
 

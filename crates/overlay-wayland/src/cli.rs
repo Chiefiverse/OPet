@@ -27,6 +27,16 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
   --motion TIER      动画强度：full / reduce / off。reduce = 开箱扩散缩到 1/4 且**不闪白**，
                      off = 整个跳过扩散（只减提交、不增）；两档都不动 dwell 与稀有度色带。
                      判据②「闪烁可关」就是这一条 —— 前庭敏感是硬需求，优先于音效
+
+配件（换装）：命令行**没有**开关，只有屏上那三行（换一件 / 穿上 / 脱下）。
+  库里有什么由启动时扫目录得出并逐件打进 stderr。库的位置只由环境决定：
+    $OPET_ACCESSORIES → $XDG_DATA_HOME/opet/accessories（仅当它是绝对路径）
+    → $HOME/.local/share/opet/accessories
+  一件配件 = 该目录下一个子目录里的三件套 `accessory.json` + `sheet.webp` + `polygon.json`
+  （生产者 = `tools/pack.py --accessory … --body <本体 pet.json>`）。清单逐项对齐本体
+  （格子/列数/行表/fps/循环标志），对不上就**点名是哪一档漂移并跳过这一件** —— 错位画在
+  屏上只是「帽子歪了」，永远不会有报错，所以只能在装备那一刻判（D16 路线 B 的地基）。
+  与旧版唯一不同：坏的一件被跳过而**不影响其余**，宠物照常起（硬约束 3）。
 ";
 
 #[derive(Debug, Default, PartialEq)]
@@ -85,6 +95,11 @@ impl Args {
                 "--db 给了空路径；不写真存档就别给 --db（默认是内存库 + DRYRUN 标）".to_string(),
             );
         }
+        // 配件不再从这里进来（`--accessory` 已删，用户 2026-11-02 原话"配件不是应该由菜单选择吗，
+        // 这也不合理"）。⇒ 这一层没有任何配件相关的分支可写：**库里少一件、坏一件都不会让进程
+        // 在这里拒绝启动**，那是 `app::discover_accessories` 的 stderr。留下的唯一形状是
+        // `--test-rect`：那条路径一行资产都不读，而配件是**叠在本体像素上**的 ⇒ 没有本体就没有
+        // 可叠的对象。这一条不靠命令行判，靠 `app::run()` 里 `body_regions` 是 `None`（见那里）。
         Ok(Options {
             manifest: self.manifest.clone(),
             seconds: match self.seconds {
@@ -237,6 +252,61 @@ mod tests {
         // 否则会映射一块永远不提交的空 surface
         let a = parse(&v(&[])).unwrap();
         assert!(a.options().is_err());
+    }
+
+    /// **`--accessory` 已经不存在**（用户 2026-11-02 原话"配件不是应该由菜单选择吗，这也不合理"
+    /// ⇒ 菜单是选配件的唯一入口）。删掉一个开关最容易留下的形状 = 帮助里还写着它，而解析器
+    /// 已经拒绝它，或反过来解析器还认而文档不说。所以两条都断：命令行走老命令必须**报错而不
+    /// 是静默忽略**（"我给了配件而它没穿"与"我没给"在屏上完全一样），而 USAGE 里不许再出现
+    /// 以 `--accessory` 开头的条目。
+    ///
+    /// 顺带把老命令的另外两种形状也钉住：它们原来各有一条专属拒绝，现在都归"未知参数"这一条。
+    #[test]
+    fn the_removed_accessory_flag_fails_loudly() {
+        for args in [
+            v(&["--manifest", "a.json", "--accessory", "b.json"]),
+            v(&["--manifest=a.json", "--accessory=b.json"]),
+            v(&["--test-rect", "--accessory=b.json"]),
+            v(&["--manifest", "a.json", "--accessory"]),
+        ] {
+            let err = parse(&args)
+                .err()
+                .unwrap_or_else(|| panic!("`--accessory` 已经删掉，{args:?} 不该还能解析成功"));
+            assert!(err.contains("未知参数"), "{args:?} ⇒ {err}");
+            assert!(err.contains("--accessory"), "错误要点名是哪个开关: {err}");
+        }
+        assert!(
+            !USAGE
+                .lines()
+                .any(|l| l.trim_start().starts_with("--accessory")),
+            "帮助里不许再广告一个解析器不认的开关"
+        );
+    }
+
+    /// **帮助里广告的每一个开关都真的存在** —— 本项目吃过 `--cell` 那条假开关（`--help` 里挂了
+    /// 一整轮而两处实现都拒收非默认值）。这条门禁把它换成可判的形状：USAGE 每一行**行首**那
+    /// 个 `--flag` 都必须被解析器认识（值缺失、值非法都不算，只算"这个开关存不存在"）。
+    ///
+    /// 只查行首：正文里提到的 `tools/pack.py --accessory` 是**生产者**的开关，不是这条命令的。
+    #[test]
+    fn every_flag_advertised_in_usage_exists() {
+        let advertised = USAGE
+            .lines()
+            .map(str::trim_start)
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|t| t.starts_with("--"))
+            .collect::<Vec<_>>();
+        assert!(
+            advertised.len() >= 10,
+            "一条都没扫到 ⇒ 这条门禁白跑: {advertised:?}"
+        );
+        for flag in advertised {
+            let err = parse(&v(&[flag])).err().unwrap_or_default();
+            assert!(
+                !err.contains("未知参数"),
+                "USAGE 广告了 {flag} 而解析器不认: {err}"
+            );
+        }
     }
 
     #[test]

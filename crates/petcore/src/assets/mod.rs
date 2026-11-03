@@ -1,8 +1,10 @@
 //! 资产清单与帧调度。像素解码（WebP/PNG）在 M2 接入，内核只处理元数据与"该显示哪一格"。
 
+pub mod accessory;
 pub mod manifest;
 pub mod scheduler;
 
+pub use accessory::AccessoryManifest;
 pub use manifest::{Grid, Manifest, ManifestError, SUPPORTED_FORMAT, StateTrack};
 pub use scheduler::{Scheduler, SpriteFrame};
 

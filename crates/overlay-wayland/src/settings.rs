@@ -85,6 +85,16 @@ impl Motion {
         let v = raw.trim().to_ascii_lowercase();
         Self::ALL.into_iter().find(|m| m.code() == v)
     }
+
+    /// 设置页那一行的循环顺序：full → reduce → off → full。与 [`Self::ALL`] 同序 ⇒
+    /// "屏幕上试的顺序"与"`--motion` 给的顺序"不会分家。
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Full => Self::Reduce,
+            Self::Reduce => Self::Off,
+            Self::Off => Self::Full,
+        }
+    }
 }
 
 /// 报错/出声时把支持的语言列出来。**由 `Lang::ALL` 生成**，不在字符串里手抄一遍

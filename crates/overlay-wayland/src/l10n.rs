@@ -116,12 +116,18 @@ impl Lang {
 /// 词表的所有键。加一个键 = 四列都要填 + 重跑 `ui_strings` 门禁 + 重裁字体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
-    /// 盲盒页的页名。三个页名一律 `Page*` ⇒ 标题条由 `MenuPage::key()` 选，不是常量。
+    /// 盲盒页的页名。六个页名一律 `Page*` ⇒ 标题条由 `MenuPage::key()` 选，不是常量。
     PageGacha,
     /// 动作页的页名
     PageAction,
     /// 其它页的页名
     PageMisc,
+    /// 换装页的页名
+    PageDress,
+    /// 收藏册页的页名
+    PageCollection,
+    /// 设置页的页名
+    PageSettings,
     Pull1,
     Pull10,
     Close,
@@ -136,8 +142,34 @@ pub enum Key {
     Pause,
     /// 退出宠物进程（`exit = true` ⇒ 走正常收尾，退出摘要照打）。
     Quit,
+    /// 换装页第一行 ⇒ 把候选表移到配件库里的下一件。**只在内存里挪一个下标**，所以这一行
+    /// 不解码也不释放 ⇒ 它换来的是"这一页能选哪件"，而"穿没穿"仍由下面两行决定。
+    /// 反馈只出在 stderr：选中的那件叫什么名字是用户内容，子集字体盖不住 ⇒ 不能上卡片。
+    NextOutfit,
+    /// 换装页第二行 ⇒ 把当前选中的那件叠上去（内存档 M1 ⇒ 到这一步才解码 sheet）。
+    /// **标签静态**，不做"已穿/未穿"两态：两态字面要把 `worn.is_some()` 送进 `content_sig`，而
+    /// 进了签名的字段就必须被画师读到（否则就是白投帧），换来的只是把同一行换个词。
+    Equip,
+    /// 换装页第三行 ⇒ 丢掉配件、把穿透轮廓换回本体那份。
+    Unequip,
     /// 语言行的标签
     Lang,
+    /// 收藏册第一行 ⇒ 把"每一档各拥有几种 / 共几种 + 重复数 + 碎片"打到 stderr。**这一行不掷骰、
+    /// 不花钱、不改库** ⇒ 它是纯读，所以它**不需要**结果卡相位，也就不参与 `content_sig`。
+    Owned,
+    /// 收藏册第二行 ⇒ 把 catalog 里还没拿到的那些个名字打到 stderr（名字来自 catalog ⇒ 已在子集里）。
+    Missing,
+    /// 收藏册第三行 ⇒ 把账本最近若干次抽取打到 stderr（读 `gacha_pull` 表，不写）。
+    Recent,
+    /// 设置第一行 ⇒ 循环 `full → reduce → off`。**只改本进程**，同 [`Self::Lang`] 一个道理：
+    /// 手写 reader 保不住注释 ⇒ 不写回 config.toml。
+    MotionTier,
+    /// 设置第二行 ⇒ 把公示概率打到 stderr。数据是 `rates.json`（引擎推导产物，不掷骰），
+    /// 所以这一行读的就是"公示牌上那几个数"，不是"这次抽到了什么"。
+    Rates,
+    /// 设置第三行 ⇒ 跑一遍审计链复核并把结论打到 stderr。**只读**（`verify` 不写回），
+    /// 所以它是"设置页第三行"而不是"某个要确认的操作"。
+    Verify,
     /// 新获得标
     New,
     /// 重复获得标
@@ -153,10 +185,13 @@ pub enum Key {
 }
 
 impl Key {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 32] = [
         Self::PageGacha,
         Self::PageAction,
         Self::PageMisc,
+        Self::PageDress,
+        Self::PageCollection,
+        Self::PageSettings,
         Self::Pull1,
         Self::Pull10,
         Self::Close,
@@ -166,7 +201,16 @@ impl Key {
         Self::Climb,
         Self::Pause,
         Self::Quit,
+        Self::NextOutfit,
+        Self::Equip,
+        Self::Unequip,
         Self::Lang,
+        Self::Owned,
+        Self::Missing,
+        Self::Recent,
+        Self::MotionTier,
+        Self::Rates,
+        Self::Verify,
         Self::New,
         Self::Dup,
         Self::Shards,
@@ -195,6 +239,31 @@ fn translations(k: Key, l: Lang) -> &'static str {
         (Key::PageMisc, Lang::En) => "Other",
         (Key::PageMisc, Lang::Ja) => "その他",
         (Key::PageMisc, Lang::Ko) => "기타",
+
+        // 页名取 **帽子** 而不是 **换装**：这一页第一行是「换一件」，两个词共用「换」⇒ 同一屏上
+        // 出现两个"看着像同一件事"的字，而它们一个改下标、一个写内存 —— 是两种不同的活。
+        // 页名换成这一页此刻唯一真有货的那件配件（`head` 槽 = catalog 里最多的一档，而量到的
+        // 挂点与烘出的配件都是帽子）⇒ 名字互不重复这条由
+        // `menu::tests::no_two_menu_names_are_the_same_word_in_any_locale` 钉住。
+        // ⚠️ 代价已量明：`帽 U+5E3D` 已在清单（catalog 的 `name` 里有），`子 U+5B50` 不在 ⇒
+        // **这一改是一次真字体重裁**（+1 码位），不是改一个字符串。
+        (Key::PageDress, Lang::Zh) => "帽子",
+        (Key::PageDress, Lang::En) => "Outfit",
+        (Key::PageDress, Lang::Ja) => "服装",
+        (Key::PageDress, Lang::Ko) => "의상",
+
+        // 收藏册与设置。en 用 `Album` 而不是 `Collection`：这块卡片宽 240 logical px，
+        // 标题条还要在同一行放页名 + 页码 + 右侧碎片/演示 ⇒ 短一支是一个像素的余量，
+        // 而"册子"这个含义在抽卡语境里本来就靠图鉴而不是收藏这个词承担。
+        (Key::PageCollection, Lang::Zh) => "收藏",
+        (Key::PageCollection, Lang::En) => "Album",
+        (Key::PageCollection, Lang::Ja) => "図鑑",
+        (Key::PageCollection, Lang::Ko) => "도감",
+
+        (Key::PageSettings, Lang::Zh) => "设置",
+        (Key::PageSettings, Lang::En) => "Settings",
+        (Key::PageSettings, Lang::Ja) => "設定",
+        (Key::PageSettings, Lang::Ko) => "설정",
 
         (Key::Pull1, Lang::Zh) => "抽一次",
         (Key::Pull1, Lang::En) => "Pull 1",
@@ -225,7 +294,7 @@ fn translations(k: Key, l: Lang) -> &'static str {
 
         (Key::Jump, Lang::Zh) => "跳跃",
         (Key::Jump, Lang::En) => "Jump",
-        (Key::Jump, Lang::Ja) => "ジッャンプ",
+        (Key::Jump, Lang::Ja) => "ジャンプ",
         (Key::Jump, Lang::Ko) => "점프",
 
         (Key::Climb, Lang::Zh) => "爬墙",
@@ -243,10 +312,66 @@ fn translations(k: Key, l: Lang) -> &'static str {
         (Key::Quit, Lang::Ja) => "終了",
         (Key::Quit, Lang::Ko) => "종료",
 
+        // 换装页三行。后两行是一对反义动作 ⇒ 四语言都成对（穿上/脱下、着る/脱ぐ、착용/해제），
+        // 而 ja 那两支守上面那条"动词用辞书形"；第一行是**选择**而不是动作对（ja 取名词
+        // `着替え`），因为这一页做的事 = 从配件库里挑一件再穿上。"回第一页"交给标题条
+        // （`Dress.next() == Gacha`）⇒ 恒三行逼出来的那第三格现在被真活占了，不是凑数。
+        (Key::NextOutfit, Lang::Zh) => "换一件",
+        (Key::NextOutfit, Lang::En) => "Change",
+        (Key::NextOutfit, Lang::Ja) => "着替え",
+        (Key::NextOutfit, Lang::Ko) => "교체",
+
+        (Key::Equip, Lang::Zh) => "穿上",
+        (Key::Equip, Lang::En) => "Wear",
+        (Key::Equip, Lang::Ja) => "着る",
+        (Key::Equip, Lang::Ko) => "착용",
+
+        (Key::Unequip, Lang::Zh) => "脱下",
+        (Key::Unequip, Lang::En) => "Remove",
+        (Key::Unequip, Lang::Ja) => "脱ぐ",
+        (Key::Unequip, Lang::Ko) => "해제",
+
         (Key::Lang, Lang::Zh) => "语言",
         (Key::Lang, Lang::En) => "Language",
         (Key::Lang, Lang::Ja) => "言語",
         (Key::Lang, Lang::Ko) => "언어",
+
+        // 收藏册三行。三行**都是读**而不是写（读 owned / 读 catalog−owned / 读账本尾 N 条），
+        // 所以都不需要确认步骤，也不进 `content_sig`（画面一个字不变，变的只是 stderr）。
+        // 标签取"这一行读出什么"这一族名词，不取动词：菜单里唯一会改状态的动作行（穿上/脱下）
+        // 已经在换装页用动词，这一页混进动词就会让人以为点它会抽卡。
+        (Key::Owned, Lang::Zh) => "已获得",
+        (Key::Owned, Lang::En) => "Owned",
+        (Key::Owned, Lang::Ja) => "入手",
+        (Key::Owned, Lang::Ko) => "획득",
+
+        (Key::Missing, Lang::Zh) => "还缺",
+        (Key::Missing, Lang::En) => "Missing",
+        (Key::Missing, Lang::Ja) => "未入手",
+        (Key::Missing, Lang::Ko) => "미수집",
+
+        (Key::Recent, Lang::Zh) => "最近",
+        (Key::Recent, Lang::En) => "Recent",
+        (Key::Recent, Lang::Ja) => "最近",
+        (Key::Recent, Lang::Ko) => "최근",
+
+        // 设置三行。`MotionTier` 这一行是**循环器**（full → reduce → off → full），标签是它循环的
+        // 那个**维度名**而不是当前值：把当前值写进标签就是两态字面 ⇒ 要进签名、要人读，
+        // 而这一行按下的瞬间画面本来就不变（`Menu` 相的 frame 恒 0）。值只出 stderr。
+        (Key::MotionTier, Lang::Zh) => "动画",
+        (Key::MotionTier, Lang::En) => "Motion",
+        (Key::MotionTier, Lang::Ja) => "動き",
+        (Key::MotionTier, Lang::Ko) => "움직임",
+
+        (Key::Rates, Lang::Zh) => "概率",
+        (Key::Rates, Lang::En) => "Rates",
+        (Key::Rates, Lang::Ja) => "確率",
+        (Key::Rates, Lang::Ko) => "확률",
+
+        (Key::Verify, Lang::Zh) => "复核",
+        (Key::Verify, Lang::En) => "Verify",
+        (Key::Verify, Lang::Ja) => "検証",
+        (Key::Verify, Lang::Ko) => "검증",
 
         (Key::New, Lang::Zh) => "新",
         (Key::New, Lang::En) => "NEW",
@@ -281,7 +406,7 @@ fn translations(k: Key, l: Lang) -> &'static str {
         // 冒号形状各随其文：中日全角、英韩半角。两种都要进子集（`：` 不是 ASCII）。
         (Key::ErrorPrefix, Lang::Zh) => "抽取失败：",
         (Key::ErrorPrefix, Lang::En) => "Pull failed: ",
-        (Key::ErrorPrefix, Lang::Ja) => "引出し失敗：",
+        (Key::ErrorPrefix, Lang::Ja) => "抽出失敗：",
         (Key::ErrorPrefix, Lang::Ko) => "뽑기 실패: ",
     }
 }

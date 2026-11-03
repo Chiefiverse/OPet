@@ -7,14 +7,23 @@
 //! 1. 图集格变了 ⇒ 新 buffer + `damage_buffer` + `set_input_region` + `commit`；
 //! 2. 只有位置变了 ⇒ 只改 layer margin + `commit`（不附新 buffer）；
 //! 3. 都没变 ⇒ 什么都不发。
+//!
+//! 装备了配件（换装页"穿上"，D16 路线 B）时，第 1 档画的那一格是**本体先覆盖、配件后
+//! source-over**（`blit_cell`），而 `set_input_region` 用的是装备那一刻算好一次的**并集**
+//! （[`Regions::merged_with`]）。⇒ 分档判据与每档提交次数一个字都没变，变的只是那一格的内容与
+//! 那块 region 的矩形集合。配件的**选择**没有命令行入口，只有屏上那三行（用户原话
+//! "配件不是应该由菜单选择吗，这也不合理"）；库里有什么在启动时扫出来并打进 stderr。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use petcore::assets::Manifest;
+use petcore::assets::{AccessoryManifest, Manifest};
+use petcore::behavior::AssetKey;
 use petcore::behavior::config::{Action, BehaviorConfig};
 use petcore::behavior::machine::Command;
-use petcore::gacha::{Catalog, Currency, GachaParams, Rarity};
+use petcore::gacha::{
+    Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, Rarity, RatesFile, percent_str,
+};
 use petcore::geom::{Rect, Vec2};
 use petcore::intent::{PresentationIntent, SURFACE_MARGIN};
 use petcore::sim::{Sim, TICK_HZ};
@@ -283,6 +292,42 @@ fn attribute_of(source: Source, outcome: Tick) -> Option<Tick> {
     }
 }
 
+/// 配件库里的一件**候选**（= 目录里那份 `accessory.json` 加上它同目录的 `polygon.json`）。
+///
+/// 这里刻意**没有图集像素**，只有元数据与轮廓：内存档 M1 说"配件那份 sheet 不在常驻预算里"，
+/// 而启动时把库里每一件都解码就是把 M1 当场变成"全部常驻"。⇒ 一次启动读进内存的只有
+/// 几 KB 的清单与轮廓表，像素归 [`Equipped`]（穿了才存在，脱了就没）。
+///
+/// `merged` 是**启动时就算好**的并集轮廓，不是穿上那一刻才算：四道门禁里除解码之外的一切
+/// （网格/行表/fps/loop 一致、每格有轮廓、轮廓几何能并）都是纯元数据比对，放在启动做
+/// ⇒ [`App::equip`] 的唯一失败模式只剩"sheet 解不开"。把一件坏配件的判定推迟到用户
+/// 点下那一行，等于让屏上一个能点而没有反馈的控件（本项目对假按钮的一贯立场）。
+#[derive(Debug)]
+struct Candidate {
+    slug: String,
+    /// 三件套所在目录（`sheet.webp` 与 `accessory.json` 同目录 = 生产者 `pack.py --accessory` 的约定）。
+    dir: std::path::PathBuf,
+    manifest: AccessoryManifest,
+    /// 本体轮廓 ∪ 这件配件的轮廓 ⇒ 穿上 = 把 [`App::regions`] 换成它（一次性的事实，不重算）。
+    merged: Regions,
+}
+
+/// 装备中的一件配件（D16 路线 B = **运行时逐格叠加**）。内存档 **M1 = 一次一件**，
+/// 所以"有没有穿"就是这一个 `Option`：穿了 ⇒ 它的 sheet 在内存里；脱了 ⇒ 整个丢掉。
+///
+/// 两个字段必须**同时存在**才画得对（清单说这一档烘没烘过、图集供像素），所以挤在一个结构里
+/// 而不是铺成 `App` 上的两个 `Option` —— 后者能表示"有清单没像素"这种一画就错的组合。
+///
+/// ⚠️ 这里**没有 `regions`**：配件的穿透矩形在装备那一刻就已经并进 [`App::regions`] 了
+/// （[`Candidate::merged`]，它在启动时由 [`Regions::merged_with`] 算好）。并集是一次性的事实，
+/// 不是每次出图、也不是每次装卸都要重算的东西。
+/// ⚠️ 这里也**没有 `dir`**：像素已经在这里了，而回源目录只有卸下重穿时才有用 ⇒ 那是
+/// [`Candidate`] 的职责，混进来就会有两个"这件配件从哪来"。
+struct Equipped {
+    manifest: AccessoryManifest,
+    atlas: Atlas,
+}
+
 /// 客户端侧的呈现器。`present` 的语义与 [`petcore::render::OverlayBackend`] 一致，但所有权方向
 /// 相反：M4 竖切片是客户端进程内驱动内核，`OverlayBackend` 的契约实现留给
 /// "守护进程 spawn overlay 子进程"那一版（那时 `present` 由 IPC 线程调用）。
@@ -310,7 +355,23 @@ pub struct App {
 
     manifest: &'static Manifest,
     atlas: Option<Atlas>,
+    /// **本体自己那份**穿透轮廓，永远不含配件 ⇒ 脱装的复原就是把它换回 [`Self::regions`]。
+    /// 存两份而不是"脱装时重读 `polygon.json`"：重读会失败（文件可能已被搬走），而失败发生在
+    /// 用户刚点完"脱下"的那一刻 —— 一份几 KB 的表换来一条不可能失败的复原路径。
+    body_regions: Option<Regions>,
+    /// **已经并好配件轮廓**的那份区域表（没穿配件时就是本体那份，逐位不变）。
     regions: Option<Regions>,
+    /// 配件库（启动时扫过四道门禁、**一像素未解**的那几件）；空 = 库里没一件能用。
+    ///
+    /// 换装页的"换一件"就是在这个表里挪下标 ⇒ 它必须**不含像素**，否则"浏览一下库"
+    /// 会把 M1 那条"一次一件"的档吃光。
+    candidates: Vec<Candidate>,
+    /// [`Self::candidates`] 里当前选中的下标。**只在换装页被读到（画面上没有它）**，
+    /// 所以它不进 `menu::content_sig`：没穿东西时点"换一件"，屏上一个像素都没变，
+    /// 签名跟着变就是白投一帧（`69fd158` 那个形状的反面用法）。
+    picked: usize,
+    /// 装备中的配件；`None` = 不叠，出图路径与没有配件时逐字节相同。
+    worn: Option<Equipped>,
 
     sim: Option<Sim<'static>>,
     stage: Option<String>,
@@ -475,6 +536,132 @@ impl Gacha {
         );
         Ok((lines, best, balance))
     }
+
+    /// 「已获得」那一行：每档各拿到几种 / 该档共几种，加重复总数与余额。
+    ///
+    /// **纯读**：不掷骰、不花钱、不改库 —— 这是它能进菜单而 `redeem_ssr`（花掉 120 碎片、
+    /// 不可回退，而这块 surface 没有对话框，D14）不能进的分界。
+    ///
+    /// 分母取 **catalog** 而不是库存行数 ⇒ "还缺多少"这件事在这一行就读得出来（`n/total`），
+    /// 而库存自己只能回答"有什么"。重复数按 `count − 1` 累加：第一件不算重复，哪怕它躺在
+    /// 库存里 —— 这是 §3.6 的折算口径（第 2 件起才折碎片），不是我在省一次查询。
+    fn collection_lines(&self) -> Result<Vec<String>, String> {
+        let owned = self.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
+        let mut lines = Vec::with_capacity(Rarity::ALL.len() + 1);
+        let mut dup = 0u64;
+        let mut kinds = 0usize;
+        let mut total = 0usize;
+        for r in Rarity::ALL {
+            let mut have = 0usize;
+            let mut all = 0usize;
+            for item in self.catalog.items_of(r) {
+                all += 1;
+                if owned.contains(&item.id) {
+                    have += 1;
+                    let n = self
+                        .store
+                        .item_count(&item.id)
+                        .map_err(|e| format!("读 {} 的件数失败: {e}", item.id))?;
+                    dup += n.saturating_sub(1);
+                }
+            }
+            kinds += have;
+            total += all;
+            lines.push(format!("{} {have}/{all}", r.as_str()));
+        }
+        lines.push(format!(
+            "共 {kinds}/{total} · 重复 {dup} · 碎片 {}",
+            self.balance()
+        ));
+        Ok(lines)
+    }
+
+    /// 「还缺」那一行：catalog 里还没拿到的**名字**，按档分组。
+    ///
+    /// 名字来自 catalog ⇒ 这些字**已经在字体子集里**（`everything_the_ui_can_render_is_in_the_
+    /// codes_list` 那条门禁把 catalog 也纳进去了），所以这一行换装页那条"配件名盖不住"的反面：
+    /// 它真的能上卡片。本批仍只出 stderr，因为把变长的一列名字塞进 240×150 要动的是版式
+    /// 而不是这一行（`fit` 会截断，而"截不断"是另一件事，得看图才知道）。
+    fn missing_lines(&self) -> Result<Vec<String>, String> {
+        let owned = self.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
+        let mut lines = Vec::new();
+        for r in Rarity::ALL {
+            let names: Vec<&str> = self
+                .catalog
+                .items_of(r)
+                .filter(|i| !owned.contains(&i.id))
+                .map(|i| i.name.as_str())
+                .collect();
+            if !names.is_empty() {
+                lines.push(format!("{} {}", r.as_str(), names.join(" ")));
+            }
+        }
+        if lines.is_empty() {
+            lines.push("catalog 里的都拿到了".to_string());
+        }
+        Ok(lines)
+    }
+
+    /// 「最近」那一行：账本最后 `n` 次抽取。**只读 `gacha_pull`，一个字都不写**。
+    ///
+    /// ⚠️ **不印时间**：`ts` 是 unix 秒，而这个 crate 没有任何日期格式化依赖（引一个只为把
+    /// 一串数字变好读，代价是 `Cargo.lock` 与 D8 那条许可证核对）。印 `seq` 而不是 `ts`：
+    /// 序号是账本自己的顺序、可重放、可和 `audit verify` 的 `len` 对上，而墙钟秒数在屏幕上
+    /// 也读不出"几点"。
+    ///
+    /// 一次全表读（`rows` 没有 LIMIT）换来的是"这一条路径与 `audit verify` 走的是同一个
+    /// 查询" ⇒ 少一个口径。点击驱动、不是每 tick 轮询（§4 那条禁止）。
+    fn recent_lines(&self, n: usize) -> Result<Vec<String>, String> {
+        let rows = self
+            .store
+            .rows(petstore::DEFAULT_PROFILE, petstore::DEFAULT_BANNER)
+            .map_err(|e| format!("读账本失败: {e}"))?;
+        if rows.is_empty() {
+            return Ok(vec![
+                "账本还是空的（这一轮没抽过，或抽的没落库）".to_string(),
+            ]);
+        }
+        let from = rows.len().saturating_sub(n);
+        Ok(rows[from..]
+            .iter()
+            .map(|r| {
+                let name = self
+                    .catalog
+                    .find(&r.item_id)
+                    .map(|i| i.name.as_str())
+                    .unwrap_or(r.item_id.as_str());
+                format!(
+                    "#{seq} {rar} {name}{dup} +{shards}",
+                    seq = r.seq,
+                    rar = r.rarity.as_str(),
+                    dup = if r.duplicate { " 重复" } else { "" },
+                    shards = r.shards_gained,
+                )
+            })
+            .collect())
+    }
+
+    /// 「复核」那一行：审计链全链校验 + 用**库里的** seed 与公示参数重放。
+    ///
+    /// `Store::verify` 只读 ⇒ 这一行不需要确认步骤（同 [`Self::collection_lines`] 那条分界）。
+    /// 报红的时候**只报错**，不报"通过了一半"：一条链要么自洽要么不自洽，中间态不存在。
+    fn verify_lines(&self) -> Result<Vec<String>, String> {
+        let report = self
+            .store
+            .verify(
+                &self.catalog,
+                petstore::DEFAULT_PROFILE,
+                petstore::DEFAULT_BANNER,
+            )
+            .map_err(|e| format!("复核不过: {e}"))?;
+        Ok(vec![
+            format!("链长 {} · 链头 {}", report.len, report.head_hex()),
+            format!(
+                "N={} R={} SR={} SSR={} ⇒ 全部对上了（链自洽 + 按库里的 seed 重放一致）",
+                report.counts[0], report.counts[1], report.counts[2], report.counts[3]
+            ),
+        ])
+    }
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -504,7 +691,20 @@ pub fn run(opts: Options) -> Result<(), String> {
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm 不可用: {e}"))?;
 
     let manifest = load_manifest(&opts)?;
-    let (atlas, regions) = load_asset(&opts, manifest)?;
+    let (atlas, body_regions) = load_asset(&opts, manifest)?;
+    // 配件库在启动时**只读元数据**（清单 + 轮廓 + 四道门禁里除解码之外的全部），一像素不解，
+    // 于是 `regions` 起手就是本体那份 —— 出图路径上没有"这份区域含不含配件"这个问题。
+    //
+    // ⚠️ 本体那份是**借出去**的（`as_ref()`）：[`Regions::merged_with`] 新造对象，而 discovery
+    // 全程只读它 ⇒ 零拷贝、"未穿的真值"那份自然原样。
+    let candidates = match (accessory_root(), &body_regions) {
+        (Some(root), Some(body)) => discover_accessories(&root, manifest, body),
+        // 本体没像素（`--test-rect` / 内置 fixture 不读盘的那条路）⇒ 没有可叠之物，库里有什么
+        // 都一样；`asset:` 那行已经说明了这轮不读像素，这里不再补一行噪音。
+        // `$HOME` 与 `$XDG_DATA_HOME` 都读不到 ⇒ **没有库**，同上：换件表空，不是错误。
+        _ => Vec::new(),
+    };
+    let regions = body_regions.clone();
     let logical = (
         manifest.grid.w + (SURFACE_MARGIN as u32) * 2,
         manifest.grid.h + (SURFACE_MARGIN as u32) * 2,
@@ -581,7 +781,11 @@ pub fn run(opts: Options) -> Result<(), String> {
         qh: Some(qh),
         manifest,
         atlas,
+        body_regions,
         regions,
+        candidates,
+        picked: 0,
+        worn: None,
         sim: None,
         stage: opts.monitor.clone(),
         opts,
@@ -689,6 +893,249 @@ fn load_asset(
         regions.frame_count(),
     );
     Ok((Some(atlas), Some(regions)))
+}
+
+/// 配件库在哪 —— **只由环境决定，命令行没有第二个入口**（用户 2026-11-02 的原话"配件不是应该由
+/// 菜单选择吗，这也不合理" ⇒ `--accessory` 整个删掉，穿哪件是屏上的活）。
+///
+/// 优先级照 `petstore::paths` 里 `opet.db` 那一条走：显式覆盖 > `$XDG_DATA_HOME/opet/accessories`
+/// （**只在它是绝对路径时**才算数 —— 相对值会让"库在哪"取决于当前目录，而宠物由 autostart 拉起、
+/// 它的 cwd 不是任何人意义上的事实）> `$HOME/.local/share/opet/accessories`。
+///
+/// 返回 `Option` 而不是直接 `PathBuf`：`$HOME` 都读不到（裸 `env -i` 的 CI）时**没有库**，
+/// 不去猜一个根目录下的 `/.local/share`。那一档下换装页三行照样画出来、照样点得到，
+/// 只是"穿上"打一行"库里没有可用配件"——**没有东西可穿不等于没有这个功能**。
+fn accessory_root() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("OPET_ACCESSORIES") {
+        if !p.is_empty() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    let base = match std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from) {
+        Some(p) if p.is_absolute() => p,
+        _ => std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))?,
+    };
+    Some(base.join("opet").join("accessories"))
+}
+
+/// [`discover_accessories`] 的内层：一个目录 → 一件候选，或一句点名它错在哪的说明。
+///
+/// 单列成函数有两个理由：① `dir` 在这里只被**借走**（`&Path`），调用方随后还要拿它打"跳过谁"
+/// 那行；写成闭包就得 move 进去，错误分支反而读不到名字。② `tests/accessory_product.rs` 要照
+/// 同一套顺序走**真产物**，收一个 `&Path` 比收一整个库目录更好摆。
+fn check_accessory(
+    dir: &std::path::Path,
+    body: &Manifest,
+    body_regions: &Regions,
+) -> Result<Candidate, String> {
+    let path = dir.join("accessory.json");
+    let name = path.to_str().ok_or("配件清单路径不是 UTF-8")?;
+    let acc = AccessoryManifest::load(name).map_err(|e| format!("清单 {name} 加载失败: {e}"))?;
+    acc.validate_against(body)
+        .map_err(|e| format!("拒绝配件 {}（{e}）", acc.slug))?;
+    let polygon = dir.join("polygon.json");
+    let acc_regions = Regions::load(
+        polygon.to_str().ok_or("配件 polygon 路径不是 UTF-8")?,
+        acc.grid.w,
+        acc.grid.h,
+        SURFACE_MARGIN,
+    )
+    .map_err(|e| format!("{}: {e}", polygon.display()))?;
+    // 配件**会被画到的每一格**都必须有自己的轮廓条目。缺格的后果不是报错，而是"那一格帽子照样
+    // 上屏、而 `wl_region` 的并集里没有它" ⇒ 那块像素点不到（三条真机人工门禁守的正是这件事）。
+    let cells = acc.drawn_cells();
+    if let Some(missing) = acc_regions.first_missing(&cells) {
+        return Err(format!(
+            "配件 {} 的 polygon.json 没有格 ({},{})：清单声明了 {} 格而轮廓只有 {} 格 \
+             ⇒ 那一格会画出点不到的像素",
+            acc.slug,
+            missing.0,
+            missing.1,
+            cells.len(),
+            acc_regions.frame_count()
+        ));
+    }
+    let merged = body_regions
+        .merged_with(&acc_regions)
+        .map_err(|e| format!("拒绝配件 {}: {e}", acc.slug))?;
+    Ok(Candidate {
+        slug: acc.slug.clone(),
+        dir: dir.to_path_buf(),
+        manifest: acc,
+        merged,
+    })
+}
+
+/// 启动时扫一遍配件库 ⇒ 换装页能选的那张表（**元数据 + 并集轮廓，一像素未解**）。
+///
+/// 四道门禁与旧的显式路径版同一套、同一顺序（便宜的在前），只把**第五道 = 解码**挪进
+/// [`App::equip`]。这条不是洁癖：`VmHWM` 是**高水位**，启动时"每件解码一次再丢掉"与"全部常驻"
+/// 给出同一个峰值（实测 59,164 kB，越过了用户签的未装备配件那条 57,344 kB）。
+///
+/// 顺序不是审美：`validate_against` 是纯元数据比对，而 sheet 解码是几十毫秒和几 MiB。把它放在
+/// 门禁之前，等于让"格子尺寸对不上"这种一行就能判出来的错先付一次装载代价 —— 而那条错恰恰是
+/// D16 路线 B 唯一真正防的东西（"偏移恒为 0"一旦被违反，屏上只是帽子画歪，永远不会报错）。
+///
+/// ⚠️ **这里一个 `Err` 都不出**，和显式路径那版最大的语义区别就在这里：库里一个坏文件的后果是
+/// "少一件可穿"，不是"宠物起不来"（硬约束 3）。每条跳过打一行**点名是哪件、错在哪一道**的 stderr
+/// ⇒ 少了什么用户看得见，而不是在屏上找一个不存在的行。
+///
+/// 生产者 = `tools/pack.py --accessory`（产 `accessory.json` + `sheet.webp` + `polygon.json`
+/// 三件同目录）。这几道门禁在**真产物**上的证据 = `tests/accessory_product.rs`，它照本函数的
+/// 顺序走一遍；那条 ⑤′ 把"帽子画出来了而点不到"钉成了像素与轮廓同空同满。
+fn discover_accessories(
+    root: &std::path::Path,
+    body: &Manifest,
+    body_regions: &Regions,
+) -> Vec<Candidate> {
+    let mut found: Vec<Candidate> = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!(
+                "accessories: 库 {} 打不开（{e}）⇒ 换装页「穿上」点了不会有效果",
+                root.display()
+            );
+            return found;
+        }
+    };
+    // 目录名参与排序：`read_dir` 的顺序由文件系统给，同一台机器上两次启动可能不同 ⇒
+    // 换装页的"换一件"循环会把用户从一个配件直接跳到另一个不相干的配件。
+    let mut dirs: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("accessory.json").is_file())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        // —— 逐件把四道门禁走完；任一道的错都只让**这一件**出局，并点名它是哪一件。
+        match check_accessory(&dir, body, body_regions) {
+            Ok(cand) => {
+                // **覆盖哪些状态**必须打出来，而且缺的时候要把缺的点名。这条行是本轮唯一的
+                // "为什么有些动作看不到帽子"的出口：清单只声明 `idle` 是一件**合法**的配件
+                // （`covers()` 为假 ⇒ `blit_cell` 按设计不叠），而它上屏后的形状与"叠加坏了"
+                // 一模一样，只有这一行分得开两者。
+                let all = AssetKey::ALL;
+                let have: Vec<&str> = all
+                    .iter()
+                    .filter(|k| cand.manifest.covers(**k))
+                    .map(|k| k.as_str())
+                    .collect();
+                if have.len() == all.len() {
+                    eprintln!(
+                        "accessories:   {} 叠 {:?} 档 · 覆盖 {}/{} 状态 · 轮廓 {} 格 · sheet 未解（穿上才读）",
+                        cand.slug,
+                        cand.manifest.slot,
+                        have.len(),
+                        all.len(),
+                        cand.merged.frame_count()
+                    );
+                } else {
+                    let miss: Vec<&str> = all
+                        .iter()
+                        .filter(|k| !cand.manifest.covers(**k))
+                        .map(|k| k.as_str())
+                        .collect();
+                    eprintln!(
+                        "accessories:   {} 叠 {:?} 档 · 覆盖 {}/{} 状态 ⇒ **只有这 {} 档会看到它**（缺 {}）\
+                         · 轮廓 {} 格 · sheet 未解（穿上才读）",
+                        cand.slug,
+                        cand.manifest.slot,
+                        have.len(),
+                        all.len(),
+                        have.len(),
+                        miss.join(","),
+                        cand.merged.frame_count()
+                    );
+                }
+                found.push(cand);
+            }
+            Err(err) => eprintln!(
+                "accessories: 跳过 {}（{}）⇒ 这一件不进换装页，其余不受影响",
+                dir.display(),
+                err
+            ),
+        }
+    }
+    eprintln!(
+        "accessories: 库 {} ⇒ {} 件可用{}",
+        root.display(),
+        found.len(),
+        if found.is_empty() {
+            "（「穿上」不会有效果；把 `pack.py --accessory` 的三件套放进这里）"
+        } else {
+            ""
+        }
+    );
+    found
+}
+
+/// **到这一步才解码**第二张 sheet ⇒ [`App::equip`] 是内存档 M1 唯一的执行点。
+///
+/// 只剩一道可能失败 = sheet 读不开。轮廓并集已经在 [`discover_accessories`] 算过并存的
+/// [`Candidate::merged`] 里，所以"点了穿上而屏上没帽子"与"点了穿上而帽子点不到"这两种形状
+/// 在这一层都构造不出来（后者正是上面那条 `first_missing` 守的东西）。
+fn decode(cand: &Candidate) -> Result<Equipped, String> {
+    let sheet = cand.dir.join("sheet.webp");
+    let acc = &cand.manifest;
+    let atlas = Atlas::load(
+        sheet.to_str().ok_or("配件 sheet 路径不是 UTF-8")?,
+        acc.grid.cols as u32,
+        acc.grid.rows as u32,
+        acc.grid.w,
+        acc.grid.h,
+    )
+    .map_err(|e| format!("{}: {e}", sheet.display()))?;
+    eprintln!(
+        "accessory: 穿上 {}（{}x{} {} KB → 解码 {} ms / {:.3} MiB）",
+        acc.slug,
+        atlas.width,
+        atlas.height,
+        atlas.encoded_bytes / 1024,
+        atlas.decode_ms,
+        atlas.decoded_bytes() as f64 / (1024.0 * 1024.0),
+    );
+    Ok(Equipped {
+        manifest: acc.clone(),
+        atlas,
+    })
+}
+
+/// 把"这一格该画什么"从 wayland 的 buffer 里剥出来，写进调用方给的字节切片。
+///
+/// 为什么是自由函数：它**不碰任何 wayland 类型**（`dst` 就是 `&mut [u8]`），而它做的两个决定
+/// —— "没烘过这档状态就不叠"与"叠加失败 ⇒ 整格作废" —— 恰恰是 headless 唯一能验的那部分。
+/// 留在 `draw_cell` 里，这两条就只能靠"代码写在那儿"，而本项目两条 P0 全是这种形状炸出来的。
+///
+/// `body` / `worn` 都是 `Option`：`--test-rect` 那一档两份图集都没有（画纯色矩形），
+/// 没装备配件时只有本体。顺序恒为"本体先覆盖、配件后 source-over"，反过来帽子会变透明底。
+///
+/// 配件那支的 `covers(key)` 那道门是**数据决定的可见性**：一份只声明 `idle` 的配件，在
+/// `walk` 那 4 行就是不叠。这不是 bug 也不是"没画出来"，所以它必须在启动时被读出来 ——
+/// 见 [`discover_accessories`] 那行 `覆盖 N/9 状态`。
+// 参数表 = `Atlas::blit` 的几何六项 + 两个来源 + 一个 `AssetKey`；把它压成结构体只是把
+// lint 的门槛挪个地方，而 `cell` 与 `dst_wh` 同为 `(u32, u32)` 反而多出一个可静默对调的形状。
+#[allow(clippy::too_many_arguments)]
+fn blit_cell(
+    dst: &mut [u8],
+    body: Option<&Atlas>,
+    worn: Option<&Equipped>,
+    cell: (u32, u32),
+    key: AssetKey,
+    cell_w: u32,
+    cell_h: u32,
+    stride: usize,
+) -> Result<(), String> {
+    if let Some(atlas) = body {
+        atlas
+            .blit(cell.0, cell.1, dst, cell_w, cell_h, stride)
+            .map_err(|e| format!("blit ({},{}) 失败: {e}", cell.0, cell.1))?;
+    }
+    if let Some(acc) = worn.filter(|a| a.manifest.covers(key)) {
+        acc.atlas
+            .blit_over(cell.0, cell.1, dst, cell_w, cell_h, stride)
+            .map_err(|e| format!("配件叠加 ({},{}) 失败: {e}", cell.0, cell.1))?;
+    }
+    Ok(())
 }
 
 // ───────────────────────────── 几何换算 ─────────────────────────────
@@ -1311,6 +1758,50 @@ impl App {
             menu::MenuItem::Jump => self.send_action(Action::Jump),
             menu::MenuItem::Climb => self.send_action(Action::Climb),
             menu::MenuItem::Pause => self.send_action(Action::Sleep),
+            menu::MenuItem::Equip => self.equip(),
+            menu::MenuItem::Unequip => self.unequip(),
+            menu::MenuItem::NextOutfit => self.cycle_accessory(),
+            // ── 收藏册页：三行全是**只读报表**（不掷骰、不花钱、不改库）──
+            menu::MenuItem::Owned => self.gacha_report("collection", |g| g.collection_lines()),
+            menu::MenuItem::Missing => self.gacha_report("missing", |g| g.missing_lines()),
+            // 十次 = 一次十连。不是"最近十行"也不是"最近十个 pull"：抽一次也是十行里的一行，
+            // 而这个门面要回答的是"上一次发生了什么"。
+            menu::MenuItem::Recent => self.gacha_report("recent", |g| g.recent_lines(10)),
+            // ── 设置页 ──
+            menu::MenuItem::MotionTier => self.cycle_motion(),
+            menu::MenuItem::Rates => self.show_rates(),
+            menu::MenuItem::Verify => self.gacha_report("verify", |g| g.verify_lines()),
+        }
+    }
+
+    /// 收藏册 / 设置页那几行"连库 → 读 → 打 stderr"的报表，共用同一条出声路径。
+    ///
+    /// 三件事都由这一条函数保证：**先** `ensure_gacha()`（lazy 连库那条红线，D14）、失败只
+    /// 写错误行（[`Self::gacha_bailed`]，不 panic 不置 `exit`，硬约束 3 同族）、成功就把错误行
+    /// 清空（否则上一条失败的字一直挂着，用户会以为它还没修）。
+    ///
+    /// ⚠️ **不置 `force_draw`**：这些行进的是 stderr，一行像素都不动。加了就是
+    /// 在"静止菜单 = 1 提交"那道预算上多投一帧一模一样的 buffer（`69fd158` 那个形状）。
+    fn gacha_report(
+        &mut self,
+        prefix: &str,
+        report: impl FnOnce(&Gacha) -> Result<Vec<String>, String>,
+    ) {
+        if !self.ensure_gacha() {
+            return;
+        }
+        let lines = match self.gacha.as_ref() {
+            Some(g) => report(g),
+            None => return,
+        };
+        match lines {
+            Ok(v) => {
+                self.gacha_error = None;
+                for l in &v {
+                    eprintln!("{prefix}: {l}");
+                }
+            }
+            Err(msg) => self.gacha_bailed(msg),
         }
     }
 
@@ -1338,8 +1829,9 @@ impl App {
     /// 五档核对行、VmHWM/CPU 一条不少）。抽取在点击那一刻就同步落库 ⇒ 不需要额外拆库。
     ///
     /// **不做确认步骤**：这块 surface 没有对话框、也没有 click-outside（D14），"确认"会变成
-    /// 又一个页状态 + 又一批假按钮风险；而"退出"放在最后一页最后一行，误触至少要两次点击
-    /// （翻页 + 点行），而翻页点错是免费的（三页循环）。误触退出的代价 = 重启一次，零数据损失。
+    /// 又一个页状态 + 又一批假按钮风险；而"退出"不在首页而在第三页的最后一行，误触至少要三次
+    /// 点击（翻两页 + 点行），而翻页点错是免费的（六页循环，最坏多按五次就回到原位）。误触退出的代价
+    /// = 重启一次，零数据损失。
     fn quit_pet(&mut self) {
         self.close_menu();
         self.exit = true;
@@ -1364,6 +1856,148 @@ impl App {
         }
     }
 
+    /// 点"换一件"：在 [`Self::candidates`] 里把下标往前挪一格，**穿着时立刻换过去**。
+    ///
+    /// 页导航不在这条行里做（`Dress.next() == Gacha`，标题条就是唯一翻页控件）⇒ 这一行只管
+    /// "这一页要办的两件事"里的第一件，而不是既换件又换页。
+    ///
+    /// **没穿东西时屏上一个像素都不变**，所以这里**不置 `force_draw`、也不进 `content_sig`**
+    /// （见 [`Self::picked`] 那条注释）。反馈只有 stderr：选中那件叫什么 = 用户内容，子集字体
+    /// 盖不住 ⇒ 宁可不打字也不在卡片上画 `?`。
+    ///
+    /// ⚠️ 穿着时**先释放再装载**（不是"只改下标，等用户再点一次穿上"），两个理由：
+    /// * 只改下标会把"选中的"和"屏上的"分成两个事实，而用户拿它们对不上时**没有任何一行读数
+    ///   能告诉我是哪一步没跟上** —— 这正是本项目反复出现的"两个事实源"形状。
+    /// * 顺序 = [`take_worn`] 在前、`decode` 在后 ⇒ 峰值始终是一件（M1 那一档的字面要求；
+    ///   反过来先解再丢会瞬间有两份 45 MiB 解码在场，而 `VmHWM` 记的正是那一瞬间）。
+    ///   ⚠️ 光有顺序**不够**：`take_worn` 原先把那个 [`Equipped`] 交回给这里当局部变量，而 Rust
+    ///   在块尾才 drop ⇒ "先释放"是注释上的而内存里没发生，"换一件"照样撞出三份 sheet。
+    ///   2026-11-03 真机 `VmHWM 148,076 kB` = 本体 45 + 旧 45 + 新 45 + 底子，就是这条撞出来的
+    ///   ⇒ 现在 `take_worn` 只返回 `(slug, bytes)`，旧那张在本函数返回时就没了。
+    fn cycle_accessory(&mut self) {
+        let n = self.candidates.len();
+        if n == 0 {
+            eprintln!(
+                "ui: 换一件 ⇒ 库里没有可用配件（上面 `accessories:` 那几行点名了每一件为什么出局）"
+            );
+            return;
+        }
+        self.picked = (self.picked + 1) % n;
+        let slug = self.candidates[self.picked].slug.clone();
+        if self.worn.is_none() {
+            eprintln!(
+                "ui: 换一件 ⇒ 选中 {slug}（第 {}/{} 件）；本来就没穿，屏上不变",
+                self.picked + 1,
+                n
+            );
+            return;
+        }
+        // `take_worn` 只带回打印要用的两个数 ⇒ 旧那张 sheet 在此刻已经不在内存里。
+        let (freed_slug, freed_bytes) = self.take_worn().expect("上面查过 worn.is_some");
+        eprintln!(
+            "ui: 换一件 ⇒ 释放 {freed_slug}（{:.3} MiB）、装载 {slug}",
+            freed_bytes as f64 / (1024.0 * 1024.0)
+        );
+        let outcome = decode(&self.candidates[self.picked]);
+        match outcome {
+            Ok(eq) => {
+                let merged = self.candidates[self.picked].merged.clone();
+                self.worn = Some(eq);
+                self.regions = Some(merged);
+                self.force_draw = true;
+                eprintln!(
+                    "ui: 换一件 ⇒ 已穿上 {slug}（第 {}/{} 件）",
+                    self.picked + 1,
+                    n
+                );
+            }
+            Err(e) => eprintln!("ui: 换一件 ⇒ 选中 {slug} 但装载失败：{e}（停在未装备态）"),
+        }
+    }
+
+    /// 点"穿上"：把当前选中的那件**到这一步才解码**（内存档 M1 = 一次一件 ⇒ 装备 = 装载、
+    /// 脱装 = 释放，配件那份 sheet 不在常驻预算里）。
+    ///
+    /// 三条出口都必须是"什么都不做"而不是"做一遍再把结果丢掉"，而只有第一条由本函数自己判：
+    /// * **已经穿着** ⇒ 当场返回，不重解码。重复点同一行要再付一次解码的几十毫秒与几 MiB，
+    ///   还会把同一格像素再投一帧（签名看不见变化而照样提交 = `69fd158` 那个形状）。
+    ///   这里**不需要比"是不是同一件"**：[`cycle_accessory`] 改下标时总是连像素一起换 ⇒
+    ///   "穿着"永远意味着"穿的就是当前选中这件"，这是那一条维持的不变量。
+    /// * **库里没有可用配件**（库不存在 / 空 / 每一件都过不了门禁）⇒ 一行日志。
+    ///   **不预先把这行画成灰的**：那要求客户端在绘制时读"扫到了几件"，而灰掉的行正是本项目
+    ///   禁止的假按钮形状反过来（[`send_action`] 那条同族理由，用户已判"照发、接受不响应"）。
+    /// * **sheet 解不开** ⇒ 报错并停在未装备态。**这不是新策略**：同一份坏文件在
+    ///   [`discover_accessories`] 里是"少一件可穿"，而此刻用户已经坐在桌面前 ⇒ 一行 stderr 比
+    ///   杀掉宠物好（硬约束 3）。四道门禁都在启动走过 ⇒ 这一档剩下的唯一失败面就是读像素。
+    ///
+    /// ⚠️ 装成之后**必须** `force_draw`：换装改的是**宠物那块 surface** 的像素，而换的往往是
+    /// **同一个图集格**（帽子不改变内核给出的 `{key,row,col}`）⇒ 光靠"格子变了"那道门永远不开。
+    /// 这正是 `force_draw` 的合法领地 = 签名与 `drawn_cell` 都看不见的那些像素。
+    fn equip(&mut self) {
+        if self.worn.is_some() {
+            eprintln!("ui: 穿上 ⇒ 已经穿着（穿的就是当前选中这件），不动");
+            return;
+        }
+        let outcome = match self.candidates.get(self.picked) {
+            Some(cand) => decode(cand),
+            None => {
+                eprintln!("ui: 穿上 ⇒ 库里没有可用配件 ⇒ 换装页点了不会有效果");
+                return;
+            }
+        };
+        match outcome {
+            Ok(eq) => {
+                let slug = eq.manifest.slug.clone();
+                let merged = self.candidates[self.picked].merged.clone();
+                self.worn = Some(eq);
+                self.regions = Some(merged);
+                self.force_draw = true;
+                eprintln!("ui: 穿上 {slug} ⇒ 换穿透轮廓并重画当前格");
+            }
+            Err(e) => eprintln!("ui: 穿上失败 ⇒ {e}（停在未装备态）"),
+        }
+    }
+
+    /// 点"脱下"：丢掉配件，把穿透轮廓换回 [`Self::body_regions`] 那一份。
+    ///
+    /// 复原是**换对象**而不是"再算一遍"：并集是一次性的事实，重算要求配件那份 `Regions` 一直在
+    /// 内存里 —— 而 M1 档的整个前提就是脱装要把配件的东西释放掉。这条路径不读盘、不分配，
+    /// ⇒ **结构上不可能失败**，所以没有"点了脱下而屏上还有帽子"这一档。
+    /// 本来就没穿 ⇒ 只打一行，同样不置 `force_draw`（不置就是"静止不发协议"那条老账，不是遗漏）。
+    fn unequip(&mut self) {
+        let Some((slug, bytes)) = self.take_worn() else {
+            eprintln!("ui: 脱下 ⇒ 本来就没穿，不动");
+            return;
+        };
+        self.force_draw = true;
+        eprintln!(
+            "ui: 脱下 {slug} ⇒ 配件 sheet（{:.3} MiB 解码）已释放，轮廓回到本体那份",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    /// 释放穿着的配件 = 丢掉 [`Equipped`]（那张 sheet 从此不在内存）+ 把轮廓换回本体那份。
+    ///
+    /// **不打印、不置 `force_draw`** ⇒ 由调用方决定用户要不要看见这一次（"脱下"要打一行，
+    /// "换一件"随后自己会装载，把两件事写成两行才读得懂）。返回 `None` = 本来就没穿。
+    ///
+    /// 单独一个函数只有一个理由：`take` 与"换回哪份轮廓"必须是一个动作。分成两处写就有一个
+    /// 中间形状 = "像素没了而 `regions` 还是并集" ⇒ 屏上没帽子而那块区域点得到，而那条
+    /// **没有任何门禁看得见**（`wl_region` 的并集多几格从来不算错，只有"少几格"会被
+    /// `first_missing` 抓到）。
+    ///
+    /// ⚠️ **返回 `(slug, decoded_bytes)` 而不是那个 [`Equipped]**，这是 M1 档最要紧的一条形状：
+    /// 交出对象会让调用方把旧 sheet 一路活到它自己那次 `decode()` 之后（Rust 在块尾 drop，
+    /// 不在最后一次使用处），而 [`cycle_accessory`] 正是"先卸下再装载" ⇒ 峰值变成
+    /// **本体 45 + 旧 45 + 新 45 = 135 MiB**，2026-11-03 真机 `VmHWM 148,076 kB` 量的就是它，
+    /// 越的是用户为 M1 签的 `≤ 100 MiB`。只把**打印要用的那两个数**带出来，图集就在本函数
+    /// 返回的那一刻被释放 ⇒ 内存里任何时刻最多两张 sheet。⇒ 这条不该靠调用方记得 `drop`。
+    fn take_worn(&mut self) -> Option<(String, usize)> {
+        let worn = self.worn.take()?;
+        self.regions = self.body_regions.clone();
+        Some((worn.manifest.slug.clone(), worn.atlas.decoded_bytes()))
+    }
+
     /// 点语言行：zh→en→ja→ko→zh，**只改本进程，不回写文件**。
     ///
     /// 不写回的理由不是省事：本轮的 reader 是自写的平坦 `key = "value"` 解析，读改写会把
@@ -1385,6 +2019,69 @@ impl App {
             self.ui_config_path,
             next.code()
         );
+    }
+
+    /// 点"动画"那一行：full → reduce → off → full，**只改本进程、不回写文件**。
+    ///
+    /// 不回写与 [`Self::cycle_lang`] 同一条理由（§7-R15：自写的平坦 reader 保不住用户注释，
+    /// 读改写会把文件刷平）。
+    ///
+    /// ⚠️ **这里不置 `force_draw`，也不是漏了**：`motion` 故意**不在** `menu::content_sig` 里，
+    /// 而 `menu_pixels_ignore_the_motion_tier` 那条门禁断言的是"三档下菜单像素逐字节相同"
+    /// —— 这一行改的是**卡片动画**（burst 时长、SSR 白闪），不是此刻这张菜单。加一句
+    /// `force_draw` 就是在唯一有"静止菜单 = 1 提交"预算的门面上重造 `69fd158` 那个形状：
+    /// 每 tick 重投一帧像素完全相同的 buffer。反馈走 stderr，改动**下一次抽取才看得见**。
+    fn cycle_motion(&mut self) {
+        let next = self.ui.motion.next();
+        self.ui.motion = next;
+        self.ui.motion_from = settings::ValueSource::MenuClick;
+        if let Some(m) = self.menu.as_mut() {
+            m.motion = next;
+        }
+        eprintln!(
+            "ui: 动画 → {}；本轮会话生效（下一次抽取的 burst 才跟着变），想固定请在 {} 写 [ui] motion = \"{}\"",
+            next.code(),
+            self.ui_config_path,
+            next.code()
+        );
+    }
+
+    /// 点"概率"那一行：把**公示**的两列打到 stderr。
+    ///
+    /// ⚠️ **这条路不碰库**，而且是故意的：它读的是编译期就嵌进二进制的 `rates.json`
+    /// （`DEFAULT_RATES_JSON` = `RATES_ASSET` 那份，与 `catalog rates --out` 写的是同一个产物），
+    /// 回答的是"承诺了什么"而不是"这次抽到了什么"。所以它**不需要** `ensure_gacha()` ——
+    /// 让它去连库就等于"内存库的玩家读不到公示"，而公示对每个人都一样。
+    ///
+    /// `Published::check` 是硬约束 #2（"概率必须与公示一致"）的守门人：文件与代码不一致时
+    /// 这一行报**不一致**，而不是把那份已经在说谎的文件念给用户听。宁可不答，不可答错。
+    fn show_rates(&self) {
+        let published = match RatesFile::read(DEFAULT_RATES_JSON) {
+            Ok(p) => p,
+            Err(msg) => {
+                eprintln!("rates: {msg}");
+                return;
+            }
+        };
+        let effective = match published.check(&GachaParams::V1) {
+            Ok(r) => r,
+            Err(msg) => {
+                eprintln!("rates: 公示与代码不一致 ⇒ {msg}");
+                return;
+            }
+        };
+        eprintln!(
+            "rates: 公示口径 method={:?} 视界 {} 抽（格式 v{}，百万分位）",
+            published.method, published.basis_pulls, published.format
+        );
+        for r in Rarity::ALL {
+            eprintln!(
+                "rates: {} 基础 {}% 综合 {}%",
+                r.as_str(),
+                percent_str(published.base.weight(r)),
+                percent_str(effective.weight(r))
+            );
+        }
     }
 
     /// 第一次用到才连库，之后复用同一条连接。返回"库是否可用"，调用方据此决定余额读不读。
@@ -1593,8 +2290,12 @@ impl App {
                 Tick::Deferred
             }
             Tick::Buffer => {
-                // 走这条 ⇒ 附新 buffer，margin 的改动同一次 commit 生效
-                if matches!(cell, Some((r, c)) if self.draw_cell(r, c)) {
+                // 走这条 ⇒ 附新 buffer，margin 的改动同一次 commit 生效。
+                // 配件要按**状态**决定叠不叠（没烘过那一档就不叠），而状态只在 `intent.sprite`
+                // 里 ⇒ 与 `(row, col)` 从同一个 `Option` 里一起取，编译器就看不出"有格没状态"
+                // 那种运行时不存在、类型上活着的组合。
+                let paint = intent.sprite.map(|s| ((s.row as u32, s.col as u32), s.key));
+                if matches!(paint, Some(((r, c), k)) if self.draw_cell(r, c, k)) {
                     self.drawn_cell = cell;
                     self.force_draw = false;
                     Tick::Buffer
@@ -1644,7 +2345,12 @@ impl App {
     }
 
     /// 画一格并提交。返回是否真的发出了一次 commit。
-    fn draw_cell(&mut self, row: u32, col: u32) -> bool {
+    ///
+    /// `key` 一路传到 [`blit_cell`]，在那儿只用来问一件事：装备中的配件**为这一档状态烘过像素吗**
+    /// （[`AccessoryManifest::covers`]）。没烘过 ⇒ 一帧都不叠。这不是"保守起见不画"：一件只在
+    /// `idle` 烘过的帽子，在 `run` 里继续拿 `idle` 那一格的像素往本体上叠，画的就是**别的东西**，
+    /// 而屏上看不出来。
+    fn draw_cell(&mut self, row: u32, col: u32, key: AssetKey) -> bool {
         let (pw, ph, pm) = self.cell_geometry();
         let (bw, bh) = (pw + pm * 2, ph + pm * 2);
         let stride = (bw * 4) as usize;
@@ -1666,10 +2372,20 @@ impl App {
             canvas.fill(0);
             let tail = off.min(canvas.len());
             let take = &mut canvas[tail..];
-            if let Some(atlas) = self.atlas.as_ref()
-                && let Err(e) = atlas.blit(row, col, take, pw as u32, ph as u32, stride)
-            {
-                eprintln!("blit ({row},{col}) 失败: {e}");
+            // 失败 ⇒ **整趟作废**（不 commit）。配件叠加失败时本体已经画对了，但那顶帽子只盖了
+            // 一半，而"半顶帽子"在屏上和"帽子歪了"是同一种看不出根因的错；宁可得罪一次五档计数
+            // （`Tick::Fault` 有自己的档位，且会把新 margin 冲出去）也不把它画出来。
+            if let Err(e) = blit_cell(
+                take,
+                self.atlas.as_ref(),
+                self.worn.as_ref(),
+                (row, col),
+                key,
+                pw as u32,
+                ph as u32,
+                stride,
+            ) {
+                eprintln!("{e}");
                 return false;
             }
         }
@@ -2610,5 +3326,486 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─────────────── 配件叠加（D16 路线 B）：装备门禁 + 逐格出图 ───────────────
+
+    /// 测试资产用 **16×16** 的格子：一张 sheet 只有 128×64 px，`encode_lossless_rgba` 现烘一份
+    /// 是毫秒级。寻址、并集、`covers` 这些判据跟格子尺寸无关，用 192 只会让每轮测试多解 1.5 MB。
+    const T_CELL: u32 = 16;
+    const T_COLS: u32 = 8;
+    const T_ROWS: u32 = 4;
+    /// 本体：`idle` 占行 0–1、`run` 占行 2–3 ⇒ 配件**没烘过** `run` 是这份 fixture 的常态。
+    const BODY_JSON: &str = r#"{"format":2,"slug":"tiny","sheet":"sheet.webp","grid":{"cols":8,"rows":4,"w":16,"h":16},"states":{"idle":{"rows":[0,1],"fps":8,"loop":true},"run":{"rows":[2,3],"fps":16,"loop":true}},"anchor":{"feet":[8,15]}}"#;
+    /// 帽子只覆盖 `idle`（两行）⇒ `drawn_cells()` = 行 0/1 × 8 列 = **16 格**。
+    const HAT_JSON: &str = r#"{"format":2,"slug":"cap","display_name":"蓝帽","slot":"head","fits":["tiny"],"sheet":"sheet.webp","grid":{"cols":8,"rows":4,"w":16,"h":16},"states":{"idle":{"rows":[0,1],"fps":8,"loop":true}}}"#;
+    /// 本体每格一条满高 span ⇒ 一格一个矩形；帽子两格不相邻的短 span ⇒ 一格两个矩形。
+    /// "两个矩形"是刻意的：拼接等于并集这条论证，只有两边矩形数不同时才测得出来。
+    const BODY_SPANS: &[[u32; 3]] = &[[0, 0, 15]];
+    const HAT_SPANS: &[[u32; 3]] = &[[0, 0, 0], [4, 4, 4]];
+
+    /// `polygon.json` 的一条帧记录。测试里这两个 helper 到处传这张表，具名比裸元组好读。
+    #[derive(Clone, Copy)]
+    struct Frame {
+        cell: (u32, u32),
+        spans: &'static [[u32; 3]],
+    }
+
+    fn cells_with(rows: u32, spans: &'static [[u32; 3]], skip: &[(u32, u32)]) -> Vec<Frame> {
+        (0..rows)
+            .flat_map(move |r| {
+                (0..T_COLS).map(move |c| Frame {
+                    cell: (r, c),
+                    spans,
+                })
+            })
+            .filter(move |f| !skip.contains(&f.cell))
+            .collect()
+    }
+
+    fn polygon_json(cell: u32, frames: &[Frame]) -> String {
+        let parts: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                let (r, c) = f.cell;
+                format!(
+                    r#"{{"row":{r},"col":{c},"spans":{}}}"#,
+                    serde_json::to_string(f.spans).expect("span 表该编得出去")
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"cell":{{"w":{cell},"h":{cell}}},"frames":[{}]}}"#,
+            parts.join(",")
+        )
+    }
+
+    /// 每格填一色（`at(row, col)`），行数由参数给 ⇒ 能造"清单说 4 行而像素只有 1 行"那种坏图集。
+    fn sheet_bytes(rows: u32, at: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let (w, h) = (T_COLS * T_CELL, rows * T_CELL);
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for r in 0..rows {
+            for c in 0..T_COLS {
+                let color = at(r, c);
+                for y in 0..T_CELL {
+                    let lo = ((r * T_CELL + y) * w * 4 + c * T_CELL * 4) as usize;
+                    let take = (T_CELL * 4) as usize;
+                    for p in px[lo..lo + take].chunks_exact_mut(4) {
+                        p.copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+        crate::atlas::encode_lossless_rgba(&px, w, h).expect("lossless webp 该编得出来")
+    }
+
+    fn write(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("建目录");
+        }
+        std::fs::write(&path, bytes).expect("写测试资产");
+        path
+    }
+
+    /// 本体区域从盘上读（`Regions::load` 只吃路径 ⇒ 没有"内存里造一份"的旁路，这正好）。
+    fn body_regions(dir: &std::path::Path, skip: &[(u32, u32)]) -> Regions {
+        let json = polygon_json(T_CELL, &cells_with(T_ROWS, BODY_SPANS, skip));
+        let path = write(dir, "polygon.json", json.as_bytes());
+        Regions::load(
+            path.to_str().expect("UTF-8"),
+            T_CELL,
+            T_CELL,
+            SURFACE_MARGIN,
+        )
+        .expect("本体轮廓该读得进来")
+    }
+
+    /// 把帽子那三样（清单 / 像素 / 轮廓）按测试需要落进 `dir/hat/`（= 库里的一件）。
+    /// 缺哪一样就不写哪一样 ⇒ "被拒绝时一个字节都没读"这种判据才有得断言。
+    ///
+    /// **不再返回清单路径**：`--accessory` 删掉以后，生产代码里没有任何地方拿着"一份清单的路径"，
+    /// 只有"一个库目录"。测试照调用方能看到的东西写，否则它会一直测一个已经不存在的外形。
+    fn hat_in(dir: &std::path::Path, hat_json: &str, polygon: Option<&str>, rows: u32) {
+        write(dir, "hat/accessory.json", hat_json.as_bytes());
+        if let Some(p) = polygon {
+            write(dir, "hat/polygon.json", p.as_bytes());
+        }
+        if rows > 0 {
+            let bytes = sheet_bytes(rows, |r, c| {
+                if (r, c) == (0, 0) {
+                    [0, 255, 0, 128] // 半透绿：source-over 之后三个源像素都区分得出来
+                } else {
+                    [255, 0, 0, 255]
+                }
+            });
+            write(dir, "hat/sheet.webp", &bytes);
+        }
+    }
+
+    /// 一套全过的库：本体清单 + 本体 32 格轮廓 + 库里一件帽子（16 格齐全）。
+    /// 返回的是**库目录**，因为那是 `discover_accessories` 收的东西。
+    fn kit(
+        dir: &std::path::Path,
+        body_skip: &[(u32, u32)],
+        hat_json: &str,
+        hat_skip: &[(u32, u32)],
+    ) -> (Manifest, Regions) {
+        let body = Manifest::parse(BODY_JSON).expect("本体清单该合法");
+        let regions = body_regions(dir, body_skip);
+        let polygon = polygon_json(T_CELL, &cells_with(2, HAT_SPANS, hat_skip));
+        hat_in(dir, hat_json, Some(&polygon), T_ROWS);
+        (body, regions)
+    }
+
+    /// 库里只有这一件、且全过 ⇒ 拿到那唯一的候选。八条配件测试里有六条要它，形状 =
+    /// "过了门禁的那件"而不是"过了门禁的那些"，所以这里直接断言只有一件。
+    fn sole(dir: &std::path::Path, body: &Manifest, regions: &Regions) -> Candidate {
+        let found = discover_accessories(dir, body, regions);
+        assert_eq!(found.len(), 1, "这套资产该恰好产出一件候选，实际 {found:?}");
+        found.into_iter().next().expect("上面查过 len == 1")
+    }
+
+    /// 空库 ⇒ 零候选，而**本体轮廓逐位不变**。这条是"没穿配件时出图路径与从来没有配件时
+    /// 逐字节相同"那句承诺的入口（三条真机人工门禁吃的就是那份穿透矩形）。
+    ///
+    /// 三个方向都要断：① 库目录不存在 ⇒ 空表（不是错误 —— 硬约束 3，起不来比没帽子严重）；
+    /// ② 库存在但空 ⇒ 空表；③ 库里有目录而**没有** `accessory.json` ⇒ 也不算一件。
+    /// 第 ③ 档最容易被写错：拿 `read_dir` 的每一项直接当候选，那么任何一个别的目录（比如
+    /// 用户手放的 `README/`）都会变成换装页里一行点了必然失败的配件。
+    #[test]
+    fn an_empty_library_yields_no_candidates_and_leaves_the_regions_untouched() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let body = Manifest::parse(BODY_JSON).expect("本体清单该合法");
+        let given = body_regions(dir.path(), &[]);
+        let want: Vec<Vec<CellRect>> = (0..T_ROWS)
+            .flat_map(|r| (0..T_COLS).map(move |c| (r, c)))
+            .map(|(r, c)| given.rects(r, c).expect("每格都该有").to_vec())
+            .collect();
+
+        let missing = dir.path().join("nope");
+        assert!(
+            discover_accessories(&missing, &body, &given).is_empty(),
+            "库不存在 ⇒ 应当是「没有可穿」，不是错误、更不是 panic"
+        );
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).expect("建空库");
+        assert!(
+            discover_accessories(&empty, &body, &given).is_empty(),
+            "空目录 ⇒ 零候选"
+        );
+        // 一个没有清单的子目录：它**不是**一件配件，也不该进候选表。
+        std::fs::create_dir(dir.path().join("notes")).expect("建无关目录");
+        assert!(
+            discover_accessories(dir.path(), &body, &given).is_empty(),
+            "没有 accessory.json 的目录不该被当成一件配件"
+        );
+
+        let again: Vec<Vec<CellRect>> = (0..T_ROWS)
+            .flat_map(|r| (0..T_COLS).map(move |c| (r, c)))
+            .map(|(r, c)| given.rects(r, c).expect("每格都该有").to_vec())
+            .collect();
+        assert_eq!(again, want, "扫库这条路动了本体的穿透区域 ⇒ 那条承诺是假的");
+        assert_eq!(again.iter().map(Vec::len).sum::<usize>(), 32);
+    }
+
+    /// **启动这条路根本不打开 `sheet.webp`** —— 库里把像素文件删掉，候选照样产出。
+    ///
+    /// 这条断的不是"健壮性"而是**内存档 M1 的字面含义**：`VmHWM` 是高水位，"每件解码一次再丢掉"
+    /// 与"全部常驻"给出同一个峰值（实测 59,164 kB > 用户签的未装备配件 57,344 kB）。所以
+    /// "扫库时解不解码"不是一个实现细节，而是一条能被这一行抓住的判据：哪天有人把
+    /// [`Atlas::load`] 挪回 [`check_accessory`]，这份没有像素的库会立刻让它红。
+    #[test]
+    fn discovery_never_touches_the_sheet_so_a_pixel_less_library_still_lists_it() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (body, regions) = kit(dir.path(), &[], HAT_JSON, &[]);
+        std::fs::remove_file(dir.path().join("hat/sheet.webp")).expect("删掉像素");
+        let cand = sole(dir.path(), &body, &regions);
+        assert_eq!(cand.slug, "cap");
+        assert_eq!(
+            cand.merged.frame_count(),
+            32,
+            "候选只带轮廓，轮廓该已经并好"
+        );
+
+        // 而"穿上"才是唯一可能读不到像素的地方 ⇒ 同一条候选到 `decode` 手里必须报**那个路径**。
+        let Err(err) = decode(&cand) else {
+            panic!("没有 sheet.webp 而 decode 还成功 ⇒ 它读的不是候选那份目录");
+        };
+        assert!(
+            err.contains("hat/sheet.webp"),
+            "错误必须点名是哪个文件读不开，否则真机上只能靠猜: {err}"
+        );
+    }
+
+    /// **门禁顺序 + 一坏不害众**：库里放两件，一件格子漂移、一件全过 ⇒ 漂移的那件出局而
+    /// 另一件照常可选，且报的错点名的是那条几何后果。
+    ///
+    /// 这里干脆**不写**漂移那件的 `sheet.webp` ⇒ 一旦哪天有人把 `validate_against` 挪到解码之后，
+    /// 报的就会是 Io 错而不是这句"偏移不再是 0"，测试当场红。
+    #[test]
+    fn a_drifted_hat_is_skipped_in_favor_of_the_one_that_passes() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let body = Manifest::parse(BODY_JSON).expect("本体清单该合法");
+        let regions = body_regions(dir.path(), &[]);
+        let drifted = HAT_JSON.replace(r#""w":16,"h":16"#, r#""w":32,"h":32"#);
+        assert_ne!(drifted, HAT_JSON, "替换没生效 ⇒ 这条测试什么也没测");
+        hat_in(dir.path(), &drifted, None, 0);
+
+        // 同一道门禁单独问出来时，错误里带的必须是"偏移不再是 0"（`discover_accessories` 只把它
+        // 打进 stderr，而 stderr 在测试里断不到 —— 所以断言放在这一层，扫描那层只断"少一件"）。
+        let Err(err) = check_accessory(&dir.path().join("hat"), &body, &regions) else {
+            panic!("格子 32 对 16 的帽子该被拒绝");
+        };
+        assert!(
+            err.contains("偏移不再是 0"),
+            "错误要点名那条几何后果，而不是笼统的 schema 不符: {err}"
+        );
+        assert!(
+            !dir.path().join("hat/sheet.webp").exists(),
+            "这份资产根本没有配件像素 ⇒ 报出的错不可能来自解码"
+        );
+
+        // 换成一份好的：库 ⇒ 1 件，坏的那件被跳过而没有连带杀掉好的那件（硬约束 3）。
+        let good = dir.path().join("good");
+        write(&good, "accessory.json", HAT_JSON.as_bytes());
+        write(
+            &good,
+            "polygon.json",
+            polygon_json(T_CELL, &cells_with(2, HAT_SPANS, &[])).as_bytes(),
+        );
+        let found = discover_accessories(dir.path(), &body, &regions);
+        assert_eq!(found.len(), 1, "坏的一件不该连带淘汰好的一件");
+        assert_eq!(found[0].slug, "cap");
+    }
+
+    /// 配件**声明了但轮廓里没有**的格子 ⇒ 拒绝，而且错误里要带那个坐标。
+    /// 少了坐标就变成"启动失败但没人知道差哪格"，那是§9.2 第 17 条那次账的典型形状。
+    ///
+    /// 现在这条路发生在**扫库**里，所以它的后果从"宠物起不来"换成"这一件不进换装页"（硬约束 3）。
+    /// 断言还是放在 `check_accessory` 这一层：`discover_accessories` 只把它打进 stderr，而 stderr
+    /// 在测试里断不到。
+    #[test]
+    fn an_accessory_cell_without_contour_is_refused_and_named() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (body, regions) = kit(dir.path(), &[], HAT_JSON, &[(1, 5)]);
+        let Err(err) = check_accessory(&dir.path().join("hat"), &body, &regions) else {
+            panic!("帽子缺 (1,5) 的轮廓 ⇒ 那一格会画出点不到的像素");
+        };
+        assert!(err.contains("(1,5)"), "错误要点名那一格: {err}");
+        assert!(
+            err.contains("点不到"),
+            "错误要说清后果，否则下一个人只会把它当 schema 笔误: {err}"
+        );
+    }
+
+    /// 反方向：**本体缺格而配件有**⇒ `merged_with` 拒绝。放行的话那一格不再是"缺格 ⇒ 退化成整格"，
+    /// 于是画出来的本体像素点不到 —— 三条真机人工门禁守的正是这件事。
+    #[test]
+    fn a_cell_the_body_lacks_is_refused_rather_than_merged() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (body, regions) = kit(dir.path(), &[(1, 2)], HAT_JSON, &[]);
+        let Err(err) = check_accessory(&dir.path().join("hat"), &body, &regions) else {
+            panic!("本体缺 (1,2) 而帽子有 ⇒ 并进来会取消那次整格退化");
+        };
+        assert!(err.contains("(1,2)"), "错误要点名那一格: {err}");
+    }
+
+    /// 全过那一趟：并集**不新增格**（配件格是本体格的子集）、拼接就是并集、本体那份没被改。
+    ///
+    /// 分两段走 = 真实的两段（扫库只到候选，穿上才解码）。这条因此同时是"M1 那两步各自的产物"
+    /// 的证据：`merged` 属于候选、`slug` 在两边都得是同一件。
+    #[test]
+    fn the_merged_region_is_the_union_and_the_body_regions_stay_alone() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (body, regions) = kit(dir.path(), &[], HAT_JSON, &[]);
+        let cand = sole(dir.path(), &body, &regions);
+        let equipped = decode(&cand).expect("这套资产四道门禁全过又有像素 ⇒ 该穿得上");
+        assert_eq!(equipped.manifest.slug, "cap");
+        let merged = &cand.merged;
+        assert_eq!(merged.frame_count(), 32, "并集不许凭空多出格子");
+
+        // 一格一个 + 一格两个 = 拼接后三个：这条断的就是"直接拼接即并集"（`wl_region` 只吃矩形）。
+        let rects = merged.rects(0, 0).expect("这格有轮廓");
+        assert_eq!(rects.len(), 3, "本体 1 个 ++ 帽子 2 个: {rects:?}");
+        // 借走而不是搬走的那份，调用完了还在手里，而且**还是 1 个** ⇒ 并集只长在返回的新对象上。
+        // 这条比"从盘上重读"强：盘上那份从来不会被改（谁都没开写句柄），而这一份是真正递进
+        // 函数去的那一个。
+        assert_eq!(
+            regions.rects(0, 0).map(<[CellRect]>::len),
+            Some(1),
+            "递进去的本体轮廓被并集改写了 ⇒ `merged_with` 不再是新造对象"
+        );
+
+        // 配件**没烘过**的状态（run = 行 2/3）轮廓里本来就没有 ⇒ 那些格逐位保持本体。
+        for col in 0..T_COLS {
+            assert_eq!(
+                merged.rects(2, col).map(<[CellRect]>::len),
+                Some(1),
+                "行 2 帽子根本不画 ⇒ 穿透矩形不该多出来"
+            );
+        }
+    }
+
+    /// `covers` 那道闸门真的接在出图上：帽子只在 `idle` 烘过，`run` 里一帧都不许叠。
+    /// 三个方向都断（叠了 / 没叠 / 叠成"帽子盖掉本体"），否则写反一次仍然全绿。
+    #[test]
+    fn blit_cell_skips_the_overlay_for_a_state_the_hat_never_drew() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let body_bytes = sheet_bytes(T_ROWS, |_, _| [0, 0, 255, 255]);
+        let body_path = write(dir.path(), "body.webp", &body_bytes);
+        let body_atlas = Atlas::load(
+            body_path.to_str().expect("UTF-8"),
+            T_COLS,
+            T_ROWS,
+            T_CELL,
+            T_CELL,
+        )
+        .expect("本体图集");
+        let hat_bytes = sheet_bytes(T_ROWS, |r, c| {
+            if (r, c) == (0, 0) {
+                [0, 255, 0, 128]
+            } else {
+                [255, 0, 0, 255]
+            }
+        });
+        let hat_path = write(dir.path(), "hat.webp", &hat_bytes);
+        let hat_atlas = Atlas::load(
+            hat_path.to_str().expect("UTF-8"),
+            T_COLS,
+            T_ROWS,
+            T_CELL,
+            T_CELL,
+        )
+        .expect("配件图集");
+        let hat = Equipped {
+            manifest: AccessoryManifest::parse(HAT_JSON).expect("帽子清单该合法"),
+            atlas: hat_atlas,
+        };
+
+        let n = (T_CELL * T_CELL) as usize;
+        let stride = (T_CELL * 4) as usize;
+        let mut plain = vec![0u8; n * 4];
+        body_atlas
+            .blit(0, 0, &mut plain, T_CELL, T_CELL, stride)
+            .expect("本体那一格该画得出来");
+        let mut covered = vec![0u8; n * 4];
+        hat.atlas
+            .blit(0, 0, &mut covered, T_CELL, T_CELL, stride)
+            .expect("帽子那一格该画得出来");
+
+        let mut idle = vec![0u8; n * 4];
+        blit_cell(
+            &mut idle,
+            Some(&body_atlas),
+            Some(&hat),
+            (0, 0),
+            AssetKey::Idle,
+            T_CELL,
+            T_CELL,
+            stride,
+        )
+        .expect("idle 该叠上");
+        let mut run = vec![0u8; n * 4];
+        blit_cell(
+            &mut run,
+            Some(&body_atlas),
+            Some(&hat),
+            (0, 0),
+            AssetKey::Run,
+            T_CELL,
+            T_CELL,
+            stride,
+        )
+        .expect("run 也该出图（只是不叠）");
+
+        for px in 0..n {
+            let p = px * 4;
+            let want: Vec<u8> = crate::atlas::composite_over(
+                [covered[p], covered[p + 1], covered[p + 2], covered[p + 3]],
+                [plain[p], plain[p + 1], plain[p + 2], plain[p + 3]],
+            )
+            .to_vec();
+            assert_eq!(
+                idle[p..p + 4],
+                want[..],
+                "第 {px} 个像素不是 source-over 的结果"
+            );
+            assert_eq!(run[p..p + 4], plain[p..p + 4], "run 里帽子漏出来了");
+            assert_ne!(
+                idle[p..p + 4],
+                covered[p..p + 4],
+                "叠 = 整格拷贝帽子 ⇒ blit 用错了"
+            );
+        }
+    }
+
+    /// 两边的失败**分得开**：本体检不到格 vs 配件图集比清单短。错误里必须带着是哪一侧，
+    /// 否则真机上"帽子没显示"和"宠物没了"是同一条日志，只能靠猜。
+    #[test]
+    fn blit_cell_names_the_side_that_failed() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let short = write(
+            dir.path(),
+            "short.webp",
+            &sheet_bytes(1, |_, _| [0, 0, 0, 0]),
+        );
+        let short_atlas = Atlas::load(short.to_str().expect("UTF-8"), T_COLS, 1, T_CELL, T_CELL)
+            .expect("1 行的图集");
+        let full = write(
+            dir.path(),
+            "full.webp",
+            &sheet_bytes(T_ROWS, |_, _| [0, 0, 0, 0]),
+        );
+        let full_atlas = Atlas::load(
+            full.to_str().expect("UTF-8"),
+            T_COLS,
+            T_ROWS,
+            T_CELL,
+            T_CELL,
+        )
+        .expect("4 行的图集");
+        let hat = Equipped {
+            manifest: AccessoryManifest::parse(HAT_JSON).expect("帽子清单该合法"),
+            // 清单说 4 行而像素只有 1 行 = 不同批产物的形状（`covers(idle)` 仍为真）
+            atlas: short_atlas,
+        };
+        let stride = (T_CELL * 4) as usize;
+        let mut dst = vec![0u8; (T_CELL * T_CELL * 4) as usize];
+
+        let Err(err) = blit_cell(
+            &mut dst,
+            Some(&full_atlas),
+            Some(&hat),
+            (3, 0),
+            AssetKey::Idle,
+            T_CELL,
+            T_CELL,
+            stride,
+        ) else {
+            panic!("配件图集只有 1 行，而清单说 4 行 ⇒ 行 3 必须失败");
+        };
+        assert!(
+            err.starts_with("配件叠加"),
+            "要指明失败的是配件那一侧: {err}"
+        );
+        assert!(err.contains("图集只有 1 行"), "要带上图集自己的说法: {err}");
+
+        let Err(err) = blit_cell(
+            &mut dst,
+            Some(
+                &Atlas::load(short.to_str().expect("UTF-8"), T_COLS, 1, T_CELL, T_CELL)
+                    .expect("再Load一次短图集"),
+            ),
+            None,
+            (3, 0),
+            AssetKey::Idle,
+            T_CELL,
+            T_CELL,
+            stride,
+        ) else {
+            panic!("本体检不到行 3 ⇒ 必须失败");
+        };
+        assert!(err.starts_with("blit"), "本体侧不该被写成配件的错: {err}");
     }
 }

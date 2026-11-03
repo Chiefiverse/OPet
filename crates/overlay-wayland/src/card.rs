@@ -545,8 +545,9 @@ pub fn paint(canvas: &mut [u8], bw: i32, bh: i32, stride: usize, anim: &MenuAnim
 /// 菜单态：**标题行（左＝当前页的页名 + 页码，右＝碎片 + 演示标）**、当前页的三行按钮、
 /// 底部语言行。
 ///
-/// 标题行左端画的不再是常量：`ctx.page` 决定"盲盒 1/3 / 动作 2/3 / 其它 3/3"里的哪一个
-/// （[`MenuPage::header_text`]）。**页码是这一版里"标题条是个控件"的唯一视觉线索** ——
+/// 标题行左端画的不再是常量：`ctx.page` 决定"盲盒 1/6 / 动作 2/6 / 其它 3/6 / 帽子 4/6"里的
+/// 哪一个（[`MenuPage::header_text`]，页码分母取 [`MenuPage::ALL`] 的长度）。
+/// **页码是这一版里"标题条是个控件"的唯一视觉线索** ——
 /// 这块 surface 不吃键盘、也没有 hover（D14），不印页码就没有任何东西告诉用户"这里点下去
 /// 会翻页"。这就是 §9.2 第 14 条那一族（"没有可点线索"）在分页上的形状。
 ///
@@ -1232,10 +1233,10 @@ mod tests {
     /// 逐页验收：**每一页的三行都必须真的有墨**（行底 + 强调条 + 字），而标题那一格必须印
     /// **那一页自己的页名**。
     ///
-    /// 分页把"画哪三行"变成了一件有状态的事 ⇒ 只测盲盒页等于另外两页在像素面上从来没被画过。
-    /// 那条"三页的标题带两两不同"是 `card::Ctx::page` **被画师读到**的唯一直接证据：签名里混了页
+    /// 分页把"画哪三行"变成了一件有状态的事 ⇒ 只测盲盒页等于另外几页在像素面上从来没被画过。
+    /// 那条"各页的标题带两两不同"是 `card::Ctx::page` **被画师读到**的唯一直接证据：签名里混了页
     /// 而画师不读它，出的就是"点了翻页、命中表换了、卡片还画旧页"（`69fd158` 的镜像形状），而
-    /// "有墨"这种存在性断言对它完全无感 —— 三页都印"盲盒 1/3"照样全绿。
+    /// "有墨"这种存在性断言对它完全无感 —— 六页都印"盲盒 1/6"照样全绿。
     fn menu_phase_inks_the_header_and_every_row() {
         for scale in [1.0, 1.5] {
             let shots: Vec<(MenuPage, Shot)> = MenuPage::ALL
@@ -1308,7 +1309,7 @@ mod tests {
             }
             // 语言行：它**没有行底**（footer 直接画在卡片底色上），所以这里只查"画了字"。
             // 这条是"用户能自己设语言"在像素面的唯一证据 —— 矩形在却空白 = 假功能。
-            // ⚠️ footer 的几何与页无关（三页共用同一条带）⇒ 这一段不进页循环，逐字不动。
+            // ⚠️ footer 的几何与页无关（各页共用同一条带）⇒ 这一段不进页循环，逐字不动。
             let f = menu::footer();
             let s0 = &shots[0].1;
             assert!(
@@ -1910,19 +1911,22 @@ mod tests {
 
     /// 目视核对（M2 的教训：数字门禁看不见"少了一块"）—— **出图矩阵**（`UI_REDESIGN_V2` 提交 7）
     /// = 相位 × 4 locale × 3 motion × {1.0×, 1.5×}，逐张过眼。
-    /// 分页（本批）把**菜单那一格扩成三页**：页只改菜单相的像素 ⇒ 结果卡那些相位不加维度。
-    /// 三页 × 四 locale 是"走路/爬墙/退出这类新字在 ja/ko 下装不装得下"唯一能判的地方
-    /// （`fit` 会截断，而"截断成什么样"必须过眼）。
+    /// 分页把**菜单那一格扩成逐页一组**（六页 = 六组，换装/收藏/设置是第四~六组）：页只改菜单相的
+    /// 像素 ⇒ 结果卡那些相位不加维度。各页 × 四 locale 是"走路/爬墙/退出/穿上这类新字在 ja/ko
+    /// 下装不装得下"唯一能判的地方（`fit` 会截断，而"截断成什么样"必须过眼）。
     ///
     /// ```sh
-    /// cd /home/jun/Projects/opet && export PATH="$HOME/.cargo/bin:$PATH"
+    /// cd /home/jun/Projects/opet
     /// rm -f /tmp/opet_card_*.ppm /tmp/opet_card_*.png /tmp/sheet_*.png
     /// OPET_CARD_DUMP=1 cargo test -p overlay-wayland --lib -- card::tests::dump_each_phase --ignored --nocapture
+    /// ls /tmp/opet_card_*.ppm | wc -l        # 必须是 248 = (菜单 6 页 × 4 locale + menuerr × 4 + 卡片 96) × 2 档
     /// cd /tmp && for f in opet_card_*.ppm; do magick "$f" -scale 300% "${f%.ppm}.png"; done
     /// # 拼总览：一张 = 一个 motion × scale，行=相位、列=locale
+    /// # ⚠️ 相位名单必须跟 MenuPage::ALL 一起涨：漏一页不报错，只是那两张永远不出现在总览里
     /// for sc in s100 s150; do for mo in full reduce off; do
     ///   files=()
-    ///   for p in menu menu_action menu_misc menuerr ssr_pull ssr_burstA ssr_burstB ssr_appear ssr_card \
+    ///   for p in menu menu_action menu_misc menu_dress menu_collection menu_settings menuerr \
+    ///            ssr_pull ssr_burstA ssr_burstB ssr_appear ssr_card \
     ///            ten_pull ten_burstA ten_burstB ten_appear ten_card; do
     ///     for lc in zh en ja ko; do
     ///       [ -f "opet_card_${p}_${lc}_${mo}_${sc}.png" ] && files+=("opet_card_${p}_${lc}_${mo}_${sc}.png")
@@ -1998,7 +2002,7 @@ mod tests {
                 // 菜单两格：`motion` 改不了它的像素（`menu_pixels_ignore_the_motion_tier`），
                 // 所以每个 (locale, scale) 只出一组，而不是三组一模一样的图。
                 //
-                // **分页把这一组变成三组**：三页的三行是不同的字，标题条印的也是不同的字，
+                // **分页把这一组变成六组**：每页的三行是不同的字，标题条印的也是不同的字，
                 // 而"这行字在 ja/ko 下装不装得下"只有过眼才判得出来（`l10n` 的 `fit` 会截断，
                 // 截不断是另一回事）。页名因此进 `phase` 而不是新开文件名字段 ⇒ 蒙太奇命令不变。
                 for page in MenuPage::ALL {
@@ -2006,6 +2010,9 @@ mod tests {
                         MenuPage::Gacha => "menu",
                         MenuPage::Action => "menu_action",
                         MenuPage::Misc => "menu_misc",
+                        MenuPage::Dress => "menu_dress",
+                        MenuPage::Collection => "menu_collection",
+                        MenuPage::Settings => "menu_settings",
                     };
                     dump(&Frame {
                         phase: tag,

@@ -1,6 +1,12 @@
 //! 对**真实烘焙资产**做一次解码 + 区域还原，打印 M4 门禁要的数（解码耗时、解码后字节、
 //! 每格 `wl_region` 矩形数）。`assets/` 是烘焙产物、不进仓库，所以默认 `#[ignore]`；
 //! 本机跑：`cargo test -p overlay-wayland --test real_asset -- --ignored --nocapture`。
+//!
+//! **缺产物 = 失败，不是 SKIP。** `#[ignore]` 的测试只有显式传 `--ignored` 才会跑，而愿意
+//! 传 `--ignored` 的人就是来看真产物的 ⇒ 这条路径上"打印一行 SKIP 然后 `return`"给出的
+//! `test result: ok` 是**构造出来的假绿**（2026-11-02 在 `accessory_product.rs` 上实测到同一个
+//! 形状：`--ignored` 不带环境变量 ⇒ `SKIP：没给 OPET_ACCESSORY` + `ok`）。现在缺文件直接 panic，
+//! 于是"跑过了"与"验到东西了"重新是同一件事。
 
 use std::path::Path;
 
@@ -14,8 +20,10 @@ fn real_asset_decodes_and_yields_regions() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/pets/cat_shiro");
     let pet = dir.join("pet.json");
     if !pet.exists() {
-        eprintln!("SKIP：{} 不存在（先跑 tools/pack.py）", pet.display());
-        return;
+        panic!(
+            "{} 不存在 ⇒ 这条测试没验任何东西。先跑 tools/pack.py（或换一个本机有的宠物目录）",
+            pet.display()
+        );
     }
     let manifest = Manifest::load(pet.to_str().unwrap()).expect("清单读不出");
     let (cols, rows, gw, gh) = (

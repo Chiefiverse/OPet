@@ -128,7 +128,11 @@ struct FrameJson {
 }
 
 /// 全部格子的穿透矩形，按 `(row, col)` 索引。
-#[derive(Debug)]
+///
+/// `Clone` 是运行时换装要的：本体那份要留着，脱装时把 `App::regions` 换回去（并集是一次性的
+/// 事实，不能靠"再算一遍"复原 —— 那要求配件那份一直在内存里，而 M1 档脱装就是把 sheet 丢掉）。
+/// 一张 320 条 × 几条矩形的表，几 KB。
+#[derive(Clone, Debug)]
 pub struct Regions {
     pub cell_w: u32,
     pub cell_h: u32,
@@ -186,6 +190,63 @@ impl Regions {
     /// 全透明帧给的是 `Some(空)`：此时应当**什么都不遮**，即空 region = 完全穿透。
     pub fn rects(&self, row: u32, col: u32) -> Option<&[CellRect]> {
         self.frames.get(&(row, col)).map(|v| &v[..])
+    }
+
+    /// 这些格里第一个**没有条目**的格（按传入顺序）；全部有 ⇒ `None`。
+    ///
+    /// 只查"有没有 key"而不是"矩形非空"：全透明帧本来就该是 `Some(空)`（= 那一格完全穿透），
+    /// 把它当缺格拒绝会误红。
+    pub fn first_missing(&self, cells: &[(u32, u32)]) -> Option<(u32, u32)> {
+        cells.iter().copied().find(|c| !self.frames.contains_key(c))
+    }
+
+    /// 把配件的逐格矩形并到本体上，返回一块新的 `Regions`（`self` 不被改动 ⇒ 无配件路径
+    /// 用的还是原来那份，逐位不变）。
+    ///
+    /// **为什么"两份列表直接拼接"就是并集**：`wl_region` 只接受矩形，而它的语义就是这些
+    /// 矩形的并（`app.rs::set_input_region` 逐条 `region.add`）。⇒ 不需要先把两边的 span
+    /// 合成一份再重新裁矩形 —— 那一步各自 `load` 时已经做过，且带各自的边距与 clamp。
+    ///
+    /// 逐格语义（一条：画出来的必须点得到，点不到的必须是透明的）：
+    /// - 两边都有这格 ⇒ 本体矩形 ++ 配件矩形。
+    /// - **只有本体有** ⇒ 只取本体的。配件在这格根本不画（装备前已用
+    ///   [`petcore::assets::AccessoryManifest::drawn_cells`] 逐格验过轮廓），所以并集本来
+    ///   就是本体 —— 这不是退化。
+    /// - **只有配件有** ⇒ 拒绝并点名那一格。本体没有这格 = 本体资产缺格，而调用方对缺格的
+    ///   处理是**退化成整格**；让配件把这一格变成 `Some` 会取消那次退化 ⇒ 本体像素画出来却
+    ///   点不到。宁可拒绝启动，也不要静默改掉穿透语义（那是三条真机人工门禁守的东西）。
+    /// - 两边都没有 ⇒ `None`，与无配件路径完全一致。
+    pub fn merged_with(&self, acc: &Regions) -> Result<Regions, String> {
+        let geom = |r: &Regions| (r.cell_w, r.cell_h, r.margin, r.surface_w, r.surface_h);
+        if geom(self) != geom(acc) {
+            let (a, b) = (geom(self), geom(acc));
+            return Err(format!(
+                "配件区域是 格{}x{} 边距{} surface{}x{}，本体是 格{}x{} 边距{} surface{}x{} \
+                 ⇒ 同一格在两块 surface 上落在不同坐标，并不了",
+                b.0, b.1, b.2, b.3, b.4, a.0, a.1, a.2, a.3, a.4
+            ));
+        }
+        let mut frames = self.frames.clone();
+        for (cell, rects) in &acc.frames {
+            match frames.get_mut(cell) {
+                Some(body) => body.extend_from_slice(rects),
+                None => {
+                    return Err(format!(
+                        "配件轮廓里有格 ({},{}) 而本体没有 ⇒ 那一格本来会退化成整格，\
+                         并进来会让画出的本体点不到",
+                        cell.0, cell.1
+                    ));
+                }
+            }
+        }
+        Ok(Regions {
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
+            frames,
+            margin: self.margin,
+            surface_w: self.surface_w,
+            surface_h: self.surface_h,
+        })
     }
 
     pub fn frame_count(&self) -> usize {
@@ -330,5 +391,104 @@ mod tests {
         let e = Regions::load(path.to_str().unwrap(), 96, 96, 16.0).unwrap_err();
         assert!(e.contains("不一致"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一条帧记录 = 格键 + 它的矩形集合（`Option` 的两种形状见 [`made_of`]）。
+    type Frame = ((u32, u32), Option<Vec<CellRect>>);
+
+    /// 直接造 `Regions`（不经过文件）。`None` = 这份资产里**没有**那一格的条目，
+    /// `Some(vec![])` = 有条目但那一格全透明 —— 两者在并集里走向完全不同，必须分得开。
+    fn made_of(entries: &[Frame]) -> Regions {
+        let mut frames = BTreeMap::new();
+        for (cell, rects) in entries {
+            if let Some(r) = rects {
+                frames.insert(*cell, r.clone());
+            }
+        }
+        Regions {
+            cell_w: 96,
+            cell_h: 96,
+            frames,
+            margin: 16,
+            surface_w: 128,
+            surface_h: 128,
+        }
+    }
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> CellRect {
+        CellRect::new(x, y, w, h)
+    }
+
+    #[test]
+    fn merging_concatenates_both_silhouettes_per_cell() {
+        // `wl_region` 吃的就是矩形的并 ⇒ 拼接两份列表 == 两块剪影的并，不必重新合 span。
+        let body = made_of(&[((0, 0), Some(vec![r(16, 16, 40, 60)]))]);
+        let acc = made_of(&[((0, 0), Some(vec![r(30, 4, 36, 12)]))]);
+        let m = body.merged_with(&acc).expect("同几何要能并");
+        assert_eq!(
+            m.rects(0, 0),
+            Some(&[r(16, 16, 40, 60), r(30, 4, 36, 12)][..])
+        );
+        // 本体那份不许被改动（无配件路径共用同一个 `Regions`）
+        assert_eq!(body.rects(0, 0), Some(&[r(16, 16, 40, 60)][..]));
+    }
+
+    #[test]
+    fn a_cell_only_the_body_has_keeps_the_body_alone() {
+        // 配件覆盖的状态比本体少 ⇒ 那些格配件根本不画，并集本来就是本体。
+        let body = made_of(&[
+            ((0, 0), Some(vec![r(1, 1, 2, 2)])),
+            ((7, 3), Some(vec![r(5, 5, 6, 6)])),
+        ]);
+        let acc = made_of(&[((0, 0), Some(vec![r(9, 9, 1, 1)]))]);
+        let m = body.merged_with(&acc).expect("配件只碰一部分格要能并");
+        assert_eq!(
+            m.rects(7, 3),
+            Some(&[r(5, 5, 6, 6)][..]),
+            "本体的格不能被配件改掉"
+        );
+        assert_eq!(m.rects(0, 0), Some(&[r(1, 1, 2, 2), r(9, 9, 1, 1)][..]));
+    }
+
+    #[test]
+    fn an_all_transparent_accessory_cell_contributes_no_rects_but_is_not_missing() {
+        // 全透明帧 = `Some(空)`：并进去一个矩形都不加，但它**不是**缺格。
+        let body = made_of(&[((2, 2), Some(vec![r(1, 1, 2, 2)]))]);
+        let acc = made_of(&[((2, 2), Some(vec![]))]);
+        let m = body.merged_with(&acc).expect("空轮廓也是有条目");
+        assert_eq!(m.rects(2, 2), Some(&[r(1, 1, 2, 2)][..]));
+        assert!(m.first_missing(&[(2, 2)]).is_none(), "全透明不能被报成缺格");
+    }
+
+    #[test]
+    fn merging_refuses_a_cell_the_body_does_not_have() {
+        // 本体缺那格 ⇒ 调用方本来会退化成整格；配件把它变成 `Some` 就取消了那次退化，
+        // 于是**画出来的本体点不到**。这条必须拒绝，而不是静默按配件的轮廓走。
+        let body = made_of(&[((0, 0), Some(vec![r(1, 1, 2, 2)]))]);
+        let acc = made_of(&[((9, 9), Some(vec![r(3, 3, 4, 4)]))]);
+        let e = body.merged_with(&acc).unwrap_err();
+        assert!(e.contains("(9,9)"), "报错要点名那一格：{e}");
+    }
+
+    #[test]
+    fn merging_refuses_a_differently_sized_grid() {
+        // ⚠️ 装备路径上这条**够不到**：`AccessoryManifest::validate_against` 先拒了 `w/h`
+        // 不同的配件。留它是防"绕过清单校验直接调 `merged_with`"的调用方（同 `first_missing`
+        // 那一族的口径：判据不成立的后果是穿透错位，静默比拒绝危险得多）。
+        let body = made_of(&[((0, 0), Some(vec![r(1, 1, 2, 2)]))]);
+        let mut acc = made_of(&[((0, 0), Some(vec![r(3, 3, 4, 4)]))]);
+        acc.cell_w = 192;
+        let e = body.merged_with(&acc).unwrap_err();
+        assert!(e.contains("并不了"), "{e}");
+    }
+
+    #[test]
+    fn first_missing_reports_only_absent_keys_in_the_given_order() {
+        let reg = made_of(&[((0, 0), Some(vec![])), ((1, 1), Some(vec![r(0, 0, 1, 1)]))]);
+        assert_eq!(reg.first_missing(&[]), None);
+        assert_eq!(reg.first_missing(&[(0, 0), (1, 1)]), None);
+        assert_eq!(reg.first_missing(&[(1, 1), (5, 5)]), Some((5, 5)));
+        // 顺序敏感：报的是**传入顺序**里第一个缺的，不是键序里最小的
+        assert_eq!(reg.first_missing(&[(9, 9), (5, 5)]), Some((9, 9)));
     }
 }

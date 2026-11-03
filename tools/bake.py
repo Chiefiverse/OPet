@@ -203,6 +203,14 @@ def parse_args():
         help="只对已烘产物做纯测量（一个像素都不重渲）：按 <out>/meta.json 还原场景、"
         "断言 feet_px 逐位相等、逐状态逐列投影挂点、写 <out>/outfit.json 后退出",
     )
+    p.add_argument(
+        "--outfit-only",
+        action="store_true",
+        help="只渲配件、载体不进画面（各 `hide_render`），烘出来的是**配件图集**"
+        "（D16 路线 B：客户端逐格把这张叠在本体那张上）。相机、姿态、格子、列约定与本体那批"
+        "**完全同一套** ⇒ 同一 (row, col) 就是屏幕上同一块矩形，这是路线 B 的地基。"
+        "配套的清单生产者 = `tools/pack.py --accessory`",
+    )
     return p.parse_args(argv)
 
 
@@ -1009,6 +1017,66 @@ def check_hat_in_pixels(path, cam, cell, ctx, meshes):
     print(
         "BAKE 配件像素自检：帽撑大了剪影 %s ⇒ alpha 盒 %d–%d / %d–%d 覆盖到投影极值（%s，容忍 %.1fpx）"
         % (" ".join(s for s, _, _ in need), x0, x1, y0, y1, " ".join("%.1f" % v for v in hb), tol)
+    )
+    return True
+
+
+def hide_carrier(meshes):
+    """`--outfit-only`：把载体从渲染里摘掉，但**不动它的几何与姿态**。
+
+    为什么用 `hide_render` 而不是删掉物体：客户端那条路线的地基是"同一台相机、同一批姿态"，
+    而姿态是骨架驱动载体的 ⇒ 删了载体，配件的 `CHILD_OF` 照样跟着 head 骨走（那部分不受影响），
+    但 `check_attach` / `check_framing` / `measure_outfit` 这三条读的都是**载体的几何**
+    （头区、颅顶、脚锚点），删掉就全都读不到了。`hide_render` 只让成片里没有它。
+    """
+    for ob in meshes:
+        ob.hide_render = True
+    return [ob.name for ob in meshes]
+
+
+def check_hat_only_in_pixels(path, cam, cell, ctx):
+    """`--outfit-only` 那一档的像素自检，判的是**另一件事**，所以不能沿用上面那条。
+
+    上面那条比的是"帽有没有把身体的剪影撑大"（载体在画面里才有意义）。这里载体被 `hide_render`
+    藏掉了，剪影**只有帽子** ⇒ 那条会走进"没撑大 ⇒ 这条测不出东西"的打印分支而返回 False，
+    于是"这一格到底有没有渲出东西"重新变成没人守的东西（这正是 10-30 那起"探针全绿而画面空"
+    的事故形状）。这一档要守的两条是：
+    1. **非空** —— 不透明像素的包围盒存在（否则整批配件图集是空的，客户端叠上去什么也看不见）；
+    2. **不外溢** —— alpha 盒必须落在帽自己的投影盒 + tol 之内。**外溢的唯一来源就是载体没藏干净**
+       （身体比帽子大得多，露一点就会把包围盒推到帽盒外面 ⇒ 方向上是安全的判据）。
+    反过来"alpha 比投影盒小"是常态（`rigid_points` 的 limit=600 采样取极值必然**不超出**真实剪影，
+    见上面那条里同一段注释），所以不许拿它判红。
+    """
+    hat = [bpy.data.objects[n] for n in ctx["objects"]]
+    update_depsgraph()
+    hb = projected_box(hat, cam, cell, 600)
+    x0, x1, y0, y1 = alpha_bbox(path)
+    tol = 6.0 * cell / 96.0
+    if x1 < x0 or y1 < y0:
+        sys.exit(
+            "BAKE 配件图集像素自检：%s 一个不透明像素都没有，而帽的投影盒是 "
+            "%.1f–%.1f / %.1f–%.1f ⇒ 载体藏了而配件也没渲出来（约束被静默忽略 / 配件被剪到格外 / "
+            "hide_render 连带把配件也关了）" % (path, *hb)
+        )
+    out = []
+    if x0 < hb[0] - tol:
+        out.append(("左", x0, hb[0] - tol))
+    if x1 > hb[1] + tol:
+        out.append(("右", x1, hb[1] + tol))
+    if y0 < hb[2] - tol:
+        out.append(("下", y0, hb[2] - tol))
+    if y1 > hb[3] + tol:
+        out.append(("上", y1, hb[3] + tol))
+    if out:
+        sys.exit(
+            "BAKE 配件图集像素自检：alpha 盒 %d–%d / %d–%d 越出帽的投影盒 %.1f–%.1f / %.1f–%.1f（%s 侧 %.1f > %.1f，"
+            "容忍 %.1fpx）⇒ 这一格里画了帽之外的东西 —— `--outfit-only` 下唯一的来源就是**载体没藏干净**，"
+            "那张图集叠在本体上会把身体重画一遍"
+            % (x0, x1, y0, y1, *hb, " ".join(s for s, _, _ in out), *(out[0][1], out[0][2]), tol)
+        )
+    print(
+        "BAKE 配件图集像素自检：这一格只有帽 ⇒ alpha 盒 %d–%d / %d–%d 落在帽投影盒（%s）+%.1fpx 内，载体未参与画面"
+        % (x0, x1, y0, y1, " ".join("%.1f" % v for v in hb), tol)
     )
     return True
 
@@ -2113,6 +2181,11 @@ def parse_vec(text):
 def main():
     global ORTHO_SCALE, TARGET_Z, NOSE, REAR, FEET
     args = parse_args()
+    if args.outfit_only and not args.outfit:
+        # 不是挑剔写法：一个"只在某条路径上有意义"的开关如果允许单独给，它就会静默什么都不做，
+        # 而那正是 `--cell` 那条假开关的形状（存在 ≠ 能用）。拒绝比沉默便宜。
+        sys.exit("--outfit-only 必须和 --outfit 一起用：它改的是「画面里留不留载体」，"
+                 "没有配件就没有可留之物")
     recorded = restore_from_meta(args) if args.outfit_measure_only else None
     spec = load_fixture()
     cell = args.cell or spec["grid"]["w"]
@@ -2283,6 +2356,10 @@ def main():
         bg.inputs[1].default_value = 0.55
 
     if args.outfit:
+        if args.outfit_only and args.outfit_measure_only:
+            sys.exit("--outfit-only 与 --outfit-measure-only 互斥：测量轮一个像素都不渲（它 return 在渲染之前），"
+                     "所以'只渲配件'在那条路径上没有任何作用 ⇒ 两个一起给就是静默吞掉一个开关。"
+                     "要挂点就单给 --outfit-measure-only，要配件图集就单给 --outfit-only")
         if not args.model:
             sys.exit("--outfit 必须和 --model 一起用：配件要刚性附着到 head 骨上，"
                      "而程序化占位小白没有骨架（它那些 head/ear 是物体不是骨）")
@@ -2305,6 +2382,13 @@ def main():
             measure_outfit(args, cam, cell, spec, states, columns, pose, armature, roles, outfit_ctx, base, recorded)
             print("BAKE --outfit-measure-only：只量挂点，没渲染任何像素、没改 meta.json")
             return
+        if args.outfit_only:
+            outfit_ctx["carrier_hidden"] = hide_carrier(meshes)
+            print(
+                "BAKE --outfit-only：载体 %d 件已 hide_render（%s）⇒ 这批成片里只有配件，"
+                "它是给客户端叠加用的**配件图集**，不是交付给眼睛看的宠物"
+                % (len(meshes), ", ".join(outfit_ctx["carrier_hidden"]))
+            )
         check_outfit_framing(cam, cell, columns, spec, states, pose, outfit_ctx)
     if not args.skip_facing_check:
         problems = check_facing(cam)
@@ -2358,8 +2442,14 @@ def main():
                 baked += 1
                 print("BAKE %s" % path)
                 if args.outfit and index == columns[0] and frame == 0:
-                    # 每个状态的第一格都验一次"帽真的在像素里"（读贴图，不是几何推算）
-                    check_hat_in_pixels(path, cam, cell, outfit_ctx, meshes)
+                    # 每个状态的第一格都验一次"帽真的在像素里"（读贴图，不是几何推算）。
+                    # `--outfit-only` 必须换一条闸门：那条量的判据是"帽让剪影变大了"，而这一批
+                    # **本来就没有身体可变大** ⇒ 拿它去判只会两件事之一：载体没藏干净⇒照样绿，
+                    # 或藏干净了⇒"没有变大"而报红。新闸门查的是"这一格只有帽、且帽在投影盒里"。
+                    if args.outfit_only:
+                        check_hat_only_in_pixels(path, cam, cell, outfit_ctx)
+                    else:
+                        check_hat_in_pixels(path, cam, cell, outfit_ctx, meshes)
 
     meta = {
         "cell": {"w": cell, "h": cell},
@@ -2392,6 +2482,12 @@ def main():
         for k in ("rot_z", "tilt", "seat"):
             meta["outfit_" + k] = outfit_ctx[k]
         meta["outfit_subsurf"] = args.outfit_subsurf
+        # 这一批是"配件图集"还是"带帽的宠物"，只有这两个数分得开，而它俩渲出来的像素在肉眼看来
+        # 是同一类东西（都有帽）。不记 ⇒ 以后没人知道这张 sheet 该单独叠还是直接上屏。
+        # 藏了哪几件也一起记：那是"为什么这张图里没有身体"的唯一出处。
+        meta["outfit_only"] = bool(args.outfit_only)
+        if args.outfit_only:
+            meta["outfit_carrier_hidden"] = outfit_ctx.get("carrier_hidden", [])
     with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, ensure_ascii=False, indent=2)
     print("BAKE 完成 baked=%d skipped=%d → %s" % (baked, skipped, os.path.join(args.out, "meta.json")))
