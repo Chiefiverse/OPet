@@ -103,7 +103,6 @@ U+007E # ascii
 U+2026 # l10n
 U+3048 # l10n
 U+304B # l10n
-U+304D # l10n
 U+304F # l10n
 U+3050 # l10n
 U+3051 # l10n
@@ -143,6 +142,7 @@ U+52A8 # l10n
 U+52D5 # l10n
 U+5305 # catalog-name
 U+5341 # l10n
+U+5361 # l10n
 U+53D6 # l10n
 U+53F6 # catalog-name
 U+56DE # l10n

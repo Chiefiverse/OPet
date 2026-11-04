@@ -2690,7 +2690,10 @@ impl App {
             m.motion = next;
         }
         self.refresh_panel_rows();
-        eprintln!("ui: 动画 → {}（下一次抽取的 burst 才跟着变）", next.code());
+        eprintln!(
+            "ui: 抽卡动画 → {}（下一次抽取的 burst 才跟着变，本体动画不受它影响）",
+            next.code()
+        );
         self.persist_ui_key(petstore::config::KEY_MOTION, next.code(), from_cli);
     }
 

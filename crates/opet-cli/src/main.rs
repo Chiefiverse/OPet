@@ -46,7 +46,7 @@ M4 可用（完整参数：`opet overlay --help`）：
       不给这个值整只宠物会被下推一个栏高、脚掉到屏幕外
       --lang = zh/en/ja/ko；不写这个开关时依次看 ~/.config/opet/config.toml 的 [ui] lang、
       再看 LC_ALL/LANG，最后默认 zh。写错值直接报错退出，不静默退回默认
-      --motion = full/reduce/off（判据②「动画强度可关 / 闪烁可关」）：reduce 把开箱扩散
+      --motion = full/reduce/off（判据②「抽卡动画强度可关 / 闪烁可关」，**不碰本体动画**）：reduce 把开箱扩散
       缩到 1/4 并关掉 SSR 白闪，off 整个跳过扩散；两档都不动结果卡停留时间与稀有度色带
   opet overlay --test-rect
       不接内核，画纯色矩形，只验 surface 映射与点击穿透

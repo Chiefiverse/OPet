@@ -24,8 +24,9 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
   --lang CODE        界面语言：zh / en / ja / ko。不给 = 走 `config.toml` 的 `[ui] lang`，
                      再退 `LC_ALL`/`LANG`，最后默认 zh。**认不出来直接报错退出**，
                      不静默退回默认（打错了和「语言不对但没人说」是两种完全不同的故障）
-  --motion TIER      动画强度：full / reduce / off。reduce = 开箱扩散缩到 1/4 且**不闪白**，
-                     off = 整个跳过扩散（只减提交、不增）；两档都不动 dwell 与稀有度色带。
+  --motion TIER      抽卡动画强度：full / reduce / off。reduce = 开箱扩散缩到 1/4 且**不闪白**，
+                     off = 整个跳过扩散（只减提交、不增）；两档都不动 dwell 与稀有度色带，
+                     也**完全不碰本体动画**（宠物该走还是走）。
                      判据②「闪烁可关」就是这一条 —— 前庭敏感是硬需求，优先于音效
 
 配件（换装）：命令行**没有**开关，只有屏上那三行（换一件 / 穿上 / 脱下）。

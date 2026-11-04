@@ -360,11 +360,16 @@ fn translations(k: Key, l: Lang) -> &'static str {
 
         // 设置三行。`MotionTier` 这一行是**循环器**（full → reduce → off → full），标签是它循环的
         // 那个**维度名**而不是当前值：把当前值写进标签就是两态字面 ⇒ 要进签名、要人读，
-        // 而这一行按下的瞬间画面本来就不变（`Menu` 相的 frame 恒 0）。值只出 stderr。
-        (Key::MotionTier, Lang::Zh) => "动画",
-        (Key::MotionTier, Lang::En) => "Motion",
-        (Key::MotionTier, Lang::Ja) => "動き",
-        (Key::MotionTier, Lang::Ko) => "움직임",
+        // 而这一行按下的瞬间画面本来就不变（`Menu` 相的 frame 恒 0）。
+        // ⚠️ 原话"值只出 stderr"**在面板那面是错的**（已就地订正，2026-11-04 第三批核对）：
+        // 菜单 footer 那一行只有维度名，而 `panel::settings_rows` 打的是 `标签 + motion.code()`
+        // ⇒ 屏上看得见当前档。**改名不改这条**：标签仍是维度名。
+        // ⚠️ 标签必须带"抽卡"：这一行只管开箱那一下的扩散与白闪，**不碰本体任何动画**，
+        // 单叫"动画"会被读成"宠物动不动"（用户 2026-11-04 判）。四语同口径。
+        (Key::MotionTier, Lang::Zh) => "抽卡动画",
+        (Key::MotionTier, Lang::En) => "Gacha animation",
+        (Key::MotionTier, Lang::Ja) => "ガチャ演出",
+        (Key::MotionTier, Lang::Ko) => "뽑기 움직임",
 
         (Key::Rates, Lang::Zh) => "概率",
         (Key::Rates, Lang::En) => "Rates",
