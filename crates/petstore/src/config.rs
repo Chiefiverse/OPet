@@ -1,8 +1,9 @@
-//! 用户配置文件的读取：`$XDG_CONFIG_HOME/opet/config.toml`（`UI_REDESIGN_V2` §4.6）。
+//! 用户配置文件：`$XDG_CONFIG_HOME/opet/config.toml`（`UI_REDESIGN_V2` §4.6 + 设计书 §9.2 第 19 条）。
 //!
-//! **只读、只认平坦的 `[段]` + `key = "值"`** —— 自写 ~120 行而不是引 `toml` crate：本轮
-//! 只要两个键，为它加一个依赖（还要按 D8 逐条核许可证）不划算，而且平坦语法出错时我们能
-//! 精确说清"第几行、哪个键、为什么"，库通常只会回一个 `TomlError`。
+//! **读 = 自写的那只平坦 reader，只认 `[段]` + `key = "值"`**：为两个键引一个 TOML 依赖去
+//! **读**不划算，而且平坦语法出错时我们能精确说清"第几行、哪个键、为什么"，库通常只会回一个
+//! `TomlError`。**写 = `toml_edit`**（见 [`write_ui_key`]）：读改写必须由一个保住 decor 的
+//! 库来做，自写 writer 会把用户手写的注释刷平。两边不是同一套实现，正是那条往返测试要钉的东西。
 //!
 //! 值一律**原样返回字符串**，本模块不解释语义。`lang` 认不认得由
 //! [`overlay_wayland::l10n::Lang::parse`] 判，`motion` 由
@@ -26,8 +27,10 @@
 //! 刻意由测试 `config_path_follows_the_same_xdg_rule_as_the_archive` 钉住两边同形，
 //! 免得将来一处改了另一处没改（那就是"两套 XDG 语义"）。
 //!
-//! ⚠️ **本轮不回写这个文件**（§4.7/R15）：菜单里点语言只改本进程。自写 reader 保不住注释，
-//! 读改写会把用户的文件刷平 —— 丢注释比"重启回默认"更坏。
+//! ⚠️ **回写走 [`write_ui_key`]，且只回写 `[ui] lang` / `[ui] motion` 这两个键**。写的时候
+//! 一次只碰那一个键、把它的 decor 原样摘贴回去，所以用户手写的注释与不认识的段都不动。
+//! 这条设计的前提是"reader 读得懂 writer 写出的字节" ⇒ 由 `writing_a_commented_key_keeps_the_comment`
+//! 那一族测试钉住，**判据是我们的 reader，不是 `toml_edit` 再 parse 一遍**（后者等于用写它的库证明它写对了）。
 
 use std::path::{Path, PathBuf};
 
@@ -152,11 +155,13 @@ impl Config {
     /// 一句话说明这份配置是从哪个文件来的、状态如何（启动摘要用）。
     ///
     /// `Absent` 那一支**刻意把路径打出来**：这是"用户自己设置语言"这个功能唯一的发现入口
-    /// —— 菜单里点语言只改本进程（本轮不回写文件），要让设置活过重启就得知道该写哪个文件。
+    /// —— 文件还不存在时，用户要先知道该建在哪、写哪两个键，[`write_ui_key`] 才有个落点。
     pub fn describe(&self) -> String {
         let at = self.path.display();
         match self.source {
-            ConfigSource::Absent => format!("{at} 不存在（要持久化就建它，写 [ui] lang/motion）"),
+            ConfigSource::Absent => {
+                format!("{at} 不存在（点菜单里的语言/动画会写它；手工建也行，写 [ui] lang/motion）")
+            }
             s => format!("{at}（{}）", s.as_str()),
         }
     }
@@ -182,6 +187,122 @@ fn config_path(env: &ConfigEnv) -> PathBuf {
         .join(".config")
         .join("opet")
         .join("config.toml")
+}
+
+/// 对账时要读回的那一个键。抽出来是因为 writer 里有**两处**都要问同一个问题（落盘前的
+/// 字节、落盘后的磁盘），两处各写一遍 `match` 早晚漂移成两个键。
+fn reads_back(key: &str, ui: &UiKeys) -> Option<String> {
+    match key {
+        KEY_LANG => ui.lang.clone(),
+        _ => ui.motion.clone(),
+    }
+}
+
+/// 写回 `[ui]` 的一个键，**用进程环境**（与 [`Config::read`] 对称）。
+pub fn write_ui_key(key: &str, value: &str) -> Result<PathBuf, String> {
+    write_ui_key_in(&ConfigEnv::from_process(), key, value)
+}
+
+/// 写回 `[ui] lang` / `[ui] motion`，其余一概不碰（设计书 §9.2 第 19 条）。
+///
+/// 五条规则，每一条都是"违反了就等于把用户的文件弄坏"：
+/// · **只改那一个键**：注释、空行、`[render]` 那些本轮不生效的段必须逐行活着 ⇒ 所以读改写
+///   交给 `toml_edit`（它保留 decor），**不**能拿这只手写 reader 反推整份文件；
+/// · **写之前先要求这份文件是合法 TOML**：解析不回来就**拒绝改写**，因为那时任何"改写"都会
+///   把用户手写的东西刷平 —— 报错并交出路径，比"帮你修好文件"诚实；
+/// · **写盘走同目录的临时文件 + rename**：`fs::write` 写一半被杀会把配置截断，那比丢注释更坏；
+/// · **落盘前先用我们的 reader 判一次**那串要写出的字节（[`parse`]）：读不回同一个值就**在碰
+///   磁盘之前**退出 ⇒ 那条报错说"文件未改动"是真话。抓的是 `ui = { lang = "zh" }` 这种
+///   TOML 合法而我们的 reader 不认的形状；
+/// · **落盘后再从磁盘读回来对账**（[`Config::read_in`]，**两处都绝不用 `toml_edit` 再 parse
+///   一遍自验** —— 那等于用写它的库证明它写对了）。第二次判的东西和第一次不同：同目录里被
+///   并发改写、rename 没换成功，只有"真在文件上的字节"这一侧看得见，而那一次已经改过文件 ⇒
+///   所以它的报错只能说"已写出而读不回"，不能说"原样"。
+pub fn write_ui_key_in(env: &ConfigEnv, key: &str, value: &str) -> Result<PathBuf, String> {
+    if !UI_KEYS.contains(&key) {
+        return Err(format!(
+            "`{key}` 不是 [{SECTION_UI}] 的键（本轮只认 {UI_KEYS:?}）⇒ 没有写任何东西"
+        ));
+    }
+    if value.trim().is_empty() {
+        return Err(format!(
+            "`{key}` 的值为空 ⇒ 拒绝写回（空值会被 reader 判成\"未设置\"并出声，写进去只是把用户原来的设置抹掉）"
+        ));
+    }
+    let path = config_path(env);
+    let at = path.display().to_string();
+
+    // 已存在的文件读不出来 = 拒绝，不是"当没有文件重写一份"。
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{at}: 现有配置文件读不出来（{e}）⇒ 拒绝改写")),
+    };
+    let mut doc: toml_edit::DocumentMut = if text.is_empty() {
+        toml_edit::DocumentMut::default()
+    } else {
+        text.parse().map_err(|e| {
+            format!("{at}: 现有内容不是合法 TOML（{e}）⇒ 拒绝改写（改写会把注释与其余行刷平）")
+        })?
+    };
+    if doc.get(SECTION_UI).is_none() {
+        doc[SECTION_UI] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    // 把原值的 decor（前导空白 + 行尾注释）摘下来贴回新值 ⇒ `lang = "zh"   # 界面语言`
+    // 改完只剩注释换不掉，那正是"只改一个键"的含义。
+    let decor = doc
+        .get(SECTION_UI)
+        .and_then(|ui| ui.get(key))
+        .and_then(|it| it.as_value())
+        .map(|v| v.decor().clone());
+    let mut item = toml_edit::value(value);
+    if let Some(d) = decor {
+        if let Some(v) = item.as_value_mut() {
+            *v.decor_mut() = d;
+        }
+    }
+    doc[SECTION_UI][key] = item;
+    let bytes = doc.to_string();
+
+    // **落盘之前**先用我们自己的 reader 判一次（`parse` = reader 的纯函数部分）。放这一步的理由：
+    // 一旦 rename 过去再发现读不回来，用户的文件已经被改坏了，那句报错救不回来。
+    // 抓的是 `ui = { lang = "zh" }` 这种 **TOML 合法而我们的 reader 不认**的形状。
+    let (preset, _) = parse(&bytes, &path);
+    if reads_back(key, &preset).as_deref() != Some(value) {
+        return Err(format!(
+            "{at}: 将要写出的字节里 `{key}` 读不回 {value:?}（我们的 reader 只认 [{SECTION_UI}] 段下\
+             `key = \"值\"` 那一行）⇒ **文件未改动**，请手工检查这份配置（例如内联表 `ui = {{ {key} = \"…\" }}` 这种写法）"
+        ));
+    }
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建不了 {}: {e}", dir.display()))?;
+    }
+    let tmp = {
+        let mut name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".to_string());
+        name.push_str(".opet-tmp");
+        path.with_file_name(name)
+    };
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("写不了 {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{at}: 落盘失败（{e}）⇒ 原文件未改动")
+    })?;
+
+    // 再从**磁盘**读回一次：前面那次判的是"要写的字节"，这一次判的是"真在那个文件上的字节"
+    // （同一目录里被别人同时改写、rename 语义、临时文件没换成功，都只有这一侧看得见）。
+    let back = Config::read_in(env);
+    let got = reads_back(key, &back.ui);
+    if got.as_deref() != Some(value) {
+        return Err(format!(
+            "{at}: 写进去 {value:?} 而从磁盘读回来 {got:?} ⇒ writer 与 reader 不是同一套语法，\
+             这条设置重启后不会生效（⚠️ **文件已经改动**，到这一步没法退回，请手工检查）"
+        ));
+    }
+    Ok(path)
 }
 
 /// 平坦语法：**注释 `#`、`[段]`、`key = "值"`**。返回认到的 `[ui]` 键 + 每一条出声的说明。
@@ -296,6 +417,11 @@ fn parse(text: &str, path: &Path) -> (UiKeys, Vec<String>) {
 }
 
 /// 只认 `"…"` 一种写法。给出错信息时把用户写的原样带回去，别只说"格式错"。
+///
+/// **右引号后面允许"空白 + `#` 注释"**（`lang = "zh" # 界面语言`）：这既是 TOML 的合法写法，
+/// 也是 [`write_ui_key`] 写回的字节必然带的东西（`toml_edit` 把行尾注释留在 value 的 decor 里）。
+/// reader 当初不接受它 = 我们自己写的文件我们自己读不回去，而"设置完语言重启就没了"比"打错
+/// 引号"更常被撞上。严格 TOML 的裸回车、第二个值、`key = "a" "b"` 这类仍一律出声。
 fn unquote(raw: &str) -> Result<String, String> {
     let Some(rest) = raw.strip_prefix('"') else {
         return Err(if raw.is_empty() {
@@ -304,11 +430,17 @@ fn unquote(raw: &str) -> Result<String, String> {
             format!("值要用双引号括起来，这里写的是 {raw}")
         });
     };
-    let Some(inner) = rest.strip_suffix('"') else {
+    // 第一个 `"` 即闭合引号 ⇒ 引号内**从不**跨引号配对，`"a" "b"` 会走到下面那条
+    // "右引号后面还写着东西"，而不是静默吞掉后半截。
+    let Some(close) = rest.find('"') else {
         return Err(format!("少了右边的引号：{raw}"));
     };
-    if inner.contains('"') {
-        return Err(format!("引号不成对：{raw}（本轮不支持转义 `\\\"`）"));
+    let inner = &rest[..close];
+    let after = rest[close + 1..].trim_start();
+    if !after.is_empty() && !after.starts_with('#') {
+        return Err(format!(
+            "右引号后面还写着东西：{raw}（只允许空白或 `#` 注释；本轮不支持转义 `\\\"`）"
+        ));
     }
     Ok(inner.to_string())
 }
@@ -517,5 +649,346 @@ lang = \"ko\"
             n.contains("重复") && n.contains("第 3 行") && n.contains("第 2 行"),
             "重复键要点名两行：{n}"
         );
+    }
+
+    // ---- writer（§9.2 第 19 条：带注释的 config.toml 写回后注释仍在）----
+
+    /// 一份"用户真的会手写"的配置，**writer 的对照样本**。这十行里每一行的存在理由都要在
+    /// 写完后仍然成立：顶部两条注释、一条空行、`[ui]` 两个键、其中一条带**行尾注释**、
+    /// 又一条空行 + 一条注释、还有一个我们本轮不认识的 `[render]` 段与它的**数值**键。
+    const COMMENTED: &str = r#"# OPet 的用户设置
+# 手工编辑也行，菜单里的语言/动画也会写这里
+
+[ui]
+lang = "zh"   # 界面语言
+motion = "full"
+
+# 下面这段本轮不生效，reader 要出声而字节要原样留着
+[render]
+fps_active = 30
+"#;
+
+    /// writer 的沙盒。**刻意不复用 [`write_and_read`]**：它返回时 `TempDir` 就 drop 了，
+    /// 而这一族测试有一半要在写完之后去读**磁盘上的字节**。
+    struct Sandbox {
+        dir: tempfile::TempDir,
+        env: ConfigEnv,
+    }
+
+    impl Sandbox {
+        /// `seed = None` = 那份配置还不存在（第一次写的那条路径）。
+        fn with_text(seed: Option<&str>) -> Self {
+            let dir = tempfile::tempdir().expect("临时目录");
+            let conf = dir.path().join("opet");
+            std::fs::create_dir_all(&conf).expect("建 opet/");
+            if let Some(text) = seed {
+                std::fs::write(conf.join("config.toml"), text).expect("写种子配置");
+            }
+            let env = ConfigEnv::with(dir.path().to_str(), Some("/home/nobody"));
+            Self { dir, env }
+        }
+
+        /// 走 `config_path` 而不是自己拼 `opet/config.toml`：这一族测试要钉的就是
+        /// **writer 落在 reader 会去读的那个路径上**，共用同一个函数才有这个保证。
+        fn path(&self) -> PathBuf {
+            config_path(&self.env)
+        }
+
+        /// 磁盘上的原始字节 —— "注释仍在"是字节层面的事，只看 reader 认不认得会漏掉整类缺陷。
+        fn raw(&self) -> String {
+            std::fs::read_to_string(self.path()).expect("读回 config.toml")
+        }
+
+        /// 临时文件有没有留在目录里（rename 成功 = 不该留；rename 失败 = 也得删掉）。
+        fn leftovers(&self) -> Vec<String> {
+            let mut out = Vec::new();
+            for entry in std::fs::read_dir(self.dir.path().join("opet")).expect("读目录") {
+                let name = entry
+                    .expect("目录项")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned();
+                if name.contains(".opet-tmp") {
+                    out.push(name);
+                }
+            }
+            out
+        }
+    }
+
+    /// 旗舰那条：**改一个键，别的东西一个字节都不许多动**。
+    ///
+    /// 断言分三层，缺任何一层都放过一种真 bug：① **逐行 diff**（只有一行变 ⇒ 抓"整份重写"）
+    /// ② **那一行里注释还在**（抓 decor 丢失）③ **我们的 reader 读得回来**（抓"写出 reader 不认
+    /// 的字节"，而这一步正是 R 要解决的：`toml_edit` 把行尾注释写进值的 suffix ⇒
+    /// `lang = "en"   # 界面语言` ⇒ R 之前的 reader 判"少了右边的引号"）。
+    #[test]
+    fn writing_a_commented_key_keeps_the_comment() {
+        let sb = Sandbox::with_text(Some(COMMENTED));
+        let before = sb.raw();
+
+        let written = write_ui_key_in(&sb.env, KEY_LANG, "en").expect("写 lang 应当成功");
+        assert_eq!(written, sb.path(), "返回的路径要就是 reader 读的那个");
+
+        let after = sb.raw();
+        let b: Vec<&str> = before.lines().collect();
+        let a: Vec<&str> = after.lines().collect();
+        assert_eq!(a.len(), b.len(), "行数变了 = 整份被重写：\n{after}");
+        let diff: Vec<usize> = (0..b.len()).filter(|i| a[*i] != b[*i]).collect();
+        assert_eq!(
+            diff,
+            [4],
+            "改动面必须正好是 lang 那一行（第 5 行）；其余逐字节不动。差异行 = {:?}",
+            diff.iter().map(|i| (i + 1, a[*i])).collect::<Vec<_>>()
+        );
+        assert!(a[4].contains("\"en\""), "新值没写进去：{}", a[4]);
+        assert!(a[4].contains("# 界面语言"), "行尾注释被刷平了：{}", a[4]);
+
+        // 第三层：判据是我们的 reader，不是 toml_edit 再 parse 一遍。
+        let cfg = Config::read_in(&sb.env);
+        assert_eq!(
+            cfg.ui.lang.as_deref(),
+            Some("en"),
+            "写进去读不回：{}",
+            sb.raw()
+        );
+        assert_eq!(cfg.ui.motion.as_deref(), Some("full"), "没让它动的键不许动");
+        assert_eq!(
+            cfg.notices.len(),
+            1,
+            "那一段 `[render] 本轮不生效` 必须还在（它没了 = 用户那段被删了）：{:?}",
+            cfg.notices
+        );
+        assert!(
+            sb.leftovers().is_empty(),
+            "临时文件没清：{:?}",
+            sb.leftovers()
+        );
+    }
+
+    /// 上面那条测了 `lang`；这条测**另一个键**，而且断言的是"没被点的那一行逐字节相同"。
+    /// 分页式写法（先整份反序列化再整体序列化）最容易在这里露出：它会顺手把别的行的间距、
+    /// 引号风格、注释位置一起"规范化"。
+    #[test]
+    fn writing_the_other_key_leaves_the_first_line_byte_identical() {
+        let sb = Sandbox::with_text(Some(COMMENTED));
+        let before = sb.raw();
+
+        write_ui_key_in(&sb.env, KEY_MOTION, "reduce").expect("写 motion 应当成功");
+
+        let after = sb.raw();
+        let b: Vec<&str> = before.lines().collect();
+        let a: Vec<&str> = after.lines().collect();
+        assert_eq!(a.len(), b.len(), "{after}");
+        assert_eq!(a[4], b[4], "lang 那一行被蹭到了：{:?} → {:?}", b[4], a[4]);
+        let diff: Vec<usize> = (0..b.len()).filter(|i| a[*i] != b[*i]).collect();
+        assert_eq!(diff, [5], "改动面必须正好是 motion 那一行");
+        assert!(
+            a[5].contains("reduce") && !a[5].contains("full"),
+            "{}",
+            a[5]
+        );
+
+        let cfg = Config::read_in(&sb.env);
+        assert_eq!(cfg.ui.lang.as_deref(), Some("zh"));
+        assert_eq!(cfg.ui.motion.as_deref(), Some("reduce"));
+        assert!(sb.leftovers().is_empty());
+    }
+
+    /// `toml_edit` 会写出行尾注释的**四种来源**，逐一由 reader 判（探针里 R 之前红的三个形状
+    /// 都在这一张表里，第四个是"文件里根本没有 `[ui]` 段"）。
+    ///
+    /// 一张表而不是四条测试：它们的判据完全同形（"写完 reader 读得回、出声条数对"），
+    /// 拆开就是把同一个断言抄四遍。
+    #[test]
+    fn the_shapes_toml_edit_emits_all_read_back_in_our_reader() {
+        let cases: Vec<(&str, &str, &str, &str, usize)> = vec![
+            (
+                "原值带行尾注释",
+                COMMENTED,
+                KEY_LANG,
+                "en",
+                1, // 那一条 [render] 不生效
+            ),
+            (
+                "两个键都带注释而只动其中一个",
+                r#"[ui]
+lang = "zh" # A
+motion = "full" # B
+"#,
+                KEY_LANG,
+                "en",
+                0,
+            ),
+            (
+                "单引号（reader 本来不认）被改成我们的写法",
+                r#"[ui]
+lang = 'zh' # 单引号
+"#,
+                KEY_LANG,
+                "en",
+                0,
+            ),
+            (
+                "文件里没有 [ui] 段",
+                r#"[render]
+fps_active = 30
+"#,
+                KEY_MOTION,
+                "off",
+                1,
+            ),
+        ];
+
+        for (name, seed, key, value, want_notices) in cases {
+            let sb = Sandbox::with_text(Some(seed));
+            let e = write_ui_key_in(&sb.env, key, value);
+            assert!(e.is_ok(), "[{name}] 写失败：{:?}", e.err());
+
+            let after = sb.raw();
+            let cfg = Config::read_in(&sb.env);
+            assert_eq!(
+                reads_back(key, &cfg.ui).as_deref(),
+                Some(value),
+                "[{name}] 写完读不回，字节是：\n{after}"
+            );
+            assert_eq!(
+                cfg.notices.len(),
+                want_notices,
+                "[{name}] 出声条数不对（多了=吵，少了=把用户的段吞了）：{:?}\n{after}",
+                cfg.notices
+            );
+            assert!(
+                sb.leftovers().is_empty(),
+                "[{name}] 临时文件没清：{:?}",
+                sb.leftovers()
+            );
+        }
+
+        // 那两条"注释"的具体下落：动了的那条与没动的条都要活着。
+        let sb = Sandbox::with_text(Some(
+            r#"[ui]
+lang = "zh" # A
+motion = "full" # B
+"#,
+        ));
+        write_ui_key_in(&sb.env, KEY_LANG, "en").unwrap();
+        let after = sb.raw();
+        assert!(
+            after.contains("# A") && after.contains("# B"),
+            "两条注释少一条：{after}"
+        );
+        assert!(
+            after.contains("motion = \"full\""),
+            "没动的键被规范化了：{after}"
+        );
+    }
+
+    /// R 的另一半：**接受**"空白 + `#` 注释"，而**不接受**别的尾巴。
+    /// 只测前一半会把 reader 从"严格"改成"宽松"，那正是这条设计最不该有的副作用。
+    #[test]
+    fn a_trailing_comment_is_allowed_while_trailing_junk_is_not() {
+        let ok = write_and_read(
+            r#"[ui]
+lang = "zh"   # 界面语言
+motion = "full"	# 动画强度（这一行故意用 tab 分隔注释）
+"#,
+        );
+        assert_eq!(ok.ui.lang.as_deref(), Some("zh"));
+        assert_eq!(ok.ui.motion.as_deref(), Some("full"), "tab 也算空白");
+        assert!(
+            ok.notices.is_empty(),
+            "行尾注释不是错误，出声就是吵：{:?}",
+            ok.notices
+        );
+
+        let bad = write_and_read("[ui]\nlang = \"a\" \"b\"\n");
+        assert_eq!(bad.ui.lang, None, "尾巴不是注释却放行了");
+        assert_eq!(bad.notices.len(), 1, "{:?}", bad.notices);
+        assert!(
+            bad.notices[0].contains("右引号后面还写着东西"),
+            "{}",
+            bad.notices[0]
+        );
+    }
+
+    /// 拒绝改写的第一种：**现有文件不是合法 TOML**。这时连 `toml_edit` 都不该碰它。
+    #[test]
+    fn a_file_we_cannot_parse_is_refused_and_untouched() {
+        let junk = "[ui\nlang = \nfps_active = oops\n";
+        let sb = Sandbox::with_text(Some(junk));
+        let before = sb.raw();
+
+        let e = write_ui_key_in(&sb.env, KEY_LANG, "en").expect_err("非法 TOML 必须拒绝改写");
+        assert!(
+            e.contains("不是合法 TOML") && e.contains("拒绝改写"),
+            "要说清为什么拒：{e}"
+        );
+        assert_eq!(sb.raw(), before, "拒绝就得一个字节都不动");
+        assert!(sb.leftovers().is_empty());
+    }
+
+    /// 拒绝改写的第二种：**TOML 合法而我们的 reader 不认**（内联表）。
+    ///
+    /// 这条测的重点不是"报错"而是**报错的时机**：那道判卷落在 rename 之前 ⇒ 用户的文件
+    /// 必须还是原样，那句"文件未改动"才是真话（写完之后才判的版本会让这句话变成假话）。
+    #[test]
+    fn an_inline_table_is_refused_before_the_file_is_touched() {
+        let seed = "ui = { lang = \"zh\" }\n";
+        let sb = Sandbox::with_text(Some(seed));
+        let before = sb.raw();
+
+        let e = write_ui_key_in(&sb.env, KEY_LANG, "en")
+            .expect_err("reader 读不出内联表 ⇒ 不许写出去让它变成读得回的形状");
+        assert!(e.contains("文件未改动"), "{e}");
+        assert_eq!(
+            sb.raw(),
+            before,
+            "这道红线守的是用户的文件，不是我们的错误信息"
+        );
+        assert!(sb.leftovers().is_empty());
+    }
+
+    /// 两种"根本不该走到磁盘"的输入：不是 `[ui]` 的键、空值。
+    #[test]
+    fn a_key_outside_ui_and_an_empty_value_write_nothing() {
+        let sb = Sandbox::with_text(Some(COMMENTED));
+        let before = sb.raw();
+
+        let e = write_ui_key_in(&sb.env, "fps_active", "30").expect_err("段外的键要拒");
+        assert!(
+            e.contains("不是 [ui] 的键") && e.contains("没有写任何东西"),
+            "{e}"
+        );
+
+        let e = write_ui_key_in(&sb.env, KEY_LANG, "   ").expect_err("空值要拒");
+        assert!(e.contains("值为空") && e.contains("拒绝写回"), "{e}");
+
+        assert_eq!(sb.raw(), before, "这两种拒绝根本没碰文件");
+        assert!(sb.leftovers().is_empty());
+    }
+
+    /// 文件不存在时**要能把它造出来**（不然"设置持久化"这个功能在第一次用之前是空的）。
+    #[test]
+    fn the_first_write_creates_the_file_and_the_ui_section() {
+        let sb = Sandbox::with_text(None);
+        assert!(!sb.path().exists(), "前提：还不存在");
+
+        let written = write_ui_key_in(&sb.env, KEY_LANG, "zh").expect("不存在也得写出来");
+        assert_eq!(written, sb.path());
+
+        let after = sb.raw();
+        assert!(after.contains("[ui]"), "要自带段头：{after:?}");
+        assert!(after.contains("lang = \"zh\""), "{after:?}");
+
+        let cfg = Config::read_in(&sb.env);
+        assert_eq!(cfg.source, ConfigSource::File);
+        assert_eq!(cfg.ui.lang.as_deref(), Some("zh"));
+        assert!(
+            cfg.notices.is_empty(),
+            "自己写的字节不该吵：{:?}",
+            cfg.notices
+        );
+        assert!(sb.leftovers().is_empty());
     }
 }

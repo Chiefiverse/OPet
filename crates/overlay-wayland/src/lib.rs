@@ -10,6 +10,7 @@ pub mod cli;
 pub mod font;
 pub mod l10n;
 pub mod menu;
+pub mod panel;
 pub mod probe;
 pub mod region;
 pub mod settings;

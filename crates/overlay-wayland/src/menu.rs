@@ -38,31 +38,39 @@ pub enum MenuItem {
     /// 丢掉配件、把穿透轮廓换回本体那份。
     Unequip,
     // ── 收藏册页 ──
-    /// 把"每档各拥有几种 / 共几种 + 重复 + 碎片"打到 stderr。**纯读**：不掷骰、不花钱、不改库。
+    /// 点它 = **开出收藏册面板的「已获得」那一屏**（"每档各拥有几种 / 共几种 + 重复 + 碎片"）。
+    /// **纯读**：不掷骰、不花钱、不改库。stderr 逐字 echo 屏上那几行 ⇒ 屏与日志同一个口径。
     Owned,
-    /// 把 catalog 里还没拿到的名字打到 stderr。名字来自 catalog ⇒ 这些字**已经在子集里**
-    /// （`everything_the_ui_can_render_is_in_the_codes_list` 那条门禁把 catalog 也纳进去了），
-    /// 所以这一行是换装页那条"配件名盖不住"的反面：它能上卡片，但本批仍只出 stderr，
-    /// 因为把变长的一列名字塞进 240×150 的卡片要动的是版式而不是这一行。
+    /// 点它 = 开出面板的「还缺」那一屏。名字来自 catalog ⇒ 这些字**已经在子集里**
+    /// （`everything_the_ui_can_render_is_in_the_codes_list` 那条门禁把 catalog 也纳进去了）。
+    /// 这一行的宽度是**量出来的**（`App::Gacha::missing_lines` + [`crate::panel::ROW_TEXT_W`]）：
+    /// 装不下的名字折成 `+N 更多`，而不是让 `fit` 收成一个 `…` —— 那会让人以为"缺的就这些"。
     Missing,
-    /// 把账本最近若干次抽取打到 stderr（读 `gacha_pull`，不写）。
+    /// 点它 = 开出面板的「最近」那一屏（读 `gacha_pull`，一个字都不写）。条数 = 一屏装得下的
+    /// 那五行（[`crate::panel::MAX_ROWS`] 减一，第六格固定是 `Close`）。
     Recent,
     // ── 设置页 ──
-    /// 循环 `full → reduce → off`。**只改本进程**，不写回 config.toml —— 与 [`Self::Lang`] 同一
-    /// 条理由（§7-R15：手写 reader 保不住用户注释）。
+    /// 点它 = **开出设置面**。这一行自己的字不含档位，所以 `full → reduce → off` 那个循环
+    /// 交给面板上的 `Motion` 格（它同时**写回 `config.toml`**，见 [`Self::Lang`] 那条）。
     MotionTier,
-    /// 把公示概率打到 stderr。读的是 `rates.json` 那份**引擎推导**的公示（不掷骰 ⇒ 这一行
-    /// 跟"这次抽到了什么"无关，它读的是"承诺了什么"）。
+    /// 点它 = 把公示概率那五行送进面板。读的是 `rates.json` 那份**引擎推导**的公示（不掷骰 ⇒
+    /// 这一行跟"这次抽到了什么"无关，它读的是"承诺了什么"），而且**不碰库**（`ensure_gacha`
+    /// 都不需要 —— 内存档的玩家同样要看公示）。
     Rates,
-    /// 跑一遍审计链复核并把结论打到 stderr。`Store::verify` 只读 ⇒ 这一行不需要确认步骤，
-    /// 这也是它进设置页而 `redeem_ssr` **不进**的唯一分界：后者花掉 120 碎片不可回退，
-    /// 而这块 surface 没有对话框（D14）。
+    /// 点它 = 跑一遍审计链复核，把结论两行送进面板。`Store::verify` 只读 ⇒ 这一行不需要确认
+    /// 步骤，这也是它进设置页而 `redeem_ssr` **不进**的唯一分界：后者花掉 120 碎片不可回退，
+    /// 而这块 surface 没有对话框（D14）。⚠️ 链头在屏上只是**前缀**（64 位十六进制装不进
+    /// 216 px 那一格），完整的那一份权威出处是 `opet audit verify`。
     Verify,
     // ── 不属于任何一页的控件 ──
     /// 标题条：点一下换到下一页。它画的字来自 [`MenuPage::header_text`]，不来自 [`Self::label`]。
     Page,
-    /// 点一下循环 zh→en→ja→ko。**只改本进程**，不写回 config.toml（§7-R15：手写 reader
-    /// 保不住用户注释，读改写会把文件刷平）。
+    /// 点一下循环 zh→en→ja→ko，**并且当场写回 `config.toml`**（拍板④「设置功能……并实现
+    /// 功能」）。旧文档那句"只改本进程、不写回（§7-R15）"已作废：它说的是"只有自写的平坦
+    /// reader"那个年代 —— 读改写会把用户注释刷平。`petstore::config::write_ui_key` 换掉了
+    /// 那个前提（`toml_edit` 保住 decor 与不认识的段，落盘前后各用**我们自己的** reader
+    /// 判一遍）。写回失败**不**回滚本进程已生效的那一档，只在错误行与 stderr 出声
+    /// （`App::persist_ui_key`）；`--lang` 高于文件那条链一个字没改。
     Lang,
 }
 
@@ -1039,7 +1047,9 @@ pub fn report_lines(
         scale,
     ));
     // 档位计数行：只列非零档，从高到低。稳定排序 ⇒ 同档永远按抽取顺序出。
-    let tiers = l10n::line_tiers(counts);
+    // 这一格把 `u32` 加宽成 `u64`（`line_tiers` 的入型）：一次抽取的计数必然装得下，而那个
+    // 函数同时服务复核屏上"整条账本"的计数 ⇒ 往宽的方向加宽，是这条唯一不撒谎的走法。
+    let tiers = l10n::line_tiers(&counts.map(u64::from));
     if !tiers.is_empty() {
         lines.push(fit(&tiers, scale));
     }

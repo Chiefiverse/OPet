@@ -176,6 +176,11 @@ def load_body_manifest(path):
 
     if "slot" in body:
         bad("这份清单有 slot ⇒ 它是一份**配件**清单，而 --body 要的是本体那份 pet.json")
+    if not body.get("slug"):
+        bad(
+            "缺少 slug（或它是空串）⇒ 本体清单的内核校验同样要求 slug 非空（manifest.rs），"
+            "而配件的 fits 默认就是抄它；没有 slug 就只能瞎写一个名字，那正是 11-03 那条空转门禁的形状"
+        )
     anchor = body.get("anchor") or {}
     if "feet" not in anchor:
         bad("缺少 anchor.feet ⇒ 这不是本体清单（本体必须有脚锚），或者它没经过内核校验")
@@ -337,6 +342,24 @@ def pack_accessory(args):
     （`dir.join("sheet.webp")` / `dir.join("polygon.json")`），分开放就是"清单加载成功而装备失败"。
     """
     body = load_body_manifest(args.body)
+    # `fits` 的默认 = **`--body` 那份清单上的 slug**，而 2026-11-04 起那个章是本体真的身份
+    # （见 `main()` 里"本体身份 = --pet"那一段）。这条在 11-03 之前是**空转门禁**：八份本体产物
+    # 全被盖成 fixture 的 `cat_shiro` ⇒ 一顶为老虎烘的帽子章上也写着 cat_shiro，于是它对今天
+    # 四只模型之间的错配一个都拦不住（`accessory.rs::validate_against` 那句"这件配件不是为这只
+    # 宠物烘的"永远不会响）。
+    #
+    # 这道判断放在**任何磁盘写入与逐格解码之前**：它只读两个字符串，而它拒的是"这份清单刚被
+    # 要求抄它、刚被要求与它同相机，产出后却必然在装载那一刻被内核拒掉"。付完 320 格再被告知
+    # 就是 `--cell` 那条"一行就能判出来的错先付装载代价"的同一种浪费。
+    fits = [s.strip() for s in args.fits.split(",") if s.strip()] or [body["slug"]]
+    if body["slug"] not in fits:
+        sys.exit(
+            "--fits %s 不含 --body 那一只 %r ⇒ 这份清单刚被要求抄它、刚被要求与它同相机，\n"
+            "    而产出的配件在装载那一刻必然被 `validate_against` 拒掉。要么去掉 --fits 用默认，\n"
+            "    要么把 %r 写进去（真的要多本体通用就逐个列全）。\n"
+            "    注意这一拒同时也是「本体那份章可能是错的」的信号：先 grep 一下 %s 里的 slug。"
+            % (fits, body["slug"], body["slug"], args.body)
+        )
     out_dir = args.out or os.path.join(REPO, "assets", "accessories", args.accessory)
     frames_dir = args.frames or os.path.join(out_dir, "frames")
     os.makedirs(out_dir, exist_ok=True)
@@ -386,7 +409,8 @@ def pack_accessory(args):
     if args.display_name:
         manifest["display_name"] = args.display_name
     manifest["slot"] = args.slot
-    manifest["fits"] = [s.strip() for s in args.fits.split(",") if s.strip()] or [body["slug"]]
+    # `fits` 与"必须含本体 slug"那道拒绝都在函数开头（读两个字符串就能判，不该付解码代价）。
+    manifest["fits"] = fits
     manifest["sheet"] = "sheet.webp"
     manifest["grid"] = {"cols": FACING_COLUMNS, "rows": grid_rows, "w": cell, "h": cell}
     manifest["states"] = {
@@ -471,7 +495,12 @@ def main():
         default="",
         help="本体批次的 frames 目录；给了它就把两批的 feet_px 逐位比一遍，不同即拒绝（不写任何文件）",
     )
-    ap.add_argument("--display-name", default="", help="配件显示名（可省）")
+    ap.add_argument(
+        "--display-name",
+        default="",
+        help="正式显示名（两档都能给）：本体档不给就用 fixture 的名字（只有 --pet 就是 fixture "
+        "那一只时）或 slug 本身；配件档不给就省略这个字段",
+    )
     ap.add_argument("--fits", default="", help="逗号分隔的适配本体 slug；默认 = --body 那一只")
     args = ap.parse_args()
 
@@ -498,10 +527,13 @@ def main():
         pack_accessory(args)
         return
 
-    if args.slot or args.body or args.body_frames or args.fits or args.display_name:
+    # ⚠️ `--display-name` **不在这一串里**：它两档都用（本体那一档给 `body_name` 用，见下面
+    # 「身份与行布局分家」那段）。把它留在"只在 --accessory 有意义"的名单里 = 一条**永远拦住
+    # 合法用法**的门禁，而本体档唯一能盖对中文名的路就被它自己堵死（假开关同族）。
+    if args.slot or args.body or args.body_frames or args.fits:
         stray = " ".join(
             flag
-            for flag, on in (("--slot", args.slot), ("--body", args.body), ("--body-frames", args.body_frames), ("--fits", args.fits), ("--display-name", args.display_name))
+            for flag, on in (("--slot", args.slot), ("--body", args.body), ("--body-frames", args.body_frames), ("--fits", args.fits))
             if on
         )
         sys.exit(
@@ -509,7 +541,25 @@ def main():
             "那几个参数会被完全忽略。要么补 --accessory，要么把它们去掉。" % stray
         )
 
-    pet = args.pet or "cat_shiro"
+    # **身份必须显式**（拍板③的连带一半）：`--pet` 原先只用来拼默认路径，八份产物
+    # （`rabit / spacecat / tiger` 两档）当初都是走文档里那条 `--frames X --out Y`（不带 `--pet`）
+    # 烘的 ⇒ 默认值 `cat_shiro` 一路盖到每一只身上。只修 `slug` 那一个赋值不够：**路径被重定向后
+    # 默认 slug 就不再指向任何东西**，它是一条没人认领的章。所以这里宁可直接拒绝，也不猜目录名
+    # （`rabit_192` ≠ slug `rabit`；猜出来的是第二条假章，只是换了个写法）。
+    pet = args.pet
+    if not pet:
+        if args.frames or args.out:
+            redirected = " ".join(
+                flag for flag, on in (("--frames", args.frames), ("--out", args.out)) if on
+            )
+            sys.exit(
+                "给了 %s 而没给 --pet ⇒ 这次打的图集**叫什么**没有任何输入说得出。\n"
+                "    以前它默默用默认值 cat_shiro，于是给老虎/兔子/太空猫烘的八份产物全被盖成\n"
+                "    「小白」，而配件那一档的 fits 抄的还是同一个错章 ⇒ validate_against 空转。\n"
+                "    补 --pet <本体 slug>（正式名另给 --display-name）。目录名不能当 slug：\n"
+                "    assets/pets/tiger_192 那只的 slug 是 tiger，不是 tiger_192。" % redirected
+            )
+        pet = "cat_shiro"
     fixture = load_fixture()
     frames_dir = args.frames or os.path.join(REPO, "assets", "pets", pet, "frames")
     out_dir = args.out or os.path.join(REPO, "assets", "pets", pet)
@@ -534,10 +584,36 @@ def main():
     if not (0 <= anchor[0] <= cell and 0 <= anchor[1] <= cell):
         sys.exit("anchor.feet %s 不在 %dx%d 帧内，内核会拒绝" % (anchor, cell, cell))
 
+    # ⚠️ **身份与行布局分家**（拍板③，11-03 实测抓到的那条空转门禁的根）：fixture 那份
+    # `cat_shiro.pet.json` 是**行布局**（`states.*.rows` / fps / loop / facing）的唯一事实源，
+    # 它**从来不是身份的事实源** —— 原先这里写 `"slug": fixture["slug"]`，于是
+    # `rabit / spacecat / tiger` 两档共八份产物全被盖成 `cat_shiro`，`display_name` 也全叫「小白」。
+    # 连带后果是配件那一档 `fits=[body["slug"]]` 抄的还是同一个错章 ⇒ `validate_against`
+    # （`accessory.rs:157`）对今天这四只模型之间的错配**一个都拦不住**：一顶为老虎烘的帽子装到
+    # 兔子身上全绿灯，只有像素（两批 `feet_px`）会露馅。所以本体身份 = `--pet` 那一只。
+    #
+    # 这两列**不进指纹**：`Sim::fingerprint()`（`sim.rs:207-228`）混的是 tick / state / pos / vel /
+    # facing / rng.counter / `last_sprite` 的 row·col·frame，一个字符串都不读 ⇒ 改章不动基线
+    # `ea97139205536cd8`（这条由本文件末尾那条对照验过，不是推论）。
+    body_slug = pet
+    if body_slug == fixture.get("slug"):
+        # 只有"这一份就是 fixture 那一只"时，fixture 的正式中文名才属于它。
+        body_name = args.display_name or fixture.get("display_name", body_slug)
+    elif args.display_name:
+        body_name = args.display_name
+    else:
+        # 不认得的名字**不编**：把「小白」发给一只老虎，比只写 slug 更坏（那是第二条假章）。
+        body_name = body_slug
+        print(
+            "PACK 提示：--pet %s 与 fixture 的 %s 不是同一只 ⇒ 不继承 display_name「%s」，"
+            "这一栏先写 slug；要正式中文名就加 --display-name。"
+            % (body_slug, fixture.get("slug"), fixture.get("display_name"))
+        )
+
     manifest = {
         "format": fixture["format"],
-        "slug": fixture["slug"],
-        "display_name": fixture.get("display_name", fixture["slug"]),
+        "slug": body_slug,
+        "display_name": body_name,
         "sheet": "sheet.webp",
         "grid": {
             "cols": FACING_COLUMNS,

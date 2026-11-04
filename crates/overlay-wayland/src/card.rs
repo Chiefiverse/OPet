@@ -21,6 +21,7 @@ use crate::l10n::{self, Key, Lang};
 use crate::menu::{
     self, CARD_H, CARD_W, CORNER, FOOTER_GAP, MenuAnim, MenuPage, PAD, RectI, TEXT_PX,
 };
+use crate::panel::{self, PanelKind, PanelRow};
 use crate::settings::Motion;
 use crate::text;
 
@@ -748,6 +749,120 @@ fn paint_reveal(canvas: &mut [u8], stride: usize, lines: &[String], best: Rarity
             Align::Left,
         );
     }
+}
+
+/// 面板（裁定④）一帧的全部输入。
+///
+/// 打包的理由与 [`Ctx`] 是同一条，而这里是那条理由的**第二次生效**：`paint_panel` 数一下
+/// 就是 9 个参数（canvas/bw/bh/stride + kind/lang/rows/error/scale）⇒ 直接踩
+/// `clippy::too_many_arguments`，而门禁是零 warning。
+#[derive(Clone, Copy)]
+pub struct PanelCtx<'a> {
+    /// 这一面是哪一本：收藏册（带当前 tab）还是设置。它决定**标题带画什么字**
+    /// （[`panel::header_text`]）与**点标题带那一格是什么意思**（[`panel::PanelKind::cycle`]：
+    /// 收藏册换 tab，设置面换回默认五行）。[`panel::header_rect`] 对两面一律给
+    /// `PanelItem::Header` ⇒ "是不是控件"不再由 `kind` 决定，这里读它只为选字。
+    pub kind: PanelKind,
+    /// 生效语言。与 [`Ctx::lang`] 同族：**运行中可变**（面板里那一行点下去就换）⇒
+    /// `panel::content_sig` 必须混它，而这里必须**读到它**（每一行的字都从它来）。
+    pub lang: Lang,
+    /// 要画的行。**引用而不是 `Vec`**：这一面唯一的"内容"就是这个列表，而它同时是
+    /// `panel::content_sig` 的输入、`panel::rects` 命中表的输入、和这里的输入 ⇒ 三份必须
+    /// 来自同一个值，不存在"签名读一份、像素画另一份"那种漂移的形状。
+    pub rows: &'a [PanelRow],
+    /// 错误行（连不上库、复核失败都靠它出声）。与 [`Ctx::error`] 同一个来源。
+    pub error: &'a str,
+    pub scale: f32,
+}
+
+/// 画一帧面板。**没有相位** ⇒ 没有 burst、没有白闪、没有 `MenuAnim` 参数。
+///
+/// 版式与菜单同源，而刻意只借两处（这两处的矩形几何由 [`panel`] 与 [`menu`] 共享常量给出）：
+/// - **标题带两段** = 左 [`panel::header_text`]（`FG`）、右 [`PanelCtx::error`]（`ERR_FG`，
+///   **为空就一个字都不画**，与 [`paint_footer`] 同一条纪律：那张"每张正常卡左下角挂着红字
+///   『抽取失败：』"的出图事故，就是给空串冠了前缀画出来的）。
+///   ⚠️ 这里**不套** [`l10n::line_error`] 的前缀：面板上那行可能是"连不上库"而不是"抽卡
+///   失败"，给它加上"抽取失败："是一句假话。
+/// - **行 = 圆角行底 + 可选强调条 + 让位后的标签**，与 [`paint_menu`] 逐条同构。**唯一新增
+///   的规则是"强调条只画在可点的行上"**（[`panel::PanelItem::actionable`]）⇒ 只读数据行有底
+///   无条，`Close`/`Lang`/`Motion`/`Rates`/`Verify` 有条。这就是 §9.2 第 14 条那一族
+///   （"没有可点的外观线索"）在面板上的答案，而它**一个字都不新** ⇒ 零字体成本。
+///   条与让位（[`menu::label_rect`]）必须同进退：画了条不让位 = 字压条上，让了位没条 =
+///   凭空缩进一格，两种都只有出图过眼看得见。
+///
+/// **标题带不画条**（两面的标题带**都是**控件，而这条不随身份变）：它借的是菜单那一页
+/// 标题条的既有约定 —— 页码（收藏册 `已获得 1/3`）就是"这一带是控件"的唯一线索，而那条
+/// 线索在菜单六页上已经用了两批。反面是：这一带同时是**错误行的家**（右段 `ERR_FG`），
+/// 给它画一根左侧强调条会把"标题 / 红字"的分界读成"一个普通可点行"，两种身份挤在同一条
+/// 带上只会都不清楚。
+///
+/// ⚠️ 一处**明写的欠账**，交判据① 过眼：`Settings` 的标题带点下去有作用（换回默认五行）
+/// 而它没有页码，所以"它能点"这件事在这一面上没有视觉线索。它的动作不掷骰、不花钱、
+/// 不改库 ⇒ 误点无害，但漏点（想回去却找不到格子）是真实存在的。要不要给它补线索是视觉
+/// 决定，不是这里能自决的排版问题。
+///
+/// 底板三层 + 重描 + 清角与 [`paint`] 逐字同序，理由也一样（满宽内容与四角的不对称
+/// 只有出图看得见）；差别只在**没有 flash** ⇒ 描边恒 `EDGE`。
+pub fn paint_panel(canvas: &mut [u8], bw: i32, bh: i32, stride: usize, ctx: PanelCtx<'_>) {
+    let scale = ctx.scale;
+    let corner = px(CORNER, scale);
+    let t = px(1, scale).max(1);
+    canvas.fill(0);
+    fill_round(canvas, stride, (0, 0, bw, bh), corner, bgra(EDGE));
+    fill_round(
+        canvas,
+        stride,
+        (t, t, (bw - 2 * t).max(0), (bh - 2 * t).max(0)),
+        (corner - t).max(0),
+        bgra(BG),
+    );
+
+    let head = panel::header_rect(ctx.kind).as_rect();
+    // 左段先按整行预算截一次（它短，正常情况下是 no-op），右段再从"截完之后的左段宽度"里
+    // 拿余量 —— 顺序反了就会让一条长错误把「已获得 1/3」整个挤掉，而那块面上"我在哪一本第
+    // 几页"恰恰是最不能丢的字。
+    let title = menu::fit_to(
+        &panel::header_text(ctx.kind, ctx.lang),
+        menu::line_budget_px(scale),
+        scale,
+    );
+    let budget =
+        (menu::line_budget_px(scale) - line_w(&title, scale) - px(FOOTER_GAP, scale)).max(0);
+    let err = if ctx.error.is_empty() {
+        String::new()
+    } else {
+        menu::fit_to(ctx.error, budget, scale)
+    };
+    if !err.is_empty() {
+        draw_in(canvas, stride, head, scale, ERR_FG, &err, Align::Right);
+    }
+    draw_in(canvas, stride, head, scale, FG, &title, Align::Left);
+
+    // 行与矩形**逐下标配对**：`panel::layout` 从同一份 `rows` 导出来，所以这里不需要在
+    // `RowRect` 上再存一份文本（存了就出现"命中表那一份字"与"像素那一份字"两个事实源，
+    // 而 `content_sig` 比的是后者）。
+    for (r, row_data) in panel::layout(ctx.rows).iter().zip(ctx.rows) {
+        let row = r.as_rect();
+        row_plate(canvas, stride, row, scale);
+        let label = if r.item.actionable() {
+            row_accent(canvas, stride, row, scale);
+            menu::label_rect(row)
+        } else {
+            menu::row_text(row)
+        };
+        draw_in(
+            canvas,
+            stride,
+            label,
+            scale,
+            FG,
+            &menu::fit_to(&row_data.text, budget_of(label, scale), scale),
+            Align::Left,
+        );
+    }
+
+    stroke_round(canvas, stride, (0, 0, bw, bh), corner, t, bgra(EDGE));
+    clip_to_plate(canvas, bw, bh, stride, corner);
 }
 
 #[cfg(test)]

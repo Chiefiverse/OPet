@@ -16,9 +16,14 @@
 //!   这里不能退出：一条坏文件不该让宠物起不来，但**必须出声**，否则"配置支持多语言"就是
 //!   一个只在 grep 里存在的功能。
 //!
-//! ⚠️ 本模块**不碰键盘导航**：菜单 surface 的 `keyboard_interactivity=None`（D14），
-//! 所以生效语言只有"改文件/加参数 + 重启"和"点菜单底部语言行"两条路，后者只改本进程
-//! （§4.6 不回写文件）。
+//! ⚠️ 本模块**不碰键盘导航**：菜单与面板的 surface 都是 `keyboard_interactivity=None`（D14），
+//! 所以生效语言只有"改文件/加参数 + 重启"和"点面板上的语言/动画行"两条路。
+//!
+//! **第二条路现在会写回文件**（拍板④「设置功能……点击菜单弹出窗口……并实现功能」）。旧版这里
+//! 写的是"只改本进程（§4.6 不回写文件）"，那条理由 = 当时只有自写的平坦 reader，读改写会把
+//! 用户注释刷平；`petstore::config::write_ui_key`（`toml_edit` 保 decor + 落盘前后各用**我们的**
+//! reader 判一遍）把那个理由消掉了 ⇒ 写回的职责在 `app::App::persist_ui_key`，**不在本模块**：
+//! 这里只管"谁赢"这条链，而链条本身的行为一个字没改（文件仍是 CLI 之下、环境变量之上）。
 
 use crate::l10n::Lang;
 use petstore::config::{Config, UiKeys};
@@ -31,9 +36,15 @@ pub enum ValueSource {
     ConfigFile,
     EnvVar,
     Default,
-    /// 语言行当场点出来的。**只有 `lang` 会走到这一档**（`motion` 没有 UI 入口，每进程
-    /// 恒定）。留着它是为了让退出摘要不说谎：启动时读到的那一档在点了语言行之后就不是
-    /// 生效来源了，把 `lang_from` 停在 `ConfigFile` 等于告诉排查的人"文件里写着 en"。
+    /// 语言/动画行当场点出来的（`lang` 与 `motion` **两档都有**这一入口，都在面板上）。
+    ///
+    /// 留着这一档是为了让退出摘要不说谎：启动时读到的那一档在点过行之后就不是生效来源了，
+    /// 把 `lang_from` 停在 `ConfigFile` 等于告诉排查的人"文件里原本写着 en"。
+    ///
+    /// ⚠️ **这一档现在也写回文件**（拍板④），但 `as_str` 里**不写"已持久化"**：写回可能失败
+    /// （文件不是合法 TOML、目录不可写、reader 读不回那个形状），而这一列在退出摘要里是
+    /// **无条件打印**的，一句"已持久化"在失败那次就是假话。落没落地由两处单独说：stderr 的
+    /// `ui: lang = "…" 已写回 <路径>` 与面板/菜单那条错误行（`app::App::persist_ui_key`）。
     MenuClick,
 }
 
@@ -44,7 +55,7 @@ impl ValueSource {
             Self::ConfigFile => "config.toml",
             Self::EnvVar => "环境变量",
             Self::Default => "默认值",
-            Self::MenuClick => "菜单当场切换（不持久）",
+            Self::MenuClick => "菜单/面板当场切换",
         }
     }
 }
@@ -426,5 +437,67 @@ mod tests {
             line.contains("config.toml") && line.contains("한국어"),
             "{line}"
         );
+        // 点行那一档说的只是"这一路的来源"，**不替文件担保**（写回可能失败，见 MenuClick 那条注释）
+        let mut s = Settings::resolve(None, None, &file(Some("ko"), None), None).unwrap();
+        s.lang_from = ValueSource::MenuClick;
+        assert!(
+            !s.summary().contains("不持久") && s.summary().contains("当场切换"),
+            "{}",
+            s.summary()
+        );
+    }
+
+    /// 面板上点一行 ⇒ `app::App::persist_ui_key` 走 `write_ui_key_in` 落盘 ⇒ 下次启动
+    /// [`Settings::resolve`] 要把**同一个值**从文件那一层认回来。这一条走的是整条链，
+    /// 而它钉的东西很具体：**行上印的 `code()` 就是文件层认的那个字符串**。
+    ///
+    /// 为什么值得单独一条，而不是信 `petstore` 那 15 条 writer 测试：那些测的是**语法**
+    /// （注释仍在、内联表拒改、非法 TOML 不碰磁盘），而"我们打算写进去的那四个语言码 /
+    /// 三个动画码，写进去之后 UI 那条链还认不认得"是**跨模块**的那一段 —— 哪天有人把
+    /// `Lang::code()` 改成 `"zh-CN"`，文件里就是一个下一次启动被当坏值跳过的键：面板点了
+    /// 当场有反应（本进程改了），重启就回默认。那正是"看起来是功能、实际是半条功能"的形状，
+    /// 而真机上验它要点鼠标（我绝不注入点击）⇒ 只有 headless 这一条能管。
+    #[test]
+    fn every_written_code_comes_back_through_the_chain() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        // 注入路径，绝不碰用户的 `~/.config/opet/config.toml`（同 `ConfigEnv::with` 的存在理由）。
+        let env = petstore::config::ConfigEnv::with(dir.path().to_str(), None);
+        let read_back = || petstore::config::Config::read_in(&env);
+        // 上面那个循环最后一个写进去的语言 = 文件里此刻的 `lang`。
+        let last_lang = Lang::ALL[Lang::ALL.len() - 1];
+
+        for lang in Lang::ALL {
+            let at =
+                petstore::config::write_ui_key_in(&env, petstore::config::KEY_LANG, lang.code())
+                    .unwrap_or_else(|e| panic!("写语言码 {:?} 该成功：{e}", lang.code()));
+            // writer 返回的就是它落盘的那个路径 ⇒ 路径也只有一处算（`App` 里不许再算一遍）。
+            assert_eq!(
+                at,
+                read_back().path,
+                "{lang:?} 的落点不是 reader 看的那个文件"
+            );
+            let s = Settings::resolve(None, None, &read_back().ui, None).unwrap();
+            assert_eq!(
+                (s.lang, s.lang_from),
+                (lang, ValueSource::ConfigFile),
+                "{lang:?} 写进去而链上认不回来（屏上点了有用、重启就丢 = 半条功能）：{s:?}"
+            );
+            assert!(s.notices.is_empty(), "{:?}", s.notices);
+        }
+
+        for motion in Motion::ALL {
+            petstore::config::write_ui_key_in(&env, petstore::config::KEY_MOTION, motion.code())
+                .unwrap_or_else(|e| panic!("写动画码 {:?} 该成功：{e}", motion.code()));
+            let cfg = read_back();
+            let s = Settings::resolve(None, None, &cfg.ui, None).unwrap();
+            assert_eq!(
+                (s.motion, s.motion_from),
+                (motion, ValueSource::ConfigFile),
+                "{motion:?} 写进去而链上认不回来：{s:?}"
+            );
+            // 两个键互不相干：写 motion 必须把上面那四次语言写入的**最后那一档**留着
+            // （"只改那一个键"这条规则在 UI 侧的唯一可见证据）。
+            assert_eq!(s.lang, last_lang, "写 motion 把 lang 刷掉了");
+        }
     }
 }

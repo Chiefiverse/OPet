@@ -21,9 +21,7 @@ use petcore::assets::{AccessoryManifest, Manifest};
 use petcore::behavior::AssetKey;
 use petcore::behavior::config::{Action, BehaviorConfig};
 use petcore::behavior::machine::Command;
-use petcore::gacha::{
-    Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, Rarity, RatesFile, percent_str,
-};
+use petcore::gacha::{Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, Rarity, RatesFile};
 use petcore::geom::{Rect, Vec2};
 use petcore::intent::{PresentationIntent, SURFACE_MARGIN};
 use petcore::sim::{Sim, TICK_HZ};
@@ -77,8 +75,9 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::atlas::Atlas;
 use crate::card;
-use crate::l10n::Lang;
+use crate::l10n::{self, Key, Lang};
 use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
+use crate::panel::{self, CollectionTab, PanelKind};
 use crate::region::{CellRect, Regions};
 use crate::settings::{self, Motion};
 use crate::text;
@@ -182,6 +181,14 @@ pub struct Counters {
     /// 第二块 surface 混进去就会让"宠物三档不劣化"这条门禁变成读不出来的混合数。
     pub menu_commits: u64,
     pub menu_watchdogs: u64,
+    /// 面板（第三块 surface，收藏册 / 设置）的提交数。同 `menu_commits`：**不并进上面三档**。
+    ///
+    /// ⚠️ 这条字段的存在理由与 `menu_commits` 不是一句"再来一块面就再来一个数"：面板是
+    /// 「**开着一动不动**」的那类面 ⇒ 它唯一的省电判据是**静止恒 1 提交**（`69fd158` 那一族），
+    /// 而这个数必须和菜单的分开读，否则"菜单翻页 +1"与"面板静止不涨"混成一个数，
+    /// 两边都读不出来。
+    pub panel_commits: u64,
+    pub panel_watchdogs: u64,
 }
 
 impl Counters {
@@ -198,7 +205,11 @@ impl Counters {
         }
     }
 
-    /// 五档加总：应当逐轮等于 `App.ticks`（`Replay` 与菜单两块计数都在之外）。
+    /// 五档加总：应当逐轮等于 `App.ticks`（`Replay` 与**菜单、面板两块面的计数都在之外**）。
+    ///
+    /// 这一句从"两块面"变成"三块面"不是补字：面板的提交同样**不走 [`Self::bump`]**（它由
+    /// `update_panel` 记进 `panel_commits`）。并进来这条恒等式当场就断 —— 历史上"五档比
+    /// tick 多 5"就是 `configure` 那一格被并进去导致的。
     fn tick_accounted(&self) -> u64 {
         self.commits + self.moves + self.idle + self.deferred + self.buffer_errors
     }
@@ -349,6 +360,12 @@ pub struct App {
     viewporter: Option<WpViewporter>,
     /// 右键菜单那块 surface；`None` = 没开
     menu: Option<MenuState>,
+    /// 收藏册 / 设置那块 surface；`None` = 没开。
+    ///
+    /// **与菜单互斥**（开面板即关菜单，反之亦然），所以「同时两块开着」这个形状 structurally
+    /// 不可能 —— 这不是偷懒：同层三块 surface 的堆叠序在合成器侧不稳定，而 `placement` 的两两
+    /// 不相交检查会变成三块面的算术，收益只有"少切一块面"。
+    panel: Option<PanelState>,
     pointer: Option<ThemedPointer>,
     raw_pointer: Option<WlPointer>,
     qh: Option<QueueHandle<App>>,
@@ -428,16 +445,13 @@ pub struct App {
     /// `MenuState.motion` 是从这里抄的副本（同 `dry_run` 的手法：`draw()` 里先
     /// `menu.as_mut()` 再读 `self.ui` 会撞借用冲突；下一步的语言行同理）。
     ui: settings::Settings,
-    /// `config.toml` 的路径（**不存在也留着**）。语言行点下去时要打印"想固定就写哪儿"，
-    /// 而本轮不回写文件（自写的平坦 reader 保不住用户注释 ⇒ 读改写会把文件刷平）。
-    /// 存在 `App` 而不是现算：路径回退规则只在 `petstore::config` 一处，这里只复述结果。
-    ui_config_path: String,
     /// 抽取层，**lazy**：第一次右键才连库。rusqlite + WAL 一打开就把页缓存和语句缓存
     /// 挂进进程，而常驻宠物的 VmHWM 门禁（M4 基线 15.7 MB）不该为"也许根本不抽"付这笔。
     gacha: Option<Gacha>,
-    /// 连不上库 / 抽取失败的唯一出声处：画在菜单错误行上，**不 panic、不置 `exit`**
-    /// （硬约束 3 同族 —— UI 的故障不许波及宠物，更不许波及桌面）。
-    gacha_error: Option<String>,
+    /// 出错出声处（连不上库 / 读库存失败 / 抽取失败 / **写回 `config.toml` 失败**）：画在菜单
+    /// 与面板共用的错误行上，**不 panic、不置 `exit`**（硬约束 3 同族 —— UI 的故障不许波及宠物，
+    /// 更不许波及桌面）。字段不叫 `gacha_error` 了：拍板④ 之后它管的不止抽取，名字跟着事实走。
+    ui_error: Option<String>,
 }
 
 /// 库与目录成对出现（`connect` 一起建、一起失败），所以没有"有库没目录"的中间态。
@@ -537,7 +551,7 @@ impl Gacha {
         Ok((lines, best, balance))
     }
 
-    /// 「已获得」那一行：每档各拿到几种 / 该档共几种，加重复总数与余额。
+    /// 「已获得」那一屏的行：每档各拿到几种 / 该档共几种，最后一行是总数 + 重复 + 余额。
     ///
     /// **纯读**：不掷骰、不花钱、不改库 —— 这是它能进菜单而 `redeem_ssr`（花掉 120 碎片、
     /// 不可回退，而这块 surface 没有对话框，D14）不能进的分界。
@@ -545,7 +559,13 @@ impl Gacha {
     /// 分母取 **catalog** 而不是库存行数 ⇒ "还缺多少"这件事在这一行就读得出来（`n/total`），
     /// 而库存自己只能回答"有什么"。重复数按 `count − 1` 累加：第一件不算重复，哪怕它躺在
     /// 库存里 —— 这是 §3.6 的折算口径（第 2 件起才折碎片），不是我在省一次查询。
-    fn collection_lines(&self) -> Result<Vec<String>, String> {
+    ///
+    /// ⚠️ **每一串字都只用「字体子集里已有的字」**（`l10n` 标签 + ASCII + catalog 名）：
+    /// 这一批的字现在**同时**是屏上那一行和 stderr 那一行（[`App::gacha_panel`] 一条路径出两边），
+    /// 而 32 px 档的字号竞技场只剩 ≈7 个字形。代价**明写而不是藏起来**：原先那句
+    /// 「共 3/30 · 重复 5 · 碎片 120」的中文散文没了，读者要认 `DUP` / `Shards` 这类标签；
+    /// 换来的是"屏幕上读到的与日志里打到的是同一串字"，一个口径。
+    fn collection_lines(&self, lang: Lang) -> Result<Vec<String>, String> {
         let owned = self.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
         let mut lines = Vec::with_capacity(Rarity::ALL.len() + 1);
         let mut dup = 0u64;
@@ -570,20 +590,37 @@ impl Gacha {
             lines.push(format!("{} {have}/{all}", r.as_str()));
         }
         lines.push(format!(
-            "共 {kinds}/{total} · 重复 {dup} · 碎片 {}",
+            "{kinds}/{total} {} {dup} {} {}",
+            lang.t(Key::Dup),
+            lang.t(Key::Shards),
             self.balance()
         ));
         Ok(lines)
     }
 
-    /// 「还缺」那一行：catalog 里还没拿到的**名字**，按档分组。
+    /// 「还缺」那一屏的行：catalog 里还没拿到的**名字**，按档分组，**每档最多一行**。
     ///
     /// 名字来自 catalog ⇒ 这些字**已经在字体子集里**（`everything_the_ui_can_render_is_in_the_
-    /// codes_list` 那条门禁把 catalog 也纳进去了），所以这一行换装页那条"配件名盖不住"的反面：
-    /// 它真的能上卡片。本批仍只出 stderr，因为把变长的一列名字塞进 240×150 要动的是版式
-    /// 而不是这一行（`fit` 会截断，而"截不断"是另一件事，得看图才知道）。
-    fn missing_lines(&self) -> Result<Vec<String>, String> {
+    /// codes_list` 那条门禁把 catalog 也纳进去了），所以这一屏是换装页那条"配件名盖不住"的反面：
+    /// 它真的能上卡片。
+    ///
+    /// ⚠️ **宽度是量出来的，不是猜的**（这条是这一批新加的，而它本来就该在产行侧）：一行的预算
+    /// = [`panel::ROW_TEXT_W`]（只读行让位后的矩形）经 [`menu::budget_for`] 换算，装不下的名字
+    /// 折进尾标 [`l10n::line_more`]（`+N 更多`，四语言都已经在子集里 ⇒ 零新字形）。
+    /// **不靠 `card` 的 `fit` 兜底**：那一层截出来的是一个 `…`，读者会以为"缺的就这些"，
+    /// 而真正缺的还有 9 件 —— 一行只读报表把数量说错，和把金额说错是同一条红线。
+    /// 精确计数另有一行（`have/all`），这一屏给的是"缺哪些名字"的线索 + 几个没列出。
+    ///
+    /// ⚠️ **"放不下"必须问 [`menu::fit_to`] 本身，不能拿 [`menu::line_width`] 自己算**（这条
+    /// 是新门禁实测逼出来的，别再改回去）：`fit_to` 决定截点用的是**逐 char +1 px 的逻辑上界**
+    /// （`menu::advance_bound_log`，为了"三档截在同一个字上"可证），`line_width` 量的是**实际**
+    /// 画宽 ⇒ 按后者产行、按前者截行 = 生产者和排版各有各的预算，实测在 1× 少一个字，
+    /// 产出的行被排版截成 `…`，正好落进上面那条红线。问同一个函数 ⇒ 这一屏的结论**按构造**
+    /// 就是屏幕上会被原样画出来的那行。
+    fn missing_lines(&self, lang: Lang, scale: f32) -> Result<Vec<String>, String> {
         let owned = self.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
+        let budget = menu::budget_for(panel::ROW_TEXT_W, scale);
+        let fits = |s: &str| menu::fit_to(s, budget, scale) == s;
         let mut lines = Vec::new();
         for r in Rarity::ALL {
             let names: Vec<&str> = self
@@ -592,17 +629,38 @@ impl Gacha {
                 .filter(|i| !owned.contains(&i.id))
                 .map(|i| i.name.as_str())
                 .collect();
-            if !names.is_empty() {
-                lines.push(format!("{} {}", r.as_str(), names.join(" ")));
+            if names.is_empty() {
+                continue;
             }
+            let all = format!("{} {}", r.as_str(), names.join(" "));
+            if fits(&all) {
+                lines.push(all);
+                continue;
+            }
+            // 从"少折一个"往下减，第一个 `fits` 的就收 —— 名字位数最多影响上界里一个 char，
+            // 而这里量的是**成品整行**，所以不存在"列完才发现尾标挤不下"那种改判。
+            let mut line = format!("{} {}", r.as_str(), l10n::line_more(lang, names.len()));
+            for k in (1..names.len()).rev() {
+                let cand = format!(
+                    "{} {} {}",
+                    r.as_str(),
+                    names[..k].join(" "),
+                    l10n::line_more(lang, names.len() - k)
+                );
+                if fits(&cand) {
+                    line = cand;
+                    break;
+                }
+            }
+            lines.push(line);
         }
         if lines.is_empty() {
-            lines.push("catalog 里的都拿到了".to_string());
+            lines.push(format!("0 {}", lang.t(Key::Missing)));
         }
         Ok(lines)
     }
 
-    /// 「最近」那一行：账本最后 `n` 次抽取。**只读 `gacha_pull`，一个字都不写**。
+    /// 「最近」那一屏的行：账本最后 `n` 次抽取。**只读 `gacha_pull`，一个字都不写**。
     ///
     /// ⚠️ **不印时间**：`ts` 是 unix 秒，而这个 crate 没有任何日期格式化依赖（引一个只为把
     /// 一串数字变好读，代价是 `Cargo.lock` 与 D8 那条许可证核对）。印 `seq` 而不是 `ts`：
@@ -611,15 +669,13 @@ impl Gacha {
     ///
     /// 一次全表读（`rows` 没有 LIMIT）换来的是"这一条路径与 `audit verify` 走的是同一个
     /// 查询" ⇒ 少一个口径。点击驱动、不是每 tick 轮询（§4 那条禁止）。
-    fn recent_lines(&self, n: usize) -> Result<Vec<String>, String> {
+    fn recent_lines(&self, lang: Lang, n: usize) -> Result<Vec<String>, String> {
         let rows = self
             .store
             .rows(petstore::DEFAULT_PROFILE, petstore::DEFAULT_BANNER)
             .map_err(|e| format!("读账本失败: {e}"))?;
         if rows.is_empty() {
-            return Ok(vec![
-                "账本还是空的（这一轮没抽过，或抽的没落库）".to_string(),
-            ]);
+            return Ok(vec![format!("0 {}", lang.t(Key::Recent))]);
         }
         let from = rows.len().saturating_sub(n);
         Ok(rows[from..]
@@ -630,22 +686,38 @@ impl Gacha {
                     .find(&r.item_id)
                     .map(|i| i.name.as_str())
                     .unwrap_or(r.item_id.as_str());
+                let dup_tag = if r.duplicate {
+                    format!(" {}", lang.t(Key::Dup))
+                } else {
+                    String::new()
+                };
                 format!(
-                    "#{seq} {rar} {name}{dup} +{shards}",
+                    "#{seq} {rar} {name}{dup_tag} +{shards}",
                     seq = r.seq,
                     rar = r.rarity.as_str(),
-                    dup = if r.duplicate { " 重复" } else { "" },
                     shards = r.shards_gained,
                 )
             })
             .collect())
     }
 
-    /// 「复核」那一行：审计链全链校验 + 用**库里的** seed 与公示参数重放。
+    /// 「复核」那一屏的两行：审计链全链校验 + 用**库里的** seed 与公示参数重放。
     ///
     /// `Store::verify` 只读 ⇒ 这一行不需要确认步骤（同 [`Self::collection_lines`] 那条分界）。
     /// 报红的时候**只报错**，不报"通过了一半"：一条链要么自洽要么不自洽，中间态不存在。
-    fn verify_lines(&self) -> Result<Vec<String>, String> {
+    ///
+    /// 档位计数那行借 [`l10n::line_tiers`]：它与结果卡用的是同一个生产者 ⇒ 同一批字，
+    /// 而 `line_tiers` 只列非零档 ⇒ 空账本那行是光秃秃一个 `OK`，这是事实而不是排版事故。
+    ///
+    /// ⚠️ **链头在这块屏上只能是前缀，而前缀必须自己说它是前缀**（这条同样是新门禁逼出来的：
+    /// 原先那行 `复核 {len} {64 位十六进制}` 实测在 1× 被 `fit_to` 截成
+    /// `复核 10 d2427b64ac70b454da557…` —— 一个被悄悄切短的哈希比不印哈希更坏，读者会拿它去
+    /// 和 CLI 的输出逐字比，而"少了 39 位"这件事一行像素门禁都看不见）。所以这里
+    /// **先数出装得下的位数、把它写进正文**（`{k}/64`，纯 ASCII ⇒ 零新字形），再按同一口径
+    /// 用 [`menu::fit_to`] 挑最长的那一版。完整的 64 位不在屏上也不在日志里：权威出处是
+    /// `opet audit verify --db … --account …`（它打的就是同一个 `head_hex`）。
+    /// k=0（行窄到一位都装不下）就整个字段不印 ⇒ 那一行只剩 `复核 {len}`，是少说，不是说错。
+    fn verify_lines(&self, lang: Lang, scale: f32) -> Result<Vec<String>, String> {
         let report = self
             .store
             .verify(
@@ -654,14 +726,86 @@ impl Gacha {
                 petstore::DEFAULT_BANNER,
             )
             .map_err(|e| format!("复核不过: {e}"))?;
+        let budget = menu::budget_for(panel::ROW_TEXT_W, scale);
+        let fits = |s: &str| menu::fit_to(s, budget, scale) == s;
+        let head = report.head_hex();
+        let base = format!("{} {}", lang.t(Key::Verify), report.len);
+        let mut shown = String::new();
+        for k in (1..=head.len()).rev() {
+            let cand = format!("{base} {k}/{} {}", head.len(), &head[..k]);
+            if fits(&cand) {
+                shown = cand;
+                break;
+            }
+        }
+        if shown.is_empty() {
+            shown = base;
+        }
         Ok(vec![
-            format!("链长 {} · 链头 {}", report.len, report.head_hex()),
-            format!(
-                "N={} R={} SR={} SSR={} ⇒ 全部对上了（链自洽 + 按库里的 seed 重放一致）",
-                report.counts[0], report.counts[1], report.counts[2], report.counts[3]
-            ),
+            shown,
+            format!("OK {}", l10n::line_tiers(&report.counts)),
         ])
     }
+
+    /// 收藏册三个 tab 的**唯一**行生产者：菜单那三行、面板里点标题带换 tab、切语言后重建行
+    /// 三条路都从这里过 ⇒ 不存在"屏上是这一个 tab 的字、stderr 打的是另一个"。
+    ///
+    /// `Recent` 的条数 = [`panel::MAX_ROWS`] 减一（一屏正好装下，见
+    /// [`panel::collection_rows`] 那条"正解在调用方"的注释）；给多了不报错而是截断补
+    /// 「+N 更多」，那条分支是保险，不是主路径。
+    ///
+    /// `scale` 只有 `Missing` 那一支读（[`Gacha::missing_lines`] 按宽度折名字），另外两支
+    /// 的行与缩放无关。它和 [`Gacha::pull`] 的 `scale` 是同一个口径：**生产行的那一刻就知道
+    /// 自己要上哪块屏**，而不是画的时候再猜。
+    fn tab_lines(&self, tab: CollectionTab, lang: Lang, scale: f32) -> Result<Vec<String>, String> {
+        match tab {
+            CollectionTab::Owned => self.collection_lines(lang),
+            CollectionTab::Missing => self.missing_lines(lang, scale),
+            CollectionTab::Recent => self.recent_lines(lang, panel::MAX_ROWS - 1),
+        }
+    }
+}
+
+/// 「概率」那一屏要上屏的**五行整**：一行图例 + 四档各一行。
+///
+/// ⚠️ **这条路不碰库**，而且是故意的：它读的是编译期就嵌进二进制的 `rates.json`
+/// （`DEFAULT_RATES_JSON` = `RATES_ASSET` 那份，与 `catalog rates --out` 写的是同一个产物），
+/// 回答的是"承诺了什么"而不是"这次抽到了什么"。所以它**不需要** `ensure_gacha()` ——
+/// 让它去连库就等于"内存库的玩家读不到公示"，而公示对每个人都一样。
+///
+/// `Published::check` 是硬约束 #2（"概率必须与公示一致"）的守门人：文件与代码不一致时
+/// 这一行报**不一致**，而不是把那份已经在说谎的文件念给用户听。宁可不答，不可答错。
+///
+/// **五行 = `panel::MAX_ROWS - 1`**，一格余量都不留：这一面第六格固定是 `Close`，多一行
+/// 就得靠 `panel::collection_rows` 那条截断补「+N 更多」，而"你还没看到的第四档概率"被
+/// 截成一句话是这一屏最坏的失败形状。
+///
+/// 两处口径是明写的取舍（不是遗漏）：
+/// - **两位小数**（`{:.2}`）而不是 `percent_str` 的四位：`SSR 60.0000>57.0147` 一定超 240 px
+///   那一行的排版预算（§4 那次量化）。四位那一份没消失，它就在 `rates.json` 里。
+/// - 原先那行"公示口径 method=/视界=/format="**不再上屏也不进日志**：五行装不下它，而点
+///   「概率」要问的是"某一档多大概率"，不是"这份公示用什么口径推的"。
+///
+/// 写成**自由函数**（`Gacha` 与 `App` 都不碰）是为了让面板那两条门禁能直接吃到它：
+/// 这一批第一次把「概率」的字送进像素，而"每一行都画得出来而且不破版"这件事的入口是鼠标，
+/// 我绝不注入点击 ⇒ 它必须在 headless 里可调用。挂在 `App` 上就等于把自动化让给了真机。
+fn published_rates_lines(lang: Lang) -> Result<Vec<String>, String> {
+    let published = RatesFile::read(DEFAULT_RATES_JSON)?;
+    let effective = published.check(&GachaParams::V1)?;
+    // 百万分位 → 百分数。这里**只有**显示用的格式化碰浮点：`petcore` 里那份
+    // `percent_str` 走整数是为了公示字符串逐字符可复现（硬约束 #8），而这一行不进任何
+    // 重放契约，`{:.2}` 换来的排版余量才是这一屏要付的代价。
+    let pct = |w: u32| w as f64 / 10_000.0;
+    let mut lines = vec![format!("{} b>c", lang.t(Key::Rates))];
+    for r in Rarity::ALL {
+        lines.push(format!(
+            "{} {:.2}>{:.2}",
+            r.as_str(),
+            pct(published.base.weight(r)),
+            pct(effective.weight(r))
+        ));
+    }
+    Ok(lines)
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -776,6 +920,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         layer_shell,
         viewporter,
         menu: None,
+        panel: None,
         pointer: None,
         raw_pointer: None,
         qh: Some(qh),
@@ -813,9 +958,8 @@ pub fn run(opts: Options) -> Result<(), String> {
         grab_offset: Vec2::ZERO,
         dry_run,
         ui: settings,
-        ui_config_path: cfg.path.display().to_string(),
         gacha: None,
-        gacha_error: None,
+        ui_error: None,
         last_press: None,
         pointer_world: Vec2::ZERO,
     };
@@ -1574,10 +1718,216 @@ impl MenuState {
     }
 }
 
+// ───────────────────────────── 面板 surface（裁定④）─────────────────────────────
+
+/// 点收藏册 / 设置那一类"要看内容、要能操作"的菜单项时开出的**第三块** layer surface。
+///
+/// **为什么要有第三块而不是把菜单撑大**：菜单那张 240×150 的卡片是**几何证明**，不是审美
+/// 选择 —— `ROW_STEP 30 × 3 + HEAD_H 22 + PAD 8 = 116`，footer 从 124 起 ⇒ 只剩 8 px，第四行
+/// 物理放不下（设计书 §6.1.6）。收藏册一屏要 5 行内容 + Close，硬塞进菜单就是在改那道证明。
+/// 所以菜单保持六页三行，面板另开一面 **240×214**（同宽 ⇒ `line_budget_px`/`fit`/`MAX_LINE_PX`
+/// 逐字复用，只有高度是新的）。
+///
+/// **为什么它与菜单互斥**：同层两块以上 surface 的堆叠序在协议里**没有定义**（`hyprctl layers`
+/// 认得出 namespace 而认不出谁压谁），而菜单 + 面板 + 宠物三块同屏会读不出"我点的是哪一面"。
+/// 互斥换来的另一件事更重要：面板不会盖住宠物导致那三条 input-region 人工门禁判不了。
+///
+/// **为什么它自己一套 pool/在途标记/看门狗/region**：与 [`MenuState`] 同一条理由，而这里
+/// 更硬 —— 面板的 `content_sig` 与菜单的完全不同族（没有相位、没有余额），共用池子就等于
+/// 两块面互相"替对方"放行帧回调，`菜单: N 提交` 与 `面板: N 提交` 两个读数同时作废。
+///
+/// 与 [`MenuState`] 相比**去掉的四个字段各自的理由**（写出来是为了下次有人想加回来时
+/// 知道那不是漏了）：
+/// - **`anim`**：面板没有开箱相位 ⇒ 没有 burst、没有白闪、没有 `step()`。`card::paint_panel`
+///   因此压根不接 `&MenuAnim`。
+/// - **`page`**：面板的"翻页"是 [`panel::PanelKind`] 里的 tab，而且**只有收藏册有**。溢出
+///   不靠翻页解决而是靠截断 + 一行「+N 更多」（[`panel::collection_rows`]），因为页码要进
+///   标题带、标题带要进命中表、命中表要跟着变 —— 那是菜单分页那一整族复杂度，而这里
+///   一屏装得下 5 行数据，剩下的本来就不该在 214 px 里翻。
+/// - **`balance`**：余额**只留在菜单 footer 那一行**。同一张桌面上同一个数印两处 = 两个
+///   事实源，而"事件驱动、不轮询"那条纪律下这两处刷新的时刻还不一样（菜单在开菜单/抽卡后，
+///   面板在开面板/换 tab 后）⇒ 会出现"面板上的余额是旧的"这种读起来像 bug 的东西。
+/// - **`dry_run` / `motion`**：`dry_run` 是演示标，面板上不印它。**`motion` 有意不是字段**：
+///   `panel::settings_rows` 已经把 `motion.code()` 烘进行文案里，而**行文案进签名** ⇒ 再存
+///   一份平行字段就是"字段存在、签名不读它、画师也不读它"那一族漂移源（`69fd158` 的形状）。
+struct PanelState {
+    layer: LayerSurface,
+    /// `frame` / 指针事件按**对象身份**分流（第四路），这块要能被认出来
+    surface: WlSurface,
+    viewport: Option<WpViewport>,
+    pool: SlotPool,
+    /// 宠物 scale 的镜像；面板自己不发 `preferred_scale`，只能镜像（同 [`MenuState`]）
+    scale_num: u32,
+    logical: (i32, i32),
+    /// 现在哪一本（收藏册第几 tab / 设置）。它决定**标题带那串字**（[`panel::header_text`]）
+    /// 与**标题带那一格点下去是什么**（收藏册换 tab / 设置重载默认行，见
+    /// [`App::on_panel_press`]），所以**必须进签名**。
+    kind: panel::PanelKind,
+    /// 这一面的内容。**唯一的一份**：签名比它、命中表由它派生、像素画它，三者同源。
+    rows: Vec<panel::PanelRow>,
+    /// 命中表 = `panel::rects(kind, rows)`，与 `rows` **同生同改**（[`update_panel`]、
+    /// [`on_panel_press`] 里换 tab 的那一支是唯一改 `kind` 的地方，它同时重建这两个）。
+    items: Vec<panel::RowRect>,
+    /// 从 `App.ui.lang` 抄来的当前语言。与菜单同族：**运行中可变**（面板里那一行点下去
+    /// 就换）⇒ 进签名，且必须被画师读到。
+    lang: Lang,
+    /// 上一次 commit 的内容签名 ⇒ 静止时"什么都不发"
+    last_sig: Option<u64>,
+    frame_pending: bool,
+    pending_since: Option<Instant>,
+    active_region: Option<WlRegion>,
+    configured: bool,
+    force_draw: bool,
+}
+
+impl PanelState {
+    fn has_viewport(&self) -> bool {
+        self.viewport.is_some()
+    }
+
+    fn scale_f(&self) -> f32 {
+        scale_of(self.scale_num, self.has_viewport())
+    }
+
+    fn to_phys(&self, logical: f32) -> i32 {
+        to_phys_of(logical, self.scale_num, self.has_viewport())
+    }
+
+    fn buffer_scale(&self) -> Option<i32> {
+        buffer_scale_of(self.scale_num, self.has_viewport())
+    }
+
+    /// 宠物 scale 变了要跟着重画（面板自己不发 `preferred_scale`，只能镜像）。
+    fn mirror_scale(&mut self, scale_num: u32) {
+        if self.scale_num != scale_num {
+            self.scale_num = scale_num;
+            self.force_draw = true;
+        }
+    }
+
+    fn arm(&mut self) {
+        self.frame_pending = true;
+        self.pending_since = Some(Instant::now());
+    }
+
+    fn clear_wait(&mut self) {
+        self.frame_pending = false;
+        self.pending_since = None;
+    }
+
+    /// 看门狗同构（合成器只对可见 surface 发帧回调）；返回是否触发。
+    fn tick_watchdog(&mut self, now: Instant) -> bool {
+        let overdue = self
+            .pending_since
+            .is_some_and(|t| now.duration_since(t) > Duration::from_secs_f64(3.0 / TICK_HZ as f64));
+        if overdue {
+            self.clear_wait();
+            self.force_draw = true;
+        }
+        overdue
+    }
+
+    /// 收回协议对象。顺序与 [`MenuState::teardown`] 逐字一致：region → viewport →
+    /// layer_surface → wl_surface（`zwlr_layer_surface_v1.destroy` 之后再碰它就是协议错误）。
+    fn teardown(self) {
+        if let Some(r) = &self.active_region {
+            r.destroy();
+        }
+        if let Some(v) = &self.viewport {
+            v.destroy();
+        }
+        if let SurfaceKind::Wlr(l) = self.layer.kind() {
+            l.destroy();
+        }
+        self.surface.destroy();
+    }
+
+    /// 出一帧面板。返回是否真的 commit 了。
+    ///
+    /// **没有 `step()`**：这一面没有任何随时间自己变的像素（相位表在菜单那一面），所以
+    /// "每 tick 都投一帧完全相同的 buffer"在这里连形状都不存在 —— 签名里没有任何随时间的量。
+    fn draw(&mut self, compositor: &CompositorState, qh: &QueueHandle<App>, error: &str) -> bool {
+        if !self.configured || self.frame_pending {
+            return false;
+        }
+        let sig = panel::content_sig(self.kind, self.lang, error, &self.rows);
+        if self.last_sig == Some(sig) && !self.force_draw {
+            return false;
+        }
+        let kind = self.kind;
+        let lang = self.lang;
+        let bw = self.to_phys(self.logical.0 as f32).max(1);
+        let bh = self.to_phys(self.logical.1 as f32).max(1);
+        let stride = bw * 4;
+        // `scale_f` 先取：下面 `self.pool` 是可变借用，同一个表达式里不能再不可变借 self
+        let scale = self.scale_f();
+        let created = self
+            .pool
+            .create_buffer(bw, bh, stride, wl_shm::Format::Argb8888);
+        let (buffer, canvas) = match created {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("面板 create_buffer 失败: {e:?}");
+                return false;
+            }
+        };
+        // `rows` 走引用过去（`PanelCtx::rows` 是 `&'a [PanelRow]`）：这里必须**不**先把
+        // `self.rows` 拷一份出来，否则"签名比的那串字"与"画的那串字"就真是两份了。
+        card::paint_panel(
+            &mut canvas[..],
+            bw,
+            bh,
+            stride as usize,
+            card::PanelCtx {
+                kind,
+                lang,
+                rows: &self.rows,
+                error,
+                scale,
+            },
+        );
+        // 句柄克隆（不是对象克隆）：下面的 `self.arm()` 要可变借 self，不能同时留引用
+        let surface = self.surface.clone();
+        if let Some(s) = self.buffer_scale() {
+            surface.set_buffer_scale(s);
+        }
+        surface.damage_buffer(0, 0, bw, bh);
+        self.arm();
+        surface.frame(qh, surface.clone());
+        if buffer.attach_to(&surface).is_err() {
+            self.clear_wait();
+            return false;
+        }
+        // 与菜单同理：整块都该吃掉点击（它就是来接收点击的），region = 卡片矩形，**逻辑**坐标
+        let region = compositor.wl_compositor().create_region(qh, ());
+        region.add(0, 0, self.logical.0, self.logical.1);
+        surface.set_input_region(Some(&region));
+        if let Some(old) = self.active_region.replace(region) {
+            old.destroy();
+        }
+        self.layer.commit();
+        self.last_sig = Some(sig);
+        self.force_draw = false;
+        true
+    }
+}
+
 impl App {
     /// 可用区尺寸（output 逻辑尺寸减掉顶栏）：菜单 clamp 的边界必须和 margin 同口径，
     /// 否则菜单会"合规地"贴进顶栏底下。
     fn output_available(&self) -> (i32, i32) {
+        self.output_available_for(CARD_W, CARD_H)
+    }
+
+    /// [`output_available`](Self::output_available) 的按尺寸版：把"这块卡片"当成参数而不是
+    /// 写死菜单的 240×150。
+    ///
+    /// **为什么必须 generalize 而不是给面板另写一份**：面板比菜单高 64 px（214 vs 150），
+    /// 而这里那两条 `max` 是**把卡片塞进可用区**的唯一防线 —— 复制一份就会有两处 clamp
+    /// 口径，改一处漏一处时面板会"合规地"贴出屏外，而那只在真机上看得出来。
+    /// `card_w`/`card_h` 同时也喂给兜底的 `unwrap_or`：读不到 output 几何时（第一 tick
+    /// 之前）兜的底必须按**这一块**的尺寸，不是按菜单的。
+    fn output_available_for(&self, card_w: i32, card_h: i32) -> (i32, i32) {
         let info = self
             .pick_output()
             .and_then(|o| self.output_state.info(&o))
@@ -1588,16 +1938,26 @@ impl App {
             });
         let (w, h) = info
             .and_then(|i| i.logical_size)
-            .unwrap_or((CARD_W.max(self.logical.0), CARD_H.max(self.logical.1)));
+            .unwrap_or((card_w.max(self.logical.0), card_h.max(self.logical.1)));
         (
-            w.max(self.logical.0),
-            (h - self.opts.panel_top.round() as i32).max(self.logical.1),
+            w.max(self.logical.0).max(card_w),
+            (h - self.opts.panel_top.round() as i32)
+                .max(self.logical.1)
+                .max(card_h),
         )
     }
 
+    /// 右键 = 开/关"当前开着的那一面"。三块面里宠物自己不是面，所以这里只有两种状态：
+    /// 菜单开着 ⇒ 关菜单；**面板开着 ⇒ 关面板**（不是"关掉面板再顺手把菜单开出来"——
+    /// 那会让"再右键一次就关"这条既有语义变成"右键三次换两面"）。都没有 ⇒ 开菜单。
+    ///
+    /// 这条三分支同时是**互斥那条不变量的唯一守卫**：[`App::open_panel_lines`] 会先关菜单，
+    /// 而这里保证 `open_menu` 永远不会在面板开着时被叫到（否则菜单不带关面板 ⇒ 两块面同屏）。
     fn toggle_menu(&mut self) {
         if self.menu.is_some() {
             self.close_menu();
+        } else if self.panel.is_some() {
+            self.close_panel();
         } else {
             self.open_menu();
         }
@@ -1702,6 +2062,297 @@ impl App {
         }
     }
 
+    // ───────────────────────── 面板（第三块 surface）─────────────────────────
+
+    /// 面板**唯一**的行生产者。
+    ///
+    /// ⚠️ **不许在这里调 [`Self::ensure_gacha`]**：连不上库那件事 `ensure_gacha` →
+    /// [`Self::gacha_bailed`] 已经出过一次声，这里再返回 `Err` 让调用方处理一遍，就是
+    /// **同一次失败打两遍**（两条 stderr、错误行被覆写两次，而用户看不出哪条是真的）。
+    /// 所以这条只问"已经连上了没有"，连不连是调用方的责任。
+    ///
+    /// 设置页不碰库 ⇒ 它永远 `Ok`；`Err` 只可能来自收藏册那三个 tab，而那一路唯一的使用者
+    /// 是 [`Self::refresh_panel_rows`]（面板开着时换语言/换动画档），那里库必然已经连着。
+    fn panel_rows(&self, kind: PanelKind) -> Result<Vec<panel::PanelRow>, String> {
+        let lang = self.ui.lang;
+        match kind {
+            PanelKind::Settings => Ok(panel::settings_rows(lang, self.ui.motion)),
+            PanelKind::Collection { tab } => {
+                let g = self
+                    .gacha
+                    .as_ref()
+                    .ok_or_else(|| "库还没连上（收藏册读不到东西）".to_string())?;
+                Ok(panel::collection_rows(
+                    lang,
+                    &g.tab_lines(tab, lang, self.scale_f())?,
+                ))
+            }
+        }
+    }
+
+    /// 开面板 = **先关菜单**（两块面永不同时在场）+ 按 [`Self::panel_rows`] 现算一行。
+    ///
+    /// 收藏册那三行**不走这里**，走 [`Self::collection_panel`] —— 同一条路还要把同一批字
+    /// 打进 stderr，而这里不碰库。
+    fn open_panel(&mut self, kind: PanelKind) {
+        match self.panel_rows(kind) {
+            Ok(rows) => self.show_panel(kind, rows),
+            Err(msg) => self.gacha_bailed(msg),
+        }
+    }
+
+    /// 让面板显示这一组行：**没开就建那块面，开着就原地换行 + 换命中表**。
+    ///
+    /// 两个动作合成一条不是省事：「点标题带换 tab」与「从菜单进来」要办的是**同一件事**
+    /// （这一面此刻该画什么），分成两条路径就会出现其中一条**忘了同步 `items`** —— 而
+    /// `items` 是点击的唯一依据（`69fd158` 那一族"命中表与画面分家"的形状）。
+    ///
+    /// 原地换行**不置 `force_draw`**：`kind`、`lang`、每行文本、错误行全在
+    /// [`panel::content_sig`] 里 ⇒ 签名自己就认得出变了（`cycle_page` 那条注释立的纪律）。
+    fn show_panel(&mut self, kind: PanelKind, rows: Vec<panel::PanelRow>) {
+        if let Some(p) = self.panel.as_mut() {
+            let items = panel::rects(kind, &rows);
+            p.kind = kind;
+            p.lang = self.ui.lang;
+            p.rows = rows;
+            p.items = items;
+            return;
+        }
+        self.open_panel_lines(kind, rows);
+    }
+
+    /// 建那块面（[`App::open_menu`] 的同形物）。行由调用方给 ⇒ 这一条**不碰库、不读行**，
+    /// 只做协议：算摆位、建 surface/layer/viewport/shm 池，然后交给 [`PanelState`]。
+    fn open_panel_lines(&mut self, kind: PanelKind, rows: Vec<panel::PanelRow>) {
+        // 互斥：菜单与面板永不同时在场（同层两块以上的堆叠序协议里没定义，见 `panel` 模块头）。
+        self.close_menu();
+        let qh = self.qh();
+        // 几何先算完（下面建 surface 全是不可变借用，别和 `self.panel =` 的可变借用打架）
+        let (mx, my) = self.margin;
+        let pet = RectI::new(mx, my, self.logical.0, self.logical.1);
+        let (aw, ah) = self.output_available_for(panel::CARD_W, panel::CARD_H);
+        let at = panel::placement(pet, RectI::new(0, 0, aw, ah));
+        let scale_num = self.scale_num;
+        let has_viewport = self.viewporter.is_some();
+        let target = self.on_output.clone();
+        let logical = (panel::CARD_W, panel::CARD_H);
+        let phys = (
+            to_phys_of(logical.0 as f32, scale_num, has_viewport).max(1),
+            to_phys_of(logical.1 as f32, scale_num, has_viewport).max(1),
+        );
+        let lang = self.ui.lang;
+        // 命中表与行**同源**：都从这一份 `rows` 派生（`MenuState.items` 那条"每翻一页算一次"
+        // 的同一条约定，而面板一页里换 tab 也算一次）。
+        let items = panel::rects(kind, &rows);
+
+        let surface = self.compositor.create_surface(&qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &qh,
+            surface.clone(),
+            Layer::Overlay,
+            // 独立 namespace：`hyprctl layers` 要能分别认出三块
+            Some("opet-panel"),
+            target.as_ref(),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_exclusive_zone(0);
+        layer.set_size(logical.0 as u32, logical.1 as u32);
+        // margin 顺序 = top,right,bottom,left
+        layer.set_margin(at.1, 0, 0, at.0);
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(&surface, &qh, ()));
+        if let Some(vp) = &viewport {
+            vp.set_destination(logical.0, logical.1);
+        }
+        layer.commit();
+
+        let initial = (phys.0 * phys.1 * 4 * 2) as usize;
+        let pool = match SlotPool::new(initial, &self.shm) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("面板 shm 池建不起来: {e:?}");
+                if let Some(v) = &viewport {
+                    v.destroy();
+                }
+                surface.destroy();
+                return;
+            }
+        };
+        self.panel = Some(PanelState {
+            layer,
+            surface,
+            viewport,
+            pool,
+            scale_num,
+            logical,
+            kind,
+            rows,
+            items,
+            lang,
+            last_sig: None,
+            frame_pending: false,
+            pending_since: None,
+            active_region: None,
+            configured: false,
+            force_draw: true,
+        });
+        eprintln!(
+            "panel: 打开于 margin {}x{}（{kind:?}，宠物 {mx},{my} {}x{}，可用区 {aw}x{ah}）",
+            at.0, at.1, self.logical.0, self.logical.1
+        );
+    }
+
+    fn close_panel(&mut self) {
+        if let Some(p) = self.panel.take() {
+            p.teardown();
+        }
+    }
+
+    /// 每 tick 走一遍：同步 scale、跑看门狗、按签名决定要不要提交。
+    /// **没有 `step()`** —— 这一面没有任何随时间自己变的像素，所以"停留期恒 0 提交"
+    /// （`counters.panel_commits` 不随 tick 增长）是它唯一的省电判据。
+    ///
+    /// 放在宠物 `!configured` 早退**之前**（同 [`Self::update_menu`]）：宠物的映射状态和
+    /// 面板该不该动帧毫无关系。
+    fn update_panel(&mut self, now: Instant) {
+        if self.panel.is_none() {
+            return;
+        }
+        let scale_num = self.scale_num;
+        let error = self.error_line();
+        let mut p = self.panel.take().expect("上面查过 is_some");
+        p.mirror_scale(scale_num);
+        if p.tick_watchdog(now) {
+            self.counters.panel_watchdogs += 1;
+            eprintln!("警告：面板帧回调超时 ⇒ 强制解锁提交");
+        }
+        let qh = self.qh();
+        if p.draw(&self.compositor, &qh, &error) {
+            self.counters.panel_commits += 1;
+        }
+        self.panel = Some(p);
+    }
+
+    /// 收藏册那三行**与面板里点标题带**共用的入口：读行 → 打 stderr → 上屏。
+    ///
+    /// 一条而不是两条的理由是 §4 那条口径：**屏上那几行就是日志里那几行**。分两条就会出现
+    /// "日志打了 5 行而屏上截断成 +N 更多"这种两边都自称正确的东西。
+    fn collection_panel(&mut self, tab: CollectionTab) {
+        self.gacha_panel(
+            "collection",
+            PanelKind::Collection { tab },
+            move |g, l, s| g.tab_lines(tab, l, s),
+        );
+    }
+
+    /// 收藏册 / 复核那几行"连库 → 读 → 上屏"的唯一路径。
+    ///
+    /// 与上一批的 `gacha_report` 的差别只有一件，而那是这一批的核心：那些行不再**只**进
+    /// stderr，它们现在**就是像素**。所以原先挂在这一条上那句
+    /// ⚠「不置 `force_draw`：这些行进的是 stderr，一行像素都不动」**作废** ——
+    /// 行文本进 [`panel::content_sig`]，闸门认得出，不需要调用方补"记得重画"。
+    ///
+    /// 三件事仍由这一条保证：**先** `ensure_gacha()`（lazy 连库那条红线，D14）、失败只写
+    /// 错误行（[`Self::gacha_bailed`]，不 panic 不置 `exit`，硬约束 3 同族）、成功就把错误行
+    /// 清空（否则上一条失败的字一直挂着，用户会以为它还没修）。
+    ///
+    /// `scale` 在**这里**取（不是各分支自己取）：它决定"一行的字装不装得下"，而这一条路径是
+    /// 收藏册三屏唯一的出口 ⇒ 读屏那一步拿到的缩放与画那块面用的是同一个数。
+    fn gacha_panel(
+        &mut self,
+        prefix: &str,
+        kind: PanelKind,
+        report: impl FnOnce(&Gacha, Lang, f32) -> Result<Vec<String>, String>,
+    ) {
+        if !self.ensure_gacha() {
+            return;
+        }
+        let lang = self.ui.lang;
+        let scale = self.scale_f();
+        let lines = match self.gacha.as_ref() {
+            Some(g) => report(g, lang, scale),
+            None => return,
+        };
+        self.show_panel_lines(prefix, kind, lines);
+    }
+
+    /// `gacha_panel` 的后半（行已经读好 → 打日志 → 上屏）。**不碰库**的那一路（公示概率）
+    /// 从这里直接进，免得它为了复用后半而假造一次 `ensure_gacha()`。
+    fn show_panel_lines(
+        &mut self,
+        prefix: &str,
+        kind: PanelKind,
+        lines: Result<Vec<String>, String>,
+    ) {
+        match lines {
+            Ok(v) => {
+                self.ui_error = None;
+                for l in &v {
+                    eprintln!("{prefix}: {l}");
+                }
+                let rows = panel::collection_rows(self.ui.lang, &v);
+                self.show_panel(kind, rows);
+            }
+            Err(msg) => self.gacha_bailed(msg),
+        }
+    }
+
+    /// 面板开着的行**跟着 `App.ui` 重算**（点语言行 / 点动画行之后调）。
+    ///
+    /// `lang` 与 `motion.code()` 都烘进行文案里，而行文案与 `lang` 都进签名 ⇒ **这里不置
+    /// `force_draw`**（`cycle_page` 那条纪律：把会变的东西交给闸门去认，而不是靠调用方在
+    /// 每个改它的地方补一句"记得重画"）。
+    ///
+    /// 重算按**当前的 `kind`**：从「概率」/「复核」借走的那一屏换回来的是默认五行 ——
+    /// 而 `Lang`/`Motion` 两格本来就只存在于默认五行上，借走的那一屏除了标题带和 `Close`
+    /// 全是不可点的 `Info`，所以这里永远读不到"借走的内容 + 新语言"那种组合。
+    fn refresh_panel_rows(&mut self) {
+        let Some(kind) = self.panel.as_ref().map(|p| p.kind) else {
+            return;
+        };
+        if let Ok(rows) = self.panel_rows(kind) {
+            self.show_panel(kind, rows);
+        }
+    }
+
+    /// 面板被点：命中哪一格、那一格办哪件事。`at` 是面板 surface 的**逻辑**局部坐标。
+    ///
+    /// 分派**只走 [`panel::press`]**（命中 + `actionable` 把关），与菜单同一条"把关放在命中侧
+    /// 而不是各 `match` 分支里"的纪律（门禁 = `an_info_row_is_hit_but_never_activates_...`）。
+    /// 面板没有"忙"相位 ⇒ `press` 只滤 `Info`，这里那臂因此**不可达**，写出来是为了以后
+    /// 加一种行而忘了决定它点不点得着时，`match` 会红而不是静默默认成"不可点"。
+    fn on_panel_press(&mut self, at: (f32, f32)) {
+        let Some(item) = self.panel.as_ref().and_then(|p| panel::press(&p.items, at)) else {
+            return;
+        };
+        let kind = self.panel.as_ref().expect("上面查过 is_some").kind;
+        match item {
+            panel::PanelItem::Info => {}
+            // 标题带：收藏册换 tab；设置页 `cycle()` 返回自身 ⇒ 这一臂的含义是
+            // **重载这一面的默认五行**，也就是「概率」/「复核」借走这一面时唯一的回程。
+            panel::PanelItem::Header => match kind.cycle().tab() {
+                Some(tab) => self.collection_panel(tab),
+                None => self.open_panel(PanelKind::Settings),
+            },
+            panel::PanelItem::Lang => self.cycle_lang(),
+            panel::PanelItem::Motion => self.cycle_motion(),
+            // 公示概率不碰库（见 [`Self::rates_lines`]），所以这一臂不过 `gacha_panel`。
+            panel::PanelItem::Rates => {
+                let lines = self.rates_lines();
+                self.show_panel_lines("rates", PanelKind::Settings, lines);
+            }
+            panel::PanelItem::Verify => {
+                self.gacha_panel("verify", PanelKind::Settings, |g, l, s| {
+                    g.verify_lines(l, s)
+                });
+            }
+            panel::PanelItem::Close => self.close_panel(),
+        }
+    }
+
     /// 每 tick 走一遍：同步 scale、跑看门狗、推进相位、按签名决定要不要提交。
     /// 静止的菜单**一次 commit 都不发**（`counters.menu_commits` 必须不随 tick 增长）。
     fn update_menu(&mut self, now: Instant) {
@@ -1709,7 +2360,7 @@ impl App {
             return;
         }
         let scale_num = self.scale_num;
-        let error = self.menu_error_line();
+        let error = self.error_line();
         let mut m = self.menu.take().expect("上面查过 is_some");
         m.mirror_scale(scale_num);
         if m.tick_watchdog(now) {
@@ -1761,47 +2412,29 @@ impl App {
             menu::MenuItem::Equip => self.equip(),
             menu::MenuItem::Unequip => self.unequip(),
             menu::MenuItem::NextOutfit => self.cycle_accessory(),
-            // ── 收藏册页：三行全是**只读报表**（不掷骰、不花钱、不改库）──
-            menu::MenuItem::Owned => self.gacha_report("collection", |g| g.collection_lines()),
-            menu::MenuItem::Missing => self.gacha_report("missing", |g| g.missing_lines()),
-            // 十次 = 一次十连。不是"最近十行"也不是"最近十个 pull"：抽一次也是十行里的一行，
-            // 而这个门面要回答的是"上一次发生了什么"。
-            menu::MenuItem::Recent => self.gacha_report("recent", |g| g.recent_lines(10)),
-            // ── 设置页 ──
-            menu::MenuItem::MotionTier => self.cycle_motion(),
-            menu::MenuItem::Rates => self.show_rates(),
-            menu::MenuItem::Verify => self.gacha_report("verify", |g| g.verify_lines()),
-        }
-    }
-
-    /// 收藏册 / 设置页那几行"连库 → 读 → 打 stderr"的报表，共用同一条出声路径。
-    ///
-    /// 三件事都由这一条函数保证：**先** `ensure_gacha()`（lazy 连库那条红线，D14）、失败只
-    /// 写错误行（[`Self::gacha_bailed`]，不 panic 不置 `exit`，硬约束 3 同族）、成功就把错误行
-    /// 清空（否则上一条失败的字一直挂着，用户会以为它还没修）。
-    ///
-    /// ⚠️ **不置 `force_draw`**：这些行进的是 stderr，一行像素都不动。加了就是
-    /// 在"静止菜单 = 1 提交"那道预算上多投一帧一模一样的 buffer（`69fd158` 那个形状）。
-    fn gacha_report(
-        &mut self,
-        prefix: &str,
-        report: impl FnOnce(&Gacha) -> Result<Vec<String>, String>,
-    ) {
-        if !self.ensure_gacha() {
-            return;
-        }
-        let lines = match self.gacha.as_ref() {
-            Some(g) => report(g),
-            None => return,
-        };
-        match lines {
-            Ok(v) => {
-                self.gacha_error = None;
-                for l in &v {
-                    eprintln!("{prefix}: {l}");
-                }
+            // ── 收藏册页：三行各自**开出面板的那一个 tab**（全是只读，不掷骰、不花钱、不改库）──
+            // 这一批起它们不再"只进 stderr"：点下去 = 第三块面上看得见那几行，而 stderr 打的
+            // 是同一批字（`Gacha::tab_lines` 是唯一的生产者，两边都从它过）。
+            menu::MenuItem::Owned => self.collection_panel(CollectionTab::Owned),
+            menu::MenuItem::Missing => self.collection_panel(CollectionTab::Missing),
+            // 条数 = 一屏装得下的行数（`panel::MAX_ROWS - 1`，见 [`Gacha::tab_lines`]）。
+            // 不是"最近十次 = 一次十连"那种口径：那个说法属于只打日志的年代，而现在这一屏
+            // 第六格是 `Close`，多一条就得靠截断补「+N 更多」，那是保险而不是主路径。
+            menu::MenuItem::Recent => self.collection_panel(CollectionTab::Recent),
+            // ── 设置页：菜单那三行是**入口**，功能在面板上办 ──
+            // `MenuItem::Settings` 不存在（也不该有 —— 加一个变体要动 `rows()`、命中表、
+            // l10n 四个 locale、字体重裁），所以"动画"那一行的循环职责交给面板里的
+            // `Motion` 行，菜单这行改成把那一面开出来。
+            menu::MenuItem::MotionTier => self.open_panel(PanelKind::Settings),
+            menu::MenuItem::Rates => {
+                let lines = self.rates_lines();
+                self.show_panel_lines("rates", PanelKind::Settings, lines);
             }
-            Err(msg) => self.gacha_bailed(msg),
+            menu::MenuItem::Verify => {
+                self.gacha_panel("verify", PanelKind::Settings, |g, l, s| {
+                    g.verify_lines(l, s)
+                });
+            }
         }
     }
 
@@ -1823,10 +2456,15 @@ impl App {
 
     /// 点"退出"：**这是 `exit` 的第二个写入点**（第一个是 `--seconds` 到点）。
     ///
-    /// 两步的顺序是有意的：先 `close_menu()`（`teardown()` 已按 region → viewport → layer →
-    /// surface 的次序收回，菜单不会活得比决定久），再置 `exit`。下一个 `on_tick` 读到它就
-    /// `signal.stop()`，而 `report()` 在事件循环**之后** ⇒ **退出摘要照打**（`菜单: N 提交`、
-    /// 五档核对行、VmHWM/CPU 一条不少）。抽取在点击那一刻就同步落库 ⇒ 不需要额外拆库。
+    /// 两步的顺序是有意的：先 `close_menu()` 与 `close_panel()`（`teardown()` 已按 region →
+    /// viewport → layer → surface 的次序收回，两块面都不会活得比决定久），再置 `exit`。
+    /// 下一个 `on_tick` 读到它就 `signal.stop()`，而 `report()` 在事件循环**之后** ⇒
+    /// **退出摘要照打**（`菜单: N 提交`、`面板: N 提交`、五档核对行、VmHWM/CPU 一条不少）。
+    /// 抽取在点击那一刻就同步落库 ⇒ 不需要额外拆库。
+    ///
+    /// ⚠️ `close_panel()` 在**当前**的可达路径上是空转（`Quit` 只有菜单那一面能点到，而菜单
+    /// 一开面板必然已经关了）。留着它不是防御，是因为"退出要把自己建过的每一块面都收回"
+    /// 这件事**不该依赖另一条不变量此刻成不成立** —— 互斥那条以后若被推翻，这里必须仍然对。
     ///
     /// **不做确认步骤**：这块 surface 没有对话框、也没有 click-outside（D14），"确认"会变成
     /// 又一个页状态 + 又一批假按钮风险；而"退出"不在首页而在第三页的最后一行，误触至少要三次
@@ -1834,6 +2472,7 @@ impl App {
     /// = 重启一次，零数据损失。
     fn quit_pet(&mut self) {
         self.close_menu();
+        self.close_panel();
         self.exit = true;
         eprintln!("ui: 菜单请求退出 ⇒ 收尾并打退出摘要");
     }
@@ -1998,90 +2637,66 @@ impl App {
         Some((worn.manifest.slug.clone(), worn.atlas.decoded_bytes()))
     }
 
-    /// 点语言行：zh→en→ja→ko→zh，**只改本进程，不回写文件**。
+    /// 点语言行：zh→en→ja→ko→zh，**本进程立刻生效 + 当场写回 `config.toml`**（拍板④）。
     ///
-    /// 不写回的理由不是省事：本轮的 reader 是自写的平坦 `key = "value"` 解析，读改写会把
-    /// 用户的注释整段刷平 ⇒ **丢注释比"重启回默认"更坏**（§7-R15）。所以切换时把持久化
-    /// 写法打在 stderr，让人自己决定要不要写。两处一起改（`App.ui.lang` 是真相源、
-    /// `MenuState.lang` 是 draw 用的副本）—— 全项目只有这一处写它。
+    /// 原先这一条是"只改本进程、不回写"，理由是 §7-R15：那一轮的 reader 是自写的平坦
+    /// `key = "value"` 解析，读改写会把用户的注释整段刷平 ⇒ **丢注释比"重启回默认"更坏**。
+    /// 那个理由现在被 `petstore::config::write_ui_key` 换掉了（`toml_edit` 保 decor +
+    /// 落盘前后各判一次），所以这一行从"提示你自己去写"变成"真的写"。两处一起改
+    /// （`App.ui.lang` 是真相源、`MenuState.lang` 是 draw 用的副本）—— 全项目只有这一处写它。
+    ///
+    /// 第三处 = **开着的面板要把行重算**（[`Self::refresh_panel_rows`]）：面板那一屏每一行的字
+    /// 都从 `lang` 来，不换就是"切了语言而收藏册还写着中文"。这里**不置 `force_draw`**：
+    /// `lang` 与每行文本都在 `panel::content_sig` 里，闸门自己认得出。
+    ///
+    /// ⚠️ 这里**不给面板置 `force_draw`**（第三处那段的同一条例外）：`lang` 与重建出来的每一行
+    /// 文本都已经在 `panel::content_sig` 里，下一 tick 闸门自己放行。写回排在最后，是因为
+    /// [`Self::persist_ui_key`] 是这一里唯一会**改错误行**的一步，而错误行也在签名里 ——
+    /// 它对"这次到底落没落地"有最后发言权。
     fn cycle_lang(&mut self) {
         let next = self.ui.lang.next();
+        // 写回之前先记下这一档原来是从哪层来的：命令行高于文件（§4.6），所以从 `--lang`
+        // 启动的那一次点了也不会下次生效，这句话必须说，不然是"点了没反应"的假故障。
+        let from_cli = self.ui.lang_from == settings::ValueSource::Cli;
         self.ui.lang = next;
         self.ui.lang_from = settings::ValueSource::MenuClick;
         if let Some(m) = self.menu.as_mut() {
             m.lang = next;
             m.force_draw = true;
         }
-        eprintln!(
-            "ui: 语言 → {} ({})；本轮会话生效，想固定请在 {} 写 [ui] lang = \"{}\"",
-            next.self_name(),
-            next.code(),
-            self.ui_config_path,
-            next.code()
-        );
+        self.refresh_panel_rows();
+        eprintln!("ui: 语言 → {} ({})", next.self_name(), next.code());
+        self.persist_ui_key(petstore::config::KEY_LANG, next.code(), from_cli);
     }
 
-    /// 点"动画"那一行：full → reduce → off → full，**只改本进程、不回写文件**。
+    /// 点"动画"那一行：full → reduce → off → full，**本进程立刻生效 + 当场写回**，
+    /// 与 [`Self::cycle_lang`] 同一条路（`[ui] motion` 是 `write_ui_key` 认的两个键之一）。
     ///
-    /// 不回写与 [`Self::cycle_lang`] 同一条理由（§7-R15：自写的平坦 reader 保不住用户注释，
-    /// 读改写会把文件刷平）。
-    ///
-    /// ⚠️ **这里不置 `force_draw`，也不是漏了**：`motion` 故意**不在** `menu::content_sig` 里，
-    /// 而 `menu_pixels_ignore_the_motion_tier` 那条门禁断言的是"三档下菜单像素逐字节相同"
+    /// ⚠️ **这里不给菜单置 `force_draw`，也不是漏了**：`motion` 故意**不在** `menu::content_sig`
+    /// 里，而 `menu_pixels_ignore_the_motion_tier` 那条门禁断言的是"三档下菜单像素逐字节相同"
     /// —— 这一行改的是**卡片动画**（burst 时长、SSR 白闪），不是此刻这张菜单。加一句
     /// `force_draw` 就是在唯一有"静止菜单 = 1 提交"预算的门面上重造 `69fd158` 那个形状：
-    /// 每 tick 重投一帧像素完全相同的 buffer。反馈走 stderr，改动**下一次抽取才看得见**。
+    /// 每 tick 重投一帧像素完全相同的 buffer。改动**下一次抽取才看得见**。
+    ///
+    /// 面板反过来：设置面**确实要重算行**，因为 `settings_rows` 把 `motion.code()` 烘进了那一行
+    /// 的正文，而正文进签名 ⇒ [`Self::refresh_panel_rows`] 换完行，下一 tick 闸门自己放行。
+    /// 菜单那一行只是入口，它自己的字不含档位。
     fn cycle_motion(&mut self) {
         let next = self.ui.motion.next();
+        let from_cli = self.ui.motion_from == settings::ValueSource::Cli;
         self.ui.motion = next;
         self.ui.motion_from = settings::ValueSource::MenuClick;
         if let Some(m) = self.menu.as_mut() {
             m.motion = next;
         }
-        eprintln!(
-            "ui: 动画 → {}；本轮会话生效（下一次抽取的 burst 才跟着变），想固定请在 {} 写 [ui] motion = \"{}\"",
-            next.code(),
-            self.ui_config_path,
-            next.code()
-        );
+        self.refresh_panel_rows();
+        eprintln!("ui: 动画 → {}（下一次抽取的 burst 才跟着变）", next.code());
+        self.persist_ui_key(petstore::config::KEY_MOTION, next.code(), from_cli);
     }
 
-    /// 点"概率"那一行：把**公示**的两列打到 stderr。
-    ///
-    /// ⚠️ **这条路不碰库**，而且是故意的：它读的是编译期就嵌进二进制的 `rates.json`
-    /// （`DEFAULT_RATES_JSON` = `RATES_ASSET` 那份，与 `catalog rates --out` 写的是同一个产物），
-    /// 回答的是"承诺了什么"而不是"这次抽到了什么"。所以它**不需要** `ensure_gacha()` ——
-    /// 让它去连库就等于"内存库的玩家读不到公示"，而公示对每个人都一样。
-    ///
-    /// `Published::check` 是硬约束 #2（"概率必须与公示一致"）的守门人：文件与代码不一致时
-    /// 这一行报**不一致**，而不是把那份已经在说谎的文件念给用户听。宁可不答，不可答错。
-    fn show_rates(&self) {
-        let published = match RatesFile::read(DEFAULT_RATES_JSON) {
-            Ok(p) => p,
-            Err(msg) => {
-                eprintln!("rates: {msg}");
-                return;
-            }
-        };
-        let effective = match published.check(&GachaParams::V1) {
-            Ok(r) => r,
-            Err(msg) => {
-                eprintln!("rates: 公示与代码不一致 ⇒ {msg}");
-                return;
-            }
-        };
-        eprintln!(
-            "rates: 公示口径 method={:?} 视界 {} 抽（格式 v{}，百万分位）",
-            published.method, published.basis_pulls, published.format
-        );
-        for r in Rarity::ALL {
-            eprintln!(
-                "rates: {} 基础 {}% 综合 {}%",
-                r.as_str(),
-                percent_str(published.base.weight(r)),
-                percent_str(effective.weight(r))
-            );
-        }
+    /// 点菜单/面板上那个「概率」格子：见 [`published_rates_lines`]（不碰库、五行整）。
+    fn rates_lines(&self) -> Result<Vec<String>, String> {
+        published_rates_lines(self.ui.lang)
     }
 
     /// 第一次用到才连库，之后复用同一条连接。返回"库是否可用"，调用方据此决定余额读不读。
@@ -2099,7 +2714,7 @@ impl App {
                     self.opts.db.as_deref().unwrap_or("内存库：不写盘")
                 );
                 self.gacha = Some(g);
-                self.gacha_error = None;
+                self.ui_error = None;
                 true
             }
             Err(msg) => {
@@ -2109,10 +2724,51 @@ impl App {
         }
     }
 
-    /// 抽取层唯一的出声处：stderr + 菜单错误行。**不 panic、不置 `exit`**。
+    /// 抽取层的出声处：stderr + 菜单/面板共用的错误行。**不 panic、不置 `exit`**。
     fn gacha_bailed(&mut self, msg: String) {
         eprintln!("gacha: {msg}");
-        self.gacha_error = Some(msg);
+        self.ui_error = Some(msg);
+    }
+
+    /// UI 侧（非抽取）的出声处，与 [`Self::gacha_bailed`] 同一条纹路：stderr + 那一行错误。
+    /// 分两个函数只为了**前缀不说谎**：配置写回的失败打成 `gacha: …` 会把排查的人支到
+    /// 数据库那边去。
+    fn ui_bailed(&mut self, msg: String) {
+        eprintln!("ui: {msg}");
+        self.ui_error = Some(msg);
+    }
+
+    /// 点设置行 = **当场写回 `config.toml`**（拍板④：「窗口中显示相关的内容，并实现功能」）。
+    ///
+    /// 写法只有 [`petstore::config::write_ui_key`] 一处（读改写走 `toml_edit` 保 decor，落盘前
+    /// 与落盘后各用**我们自己的** reader 判一遍，禁止 writer 拿自己的 parser 验自己 —— 五条规则
+    /// 与"为什么不能拿平坦 reader 反推整份文件"都写在那里）。这里只管三件事：
+    /// · **成功**只念 writer 返回的那个路径，不在 `App` 里再算一遍路径（两处各算一次早晚
+    ///   漂移成两个文件，而用户会改哪一个全看运气）；消音那一条错误行是**既有约定**
+    ///   （`ensure_gacha` 连库成功、`show_panel_lines` 读行成功、`do_pull` 抽取成功，三处各自
+    ///   清空这一行）⇒ 这一行的语义是"最近一次失败"，不是"某个一直没修好的东西"；
+    /// · **失败**要把"本进程已经改了"一起说清 —— 只报"失败"会让人以为什么都没变，而屏上
+    ///   那一行此刻写的就是新值；
+    /// · **优先关系不因写回而改变**：`--lang`/`--motion` 高于文件（§4.6 那条链），所以从
+    ///   命令行启动的那次要明说"不带参数重启才看得见"，不然用户会以为点了等于没生效。
+    fn persist_ui_key(&mut self, key: &str, value: &str, from_cli: bool) {
+        match petstore::config::write_ui_key(key, value) {
+            Ok(path) => {
+                self.ui_error = None;
+                eprintln!(
+                    "ui: {key} = \"{value}\" 已写回 {}{}",
+                    path.display(),
+                    if from_cli {
+                        "（本次启动的值来自命令行参数，它高于文件 ⇒ 不带参数重启才读得到这一档）"
+                    } else {
+                        "（下次启动读这一档）"
+                    }
+                );
+            }
+            Err(msg) => self.ui_bailed(format!(
+                "写回 {key} 失败：{msg} ⇒ 本次会话仍然生效，下次启动不会"
+            )),
+        }
     }
 
     fn gacha_balance(&self) -> i64 {
@@ -2140,7 +2796,7 @@ impl App {
         };
         let (lines, best, balance) = match pulled {
             Ok(v) => {
-                self.gacha_error = None;
+                self.ui_error = None;
                 v
             }
             // 库被别的进程锁住、公示与库里对不上…… 都只出声，不停宠物
@@ -2160,9 +2816,12 @@ impl App {
         }
     }
 
-    /// 菜单的错误行（连不上库、抽取失败都靠它出声）。
-    fn menu_error_line(&self) -> String {
-        self.gacha_error.clone().unwrap_or_default()
+    /// 错误行（连不上库、读库存失败、抽取失败、**写回 `config.toml` 失败**都靠它出声）。
+    /// **菜单与面板共用这一条通道**：写它的只有两处 —— 抽取侧
+    /// [`Self::gacha_bailed`]、UI 侧 [`Self::ui_bailed`]，而两块面都把它画进自己的标题带右段，
+    /// 且**都把它混进内容签名**（`menu::content_sig` / `panel::content_sig`）。
+    fn error_line(&self) -> String {
+        self.ui_error.clone().unwrap_or_default()
     }
 }
 
@@ -2212,9 +2871,10 @@ impl App {
             );
         }
 
-        // 菜单自己走一遍（独立 pool / 独立看门狗）。放在宠物 `!configured` 早退之前：
-        // 宠物的映射状态和菜单该不该动帧毫无关系。
+        // 每一块附属面自己走一遍（**各自的 pool、各自的看门狗、各自的内容签名**）。放在宠物
+        // `!configured` 早退之前：宠物的映射状态和菜单/面板该不该动帧毫无关系。
         self.update_menu(now);
+        self.update_panel(now);
 
         // 第一次 configure 之前 surface 还没映射，`present` 会直接早退 ⇒ 这期间推进内核就等于
         // **把"内容变了"的 intent 扔掉**（宠物可能一直不显形）。所以这里干脆不推进。
@@ -2592,6 +3252,19 @@ impl App {
             self.counters.menu_commits,
             self.counters.menu_watchdogs,
         );
+        // 面板单列一行，**不并进宠物三档也不并进菜单**：这三块面的省电判据是三个不同的问题
+        // （宠物 = 五档 vs tick；菜单 = 翻页才 +1；面板 = 开着一动不动而恒 0 增长）。混成一个
+        // 数就读不出任何一个。互斥 ⇒ 这两行最多一行是"开着"，同时开着就是 bug 的现场。
+        println!(
+            "  面板: {}（{} 提交 / {} 看门狗，静止时应当恒 0 增长）",
+            if self.panel.is_some() {
+                "开着"
+            } else {
+                "没开"
+            },
+            self.counters.panel_commits,
+            self.counters.panel_watchdogs,
+        );
         if let Some(sim) = self.sim.as_ref() {
             println!(
                 "  内核: state={:?} 指纹={:016x}",
@@ -2673,20 +3346,34 @@ impl CompositorHandler for App {
     }
 
     fn frame(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, s: &WlSurface, _t: u32) {
-        // 按**对象身份**分流：宠物 / 菜单 / 别人的（光标 surface 也走这条路）。
+        // 按**对象身份**分流：宠物 / 菜单 / 面板 / 别人的（光标 surface 也走这条路）。
         // 不分流的话，菜单的帧回调会把宠物的 `frame_pending` 解开（反之亦然），
-        // 两块 surface 互相"替对方"放行 ⇒ 提交计数和延后补投全都读不出真相。
+        // 三块 surface 互相"替对方"放行 ⇒ 提交计数和延后补投全都读不出真相。
         if self.menu.as_ref().is_some_and(|m| &m.surface == s) {
             if let Some(mut m) = self.menu.take() {
                 m.clear_wait();
                 if m.force_draw {
                     let qh = self.qh();
-                    let e = self.menu_error_line();
+                    let e = self.error_line();
                     if m.draw(&self.compositor, &qh, &e) {
                         self.counters.menu_commits += 1;
                     }
                 }
                 self.menu = Some(m);
+            }
+            return;
+        }
+        if self.panel.as_ref().is_some_and(|p| &p.surface == s) {
+            if let Some(mut p) = self.panel.take() {
+                p.clear_wait();
+                if p.force_draw {
+                    let qh = self.qh();
+                    let e = self.error_line();
+                    if p.draw(&self.compositor, &qh, &e) {
+                        self.counters.panel_commits += 1;
+                    }
+                }
+                self.panel = Some(p);
             }
             return;
         }
@@ -2714,8 +3401,10 @@ impl CompositorHandler for App {
         s: &WlSurface,
         o: &wl_output::WlOutput,
     ) {
-        // 只认宠物那块：光标 surface 和菜单也会报 enter，拿它们写 `on_output`
-        // 等于"谁最后进屏谁定义舞台"，热插拔时会飘。
+        // 只认宠物那块：光标 surface、菜单、面板也会报 enter，拿它们写 `on_output`
+        // 等于"谁最后进屏谁定义舞台"，热插拔时会飘。附属面**故意不进这条路**（它们的
+        // output 由 `open_panel_lines`/`open_menu` 建 surface 时按 `on_output` 定，改了舞台
+        // 就等下一次点击重建那块面，没有"跟着宠物搬"这回事）。
         if s != self.layer.wl_surface() {
             return;
         }
@@ -2771,6 +3460,13 @@ impl LayerShellHandler for App {
             eprintln!("menu: 合成器收回菜单 surface（宠物继续跑）");
             return;
         }
+        // 面板同一条：那块面被收回只说明"这一屏没了"，不说明"宠物该退出"。`take()` 而不是
+        // `teardown()`：合成器已经关掉它，再走一遍 destroy 只是把已经失效的对象再问一次。
+        if self.panel.as_ref().is_some_and(|p| &p.layer == l) {
+            self.panel = None;
+            eprintln!("panel: 合成器收回面板 surface（宠物继续跑）");
+            return;
+        }
         if &self.layer == l {
             self.exit = true;
         }
@@ -2790,11 +3486,25 @@ impl LayerShellHandler for App {
                 m.force_draw = true;
                 m.clear_wait();
                 let qh = self.qh();
-                let e = self.menu_error_line();
+                let e = self.error_line();
                 if m.draw(&self.compositor, &qh, &e) {
                     self.counters.menu_commits += 1;
                 }
                 self.menu = Some(m);
+            }
+            return;
+        }
+        if self.panel.as_ref().is_some_and(|p| &p.layer == l) {
+            if let Some(mut p) = self.panel.take() {
+                p.configured = true;
+                p.force_draw = true;
+                p.clear_wait();
+                let qh = self.qh();
+                let e = self.error_line();
+                if p.draw(&self.compositor, &qh, &e) {
+                    self.counters.panel_commits += 1;
+                }
+                self.panel = Some(p);
             }
             return;
         }
@@ -2877,9 +3587,11 @@ impl SeatHandler for App {
             if self.drag {
                 self.on_release(conn);
             }
-            // **菜单连带丢掉**：它整块 input region 都吃点击，而没有指针就再也点不到
+            // **两块附属面连带丢掉**：它们整块 input region 都吃点击，而没有指针就再也点不到
             // CLOSE —— 留着一块永久吞点击的不透明方块，正是 M4 那条 P0 的同一个形状。
+            // 面板在这一批成为第三块面，所以它**必须和菜单同进退**，不能只补菜单那一半。
             self.close_menu();
+            self.close_panel();
         }
     }
 
@@ -2895,21 +3607,30 @@ impl PointerHandler for App {
         events: &[SeatPointerEvent],
     ) {
         for e in events {
-            // 三路分流：菜单 / 宠物 / 别的 surface（光标那块的事件也在这里被丢掉）
+            // 四路分流：菜单 / 面板 / 宠物 / 别的 surface（光标那块的事件也在这里被丢掉）
             let on_menu = self.menu.as_ref().is_some_and(|m| m.surface == e.surface);
-            if !on_menu && e.surface != *self.layer.wl_surface() {
+            let on_panel = self.panel.as_ref().is_some_and(|p| p.surface == e.surface);
+            if !on_menu && !on_panel && e.surface != *self.layer.wl_surface() {
                 continue;
             }
-            if on_menu {
+            if on_menu || on_panel {
+                // 两块附属面**共用这一条臂**，因为它们对指针的语义完全相同：只用左键、
+                // 只用 Press、其余事件只为光标服务（`menu_press_activates` 是那条"右键落进
+                // 菜单不激活任何东西"的红线所在，面板照抄 —— 右键在面板上什么都不做，
+                // 关面板要按 CLOSE 那一行，与关菜单同一个口径）。
                 let local = (e.position.0 as f32, e.position.1 as f32);
                 match e.kind {
                     PointerEventKind::Enter { .. } => self.set_cursor(conn),
                     PointerEventKind::Press { button, .. } => {
                         if menu::menu_press_activates(button) {
-                            self.on_menu_press(local);
+                            if on_menu {
+                                self.on_menu_press(local);
+                            } else {
+                                self.on_panel_press(local);
+                            }
                         }
                     }
-                    // 菜单被点完可能当场关闭（CLOSE 项）⇒ Leave/Release 拿不到那块 surface，
+                    // 面被点完可能当场关闭（CLOSE 项）⇒ Leave/Release 拿不到那块 surface，
                     // 这里只用来收尾光标，不参与状态机。
                     PointerEventKind::Motion { .. } | PointerEventKind::Leave { .. } => {}
                     PointerEventKind::Release { .. } | PointerEventKind::Axis { .. } => {}
@@ -3093,8 +3814,6 @@ delegate_registry!(App);
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 只在测试里用：生产路径的文案都经 `card.rs`/`menu.rs` 取，`app.rs` 顶部不引 `Key`
-    use crate::l10n::Key;
 
     /// 抽取层的入口是鼠标，而**我绝不注入点击**（三项人工门禁只有用户本人能判）。
     /// 所以这一层的验收必须在 headless 里跑完：`Gacha` 不含任何 wayland 类型，
@@ -3149,6 +3868,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 一串面板上的字**画得出来**吗（每个码位都在字体子集里）。缺字在画布上是一个方框或
+    /// 一个 `?`，像素门禁全绿而玩家读到的是断字 —— 判据① 那一族。
+    fn assert_sayable(text: &str, lang: Lang, where_: &str) {
+        if let Some(c) = crate::text::missing(text) {
+            panic!("{lang:?} 的{where_}「{text}」里的 {c:?} 不在字体子集里 ⇒ 屏上是一个方框");
+        }
+    }
+
+    /// 面板六屏（设置默认 + 收藏册三 tab + 被「概率」/「复核」借走的 setting 面两屏）×
+    /// 四 locale × **两档缩放**：每一串字都要①画得出来、②一个字节都不被截。
+    ///
+    /// 为什么这条是这一批新加的，而 `panel.rs` 那 11 条不算覆盖：面板的行**从这一批起才是
+    /// 像素**（上一批它们只进 stderr，截不断、缺不缺字都没人负责），而它的入口是鼠标 ——
+    /// 我绝不注入点击 ⇒ "点下去那一屏破不破版"在真机上永远只有用户本人撞得到。没有这条，
+    ///  ja/ko 的面板正文就是**从来没被任何人看过**的东西。
+    ///
+    /// 行一律来自**真生产者**（`Gacha::tab_lines` / `Gacha::verify_lines` /
+    /// [`published_rates_lines`] / `panel::settings_rows`），不手写样本：手写的行永远比真的行短。
+    /// 预算算法与 `card::paint_panel` **逐字同构**：可点的行让出强调条（`menu::label_rect`）、
+    /// 只读行占满行底（`menu::row_text`），换算只走 `menu::budget_for`；标题带走
+    /// `menu::line_budget_px`。两边不同构的话这条绿而屏上截字。
+    ///
+    /// ⚠️ **错误行不在这条的管辖内**：它是 `petstore` 的原文（§7-R9 不译），长就得长，
+    /// `card::paint_panel` 对它**允许截断**（预算让位给标题带那一句是明写的取舍）。
+    #[test]
+    fn every_panel_row_is_sayable_and_never_truncated() {
+        let mut g = Gacha::connect(None).expect("内存库该建得起来");
+        // 真抽十连：让「已获得」有名字行、「还缺」有缺项、「最近」装满五行、「复核」有链头。
+        g.pull(10, true, Lang::Zh, 1.5).expect("十连该成功");
+        let mut screens = 0usize;
+        // ⚠️ `scale` 在**外层**：产行的那一刻读它（`missing_lines` 按宽度折名字），画的那一刻读
+        // 同一个数。把这两层拆开选就等于"用 1× 折出来的行去判 1.5× 的预算"，那是两个口径。
+        for scale in [1.0f32, 1.5] {
+            for lang in Lang::ALL {
+                let mut sets: Vec<(PanelKind, Vec<panel::PanelRow>)> = vec![(
+                    PanelKind::Settings,
+                    panel::settings_rows(lang, Motion::Full),
+                )];
+                for tab in CollectionTab::ALL {
+                    let lines = g
+                        .tab_lines(tab, lang, scale)
+                        .expect("收藏册三屏都该读得出来");
+                    sets.push((
+                        PanelKind::Collection { tab },
+                        panel::collection_rows(lang, &lines),
+                    ));
+                }
+                // 「概率」/「复核」把设置面**借走**的那两屏：`kind` 仍是 `Settings` ⇒ 标题带
+                // 还是「设置」，而行是别的内容。这两屏是这一批新出现的形状，没人量过。
+                let rates = published_rates_lines(lang).expect("公示读得出来");
+                sets.push((PanelKind::Settings, panel::collection_rows(lang, &rates)));
+                let verify = g
+                    .verify_lines(lang, scale)
+                    .expect("刚抽完十连的内存账本该自洽");
+                sets.push((PanelKind::Settings, panel::collection_rows(lang, &verify)));
+
+                for (kind, rows) in &sets {
+                    screens += 1;
+                    assert!(
+                        !rows.is_empty(),
+                        "{lang:?} 的 {kind:?} 一行都没有 ⇒ 生产者出字的地方根本没被量到"
+                    );
+                    assert!(
+                        rows.len() <= panel::MAX_ROWS,
+                        "{lang:?} 的 {kind:?} 有 {} 行 > 一屏的 {}",
+                        rows.len(),
+                        panel::MAX_ROWS
+                    );
+                    let head = panel::header_text(*kind, lang);
+                    assert_sayable(&head, lang, "标题带");
+                    assert_eq!(
+                        menu::fit_to(&head, menu::line_budget_px(scale), scale),
+                        head,
+                        "{lang:?} 的标题带「{head}」在 {scale}× 下被截 ⇒ 那一屏读不出自己在哪一本第几页"
+                    );
+                    for (r, row) in panel::layout(rows).iter().zip(rows) {
+                        let label = if r.item.actionable() {
+                            menu::label_rect(r.as_rect())
+                        } else {
+                            menu::row_text(r.as_rect())
+                        };
+                        assert_sayable(&row.text, lang, "行");
+                        let budget = menu::budget_for(label.w, scale);
+                        assert_eq!(
+                            menu::fit_to(&row.text, budget, scale),
+                            row.text,
+                            "{lang:?} 的 {kind:?}/{:?} 行「{}」在 {scale}× 下被截（预算 {budget}）",
+                            r.item,
+                            row.text
+                        );
+                    }
+                }
+            }
+        }
+        // 屏数要点名：少一个生产者这条照样绿（"没量到"和"量过了且对"在两行断言里长得一样）。
+        assert_eq!(
+            screens,
+            2 * Lang::ALL.len() * (panel::CollectionTab::ALL.len() + 3),
+            "应当量满 两档缩放 × 四 locale × (收藏册三屏 + 设置默认 + 概率 + 复核)"
+        );
     }
 
     #[test]

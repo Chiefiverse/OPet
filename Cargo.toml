@@ -27,6 +27,20 @@ getrandom = "0.3"
 # 钉死版本 + 关掉默认特性：① 字形栅格化结果**就是卡片像素**，换版本等于换 hinting ⇒ 出图过眼
 # 门禁要全部重跑；② 子集里没有 `gvar` 表，`variable-fonts`/`gvar-alloc` 用不上，多开只是多代码。
 ab_glyph = { version = "=0.2.32", default-features = false, features = ["std"] }
+# 本项目**第二次**真加依赖（设计书 §9.2 第 19 条 = 设置页那个 TOML writer）。
+# D8 allowlist 逐条核过，锁定的八个 crate 都读了 `~/.cargo/registry/src/**/LICENSE*` 原文，不是凭记忆：
+#   toml_edit 0.25.17 · toml_datetime 1.1.2 · toml_parser 1.1.5 · toml_writer 1.1.3
+#   indexmap 2.14.2 · hashbrown 0.17.1 · equivalent 1.0.3 = 全 "MIT OR Apache-2.0"
+#   winnow 1.0.4 = MIT-only
+# 全部落在 allowlist（BSD/MIT/Apache-2.0/LGPL-3）内，**GPL-2-only 那个排除项一个都没沾**；
+# 每个目录都 `ls` 过 ⇒ 只有 LICENSE-APACHE / LICENSE-MIT 两份，**没有** EXCEPTION / 附加条款文件，
+# Apache 那份读的是正文（第 3 行 = 规范 URL、第 66 行 = "2. Grant of Copyright License"、
+# 末尾 Appendix 的版权行填的是 "Individual contributors"）= 标准 2.0，不是带改动的版本。
+# MSRV 逐个查过：七个 = 1.85，winnow = 1.65、equivalent = 1.6 ⇒ 都不高于本仓库声明的 1.86，
+# **不需要抬 MSRV**。
+# **钉死版本**的理由与 ab_glyph 那条同族但更直接：writer 写出的**字节本身**就是"带注释的
+# config.toml 写回后注释仍在"那条判据的宾语 ⇒ 换版本 = 换写出的格式 = 那条往返测试要全部重跑。
+toml_edit = "=0.25.17"
 
 petcore = { path = "crates/petcore" }
 petstore = { path = "crates/petstore" }
