@@ -561,14 +561,36 @@ def main():
             )
         pet = "cat_shiro"
     fixture = load_fixture()
-    frames_dir = args.frames or os.path.join(REPO, "assets", "pets", pet, "frames")
     out_dir = args.out or os.path.join(REPO, "assets", "pets", pet)
+    # 默认帧目录跟着**产物目录**走，不跟着 `--pet` 走（`--frames` 的 help 从第一天就是这么写的，
+    # 配件那一档也是这个实现）。原先本体档按 `--pet` 拼路径 ⇒ `--pet tiger
+    # --out assets/pets/tiger_192` 读的是 `assets/pets/tiger/frames`（@96 那批）而把产物写进 @192
+    # 那个目录。最坏的地方在于它**自洽**：清单里的 grid 跟着帧走（提示行自己就说了"产物 grid.w/h
+    # 按 96 写"）、polygon 由这张 sheet 算出、14 项像素门禁比的是"这批帧 vs 这张 sheet"⇒ 全绿，
+    # 而屏上是一只体型小一半的老虎。露馅的只有那行提示，**提示不是判据**（同 `fits` 那条空转门禁
+    # 一个族：错不在没打印，错在没有任何东西因为它而拒绝）。
+    frames_dir = args.frames or os.path.join(out_dir, "frames")
     os.makedirs(out_dir, exist_ok=True)
 
     meta = load_meta(frames_dir)
     cell = meta["cell"]["w"]
     if meta["cell"]["h"] != cell:
         sys.exit("meta.json 的 cell 非方格: %s" % meta["cell"])
+
+    # 目标目录里已有的 pet.json 是唯一说得出"这个目录本来是哪一档"的东西。档位不一致 ⇒ 在
+    # **读完两个字符串之后、逐格解码与任何写入之前**拒绝（判据 = "它拒绝的那一刻已经付了多少代价"）。
+    target_manifest = os.path.join(out_dir, "pet.json")
+    if os.path.isfile(target_manifest):
+        with open(target_manifest, encoding="utf-8") as fh:
+            prior_cell = json.load(fh).get("grid", {}).get("w")
+        if prior_cell is not None and prior_cell != cell:
+            sys.exit(
+                "%s 里已有的产物是 grid %d，而 %s 这批帧是 cell %d ⇒ 这一趟会把 @%d 的像素写进 @%d\n"
+                "    的产物目录，而且**产出自洽、像素门禁一条都不会红**（错的只有屏上的体型）。\n"
+                "    要么把 --frames 指到真正产出 @%d 那批的帧目录，要么换一个 --out；确实要改档就\n"
+                "    先把 %s 移走 —— 移走这个动作本身就是那句「我知道我在覆盖什么」。"
+                % (out_dir, prior_cell, frames_dir, cell, cell, prior_cell, prior_cell, target_manifest)
+            )
     if cell != fixture["grid"]["w"]:
         print(
             "PACK 提示：烘焙格子 %d 与 fixture grid.w %d 不一致 ⇒ 产物 grid.w/h 按 %d 写；"
@@ -678,6 +700,8 @@ def main():
     )
     print("PACK sheet.webp = %d B (%.1f KB)，解码后 RGBA = %.3f MB" % (webp_bytes, webp_bytes / 1024, decoded / 1048576))
     print("PACK anchor.feet = %s" % anchor)
+    # 两个目录要**并排**打出来：上面那次事故的全部可发现性就在于"读哪批帧"这行没有出处。
+    print("PACK 帧目录 = %s（cell %d）" % (frames_dir, cell))
     print("PACK → %s" % out_dir)
 
 

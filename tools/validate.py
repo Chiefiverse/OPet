@@ -64,11 +64,13 @@ def measure_rss_mb(sheet_path):
 
 def main():
     ap = argparse.ArgumentParser(description="OPet 资产校验")
-    ap.add_argument("--pet", default="cat_shiro")
+    # 默认值必须是**空**：一个非空默认字符串回答不了"这个参数到底给没给"（下面那条盖章对照
+    # 就是被 `default="cat_shiro"` 判成"用户点名要 cat_shiro"的）。目录那一档自己补默认。
+    ap.add_argument("--pet", default="", help="宠物 slug，决定默认产物目录（不给则 cat_shiro）")
     ap.add_argument("--dir", default="")
     args = ap.parse_args()
 
-    d = args.dir or os.path.join(REPO, "assets", "pets", args.pet)
+    d = args.dir or os.path.join(REPO, "assets", "pets", args.pet or "cat_shiro")
     manifest = load_json(os.path.join(d, "pet.json"))
     sheet_path = os.path.join(d, manifest["sheet"])
     if not os.path.exists(sheet_path):
@@ -274,7 +276,14 @@ def main():
             "Python 解释器本身占大头，宠物进程只看外推值",
         )
 
-    print("## validate: %s\n" % args.pet)
+    # 标题打的是**这份产物的盖章**，不是 `--pet` 那个命令行参数：`--dir` 模式下 `--pet` 留在默认值
+    # `cat_shiro`，于是给老虎/兔子/太空猫跑的每一轮报告顶上都写着 `validate: cat_shiro` —— 六份错章
+    # 产物能藏这么久，这行也有份（它让"名字"这件事没有出处，看着就像工具自己的口音）。
+    stamped = manifest.get("slug", "?")
+    print("## validate: %s\n" % stamped)
+    if args.pet and args.pet != stamped:
+        print("> ⚠️ `--pet` 给的是 %s，而 %s 里的产物盖章是 %s ⇒ 这两个不是同一只。\n"
+              % (args.pet, d, stamped))
     print("| 项 | 实测 | 门禁 | 判定 | 备注 |")
     print("|---|---|---|---|---|")
     for name, measured, gate, mark, note in rep.rows:
