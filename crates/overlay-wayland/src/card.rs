@@ -481,6 +481,13 @@ pub struct Ctx<'a> {
     /// 被下游读过了吗"。**页不进签名 = 点了翻页、命中表换了、卡片还画旧页** —— 那是那条
     /// 缺陷的镜像形状（一个是"签名变了而画面不读"，这个是"画面读了而签名不变"）。
     pub page: MenuPage,
+    /// **开发态豁免**进行中（`--allow-unowned-accessories` 配真 `--db`）⇒ 帽子页标题带尾随
+    /// 一个 ASCII `*` 并染成警示色。
+    ///
+    /// 与 `dry_run` 同族 = **每进程恒定**（两个启动参数的函数）⇒ 不进 `content_sig`；但和
+    /// `dry_run` 一样**必须被下游读到**，否则这条记号就是"写进字段而屏上没有"的假门禁。
+    /// 演示态不点亮它 —— 那一档右端已有「演示」标，同一件事不给两个记号。
+    pub unowned_exempt: bool,
 }
 
 /// 画一帧卡片。`bw`/`bh` 是物理宽高，`stride` 是每行字节数（= bw×4）。
@@ -579,8 +586,23 @@ fn paint_menu(canvas: &mut [u8], stride: usize, ctx: Ctx) {
     // 不可能顶穿出界。页名被截是可读的（`盲盒 1/…`），标题压到碎片行上才是读不出。
     let budget =
         (menu::line_budget_px(scale) - line_w(&right, scale) - px(FOOTER_GAP, scale)).max(0);
-    let title = menu::fit_to(&ctx.page.header_text(ctx.lang), budget, scale);
-    draw_in(canvas, stride, head, scale, FG, &title, Align::Left);
+    // 豁免记号只落在**帽子页**（那条规则立在 [`menu::MenuPage::header_text_marked`] 里，不在这里
+    // 重述一遍）：它改的是那一页的候选表，六页都染成警示色就是在说"这轮整体不对"，而其它五页的
+    // 行为与豁免无关。左段照样过 `fit_to`（星号在最尾，被截的前提是本来就已超预算）。
+    // ⚠️ 染色的判据取"**星号真的在字上**"而不是"豁免开着"：后者要在两处各写一遍"只有帽子页"，
+    // 而两处的写法一旦出现半点差别，屏上就是"染了警示色而没有星号"—— 看图的人会读成整轮不对。
+    let titled = ctx.page.header_text_marked(ctx.lang, ctx.unowned_exempt);
+    let dress_marked = titled != ctx.page.header_text(ctx.lang);
+    let title = menu::fit_to(&titled, budget, scale);
+    draw_in(
+        canvas,
+        stride,
+        head,
+        scale,
+        if dress_marked { WARN } else { FG },
+        &title,
+        Align::Left,
+    );
     for r in menu::layout(ctx.page) {
         let row = r.as_rect();
         row_plate(canvas, stride, row, scale);
@@ -931,6 +953,7 @@ mod tests {
                     motion,
                     lang,
                     page: MenuPage::Gacha,
+                    unowned_exempt: false,
                 },
             )
         }
@@ -1367,6 +1390,7 @@ mod tests {
                             motion: Motion::Full,
                             lang: Lang::DEFAULT,
                             page,
+                            unowned_exempt: false,
                         },
                     );
                     (page, s)
@@ -1447,6 +1471,57 @@ mod tests {
         let demo = Shot::at(1.5, &MenuAnim::Menu, 1200, true, "");
         assert_ne!(real.canvas, demo.canvas, "DRYRUN 标必须看得见");
         assert!(demo.has_ink((PAD, PAD, CARD_W - 2 * PAD, 10)));
+    }
+
+    /// P2 那个豁免标的**像素**读数：开着必须看得见，而它只许出现在帽子页，且只许动标题带。
+    ///
+    /// 为什么这条不能拿"文本层测了 `header_text_marked`"顶掉：`unowned_exempt` 与 `dry_run`
+    /// 同族 = **不进 `content_sig`**（每进程恒定）⇒ 签名看不见它，"画面到底读没读到"是另一件事。
+    /// 本项目为这件事付过两次账：一次是"签名变了而画师不读"（`69fd158`），一次是反过来的
+    /// "字段写了而屏上没有"。这一条同时把第二种与"染色漏出标题带"钉住。
+    #[test]
+    fn dress_page_star_marks_only_the_dress_page() {
+        const SCALE: f32 = 1.5;
+        let shot = |page: MenuPage, exempt: bool| {
+            Shot::on_page(
+                &MenuAnim::Menu,
+                Ctx {
+                    balance: 1200,
+                    dry_run: false,
+                    error: "",
+                    scale: SCALE,
+                    motion: Motion::Full,
+                    lang: Lang::DEFAULT,
+                    page,
+                    unowned_exempt: exempt,
+                },
+            )
+        };
+        for page in MenuPage::ALL {
+            let differs = shot(page, false).canvas != shot(page, true).canvas;
+            assert_eq!(
+                differs,
+                page == MenuPage::Dress,
+                "{page:?}：豁免标只许改帽子页 ⇒ 这页真改了而别页没改，两处任一方向都不对",
+            );
+        }
+        // 差异的**位置**：星号与它的警示色都只许落在标题带里。整页相等只能证明"这里变了"，
+        // 证明不了"没染到别的行"。
+        let plain = shot(MenuPage::Dress, false);
+        let marked = shot(MenuPage::Dress, true);
+        let head = menu::header();
+        let mut outside = 0usize;
+        for y in 0..CARD_H {
+            for x in 0..CARD_W {
+                let (xx, yy) = (px(x, SCALE), px(y, SCALE));
+                if plain.phys_at(xx, yy) != marked.phys_at(xx, yy)
+                    && !(x >= head.x && x < head.x + head.w && y >= head.y && y < head.y + head.h)
+                {
+                    outside += 1;
+                }
+            }
+        }
+        assert_eq!(outside, 0, "豁免标的像素漏出标题带 ⇒ 警示色染到了行/页脚");
     }
 
     /// 目视核对抓到的缺陷：白字压在金块（SSR）与浅灰块（N）上，像素门禁只看到"这里画了
@@ -1859,6 +1934,7 @@ mod tests {
             lang: Lang::Zh,
             // 病理画布只验"裁而不炸"，与页无关 ⇒ 用默认页（分页前那些断言画的就是它）
             page: MenuPage::Gacha,
+            unowned_exempt: false,
         };
         paint(&mut tiny, 1, 1, 4, &MenuAnim::Menu, ctx);
         let mut zero: Vec<u8> = vec![];
@@ -2034,13 +2110,13 @@ mod tests {
     /// cd /home/jun/Projects/opet
     /// rm -f /tmp/opet_card_*.ppm /tmp/opet_card_*.png /tmp/sheet_*.png
     /// OPET_CARD_DUMP=1 cargo test -p overlay-wayland --lib -- card::tests::dump_each_phase --ignored --nocapture
-    /// ls /tmp/opet_card_*.ppm | wc -l        # 必须是 248 = (菜单 6 页 × 4 locale + menuerr × 4 + 卡片 96) × 2 档
+    /// ls /tmp/opet_card_*.ppm | wc -l        # 必须是 256 = (菜单 6 页 + 帽子页豁免 1 张 = 7 × 4 locale + menuerr × 4 + 卡片 96) × 2 档
     /// cd /tmp && for f in opet_card_*.ppm; do magick "$f" -scale 300% "${f%.ppm}.png"; done
     /// # 拼总览：一张 = 一个 motion × scale，行=相位、列=locale
     /// # ⚠️ 相位名单必须跟 MenuPage::ALL 一起涨：漏一页不报错，只是那两张永远不出现在总览里
     /// for sc in s100 s150; do for mo in full reduce off; do
     ///   files=()
-    ///   for p in menu menu_action menu_misc menu_dress menu_collection menu_settings menuerr \
+    ///   for p in menu menu_action menu_misc menu_dress menu_dress_exempt menu_collection menu_settings menuerr \
     ///            ssr_pull ssr_burstA ssr_burstB ssr_appear ssr_card \
     ///            ten_pull ten_burstA ten_burstB ten_appear ten_card; do
     ///     for lc in zh en ja ko; do
@@ -2081,6 +2157,9 @@ mod tests {
             /// 画哪一页。**只有菜单相位读它**（burst/reveal 画的是结果卡，`ctx.page`
             /// 不参与那些像素）⇒ 卡片相位一律填 `MenuPage::Gacha`，别在文件名里造假维度。
             page: MenuPage,
+            /// 开发态豁免态（帽子页标题带那个 `*` 并染警示色）。**只有帽子页读它**，理由同
+            /// `page`：其余五页 `unowned_exempt` 不改一个像素 ⇒ 别为一个不存在的维度多出一组图。
+            mark: bool,
         }
         let mut written = 0usize;
         let mut dump = |f: &Frame| {
@@ -2094,6 +2173,7 @@ mod tests {
                     motion: f.motion,
                     lang: f.lang,
                     page: f.page,
+                    unowned_exempt: f.mark,
                 },
             );
             let mut bytes = format!("P6\n{} {}\n255\n", s.bw, s.bh).into_bytes();
@@ -2139,7 +2219,30 @@ mod tests {
                         dry: true,
                         err: "",
                         page,
+                        mark: false,
                     });
+                    if page == MenuPage::Dress {
+                        // **豁免态单独一张**：那个 `*` 与它的警示色是新加的，而"帽子页标题看着
+                        // 像坏了"与"帽子页标题正常"只有过眼才分得出来（像素门禁只报"这里变了"）。
+                        // 挂在同一个 `page` 循环里而不是另开一段矩阵 ⇒ 四 locale × 两 scale 自动跟上。
+                        // ⚠️ `dry: false` 是**必须的**，不是随手：豁免态只在给了 `--db` 时才可能点亮
+                        // （[`App::dress_exempt`] 里那个 `!dry_run`），所以"带 `*` 又带「演示」标"
+                        // 是屏上永远不会出现的组合 ⇒ 出那样一张图就是过眼对象和被测对象不是同一张图
+                        // （本函数头③那条老账的另一种形状）。代价：这张与上面那张差两个维度，
+                        // 它回答的是"星号看不看得见"，不是"改了什么"。
+                        dump(&Frame {
+                            phase: &format!("{tag}_exempt"),
+                            lang,
+                            motion: Motion::Full,
+                            scale,
+                            anim: &MenuAnim::Menu,
+                            balance: 1200,
+                            dry: false,
+                            err: "",
+                            page,
+                            mark: true,
+                        });
+                    }
                 }
                 dump(&Frame {
                     phase: "menuerr",
@@ -2151,6 +2254,7 @@ mod tests {
                     dry: false,
                     err: "DB LOCKED BY ANOTHER OPEN",
                     page: MenuPage::Gacha,
+                    mark: false,
                 });
                 for &motion in &Motion::ALL {
                     // 十连（best=SR）与单抽（best=SSR）各一份，名字走**真实目录**（`ten_items`）：
@@ -2173,6 +2277,7 @@ mod tests {
                                 err: "",
                                 // 结果卡不读页 ⇒ 固定默认页，别在文件名里造一个假维度。
                                 page: MenuPage::Gacha,
+                                mark: false,
                             });
                         }
                     }

@@ -95,11 +95,136 @@ const fn default_true() -> bool {
     true
 }
 
+// ---- [`ContentPack::from_toml`] 的四只取字段小工具 ----
+//
+// 每一只都**区分"没有这个键"与"有这个键但类型不对"**：后者是错误，不是缺省。
+// 把类型写错当成没写，等于让打包的人"少写一个 price_cents"就得到一个免费包。
+
+fn toml_str(t: &toml_edit::Table, key: &str) -> Result<Option<String>, String> {
+    let Some(item) = t.get(key) else {
+        return Ok(None);
+    };
+    match item.as_str() {
+        Some(s) => Ok(Some(s.to_owned())),
+        None => Err(format!("`{key}` 不是字符串")),
+    }
+}
+
+fn toml_int(t: &toml_edit::Table, key: &str) -> Result<Option<i64>, String> {
+    let Some(item) = t.get(key) else {
+        return Ok(None);
+    };
+    match item.as_integer() {
+        Some(v) => Ok(Some(v)),
+        None => Err(format!("`{key}` 不是整数")),
+    }
+}
+
+fn toml_bool(t: &toml_edit::Table, key: &str) -> Result<Option<bool>, String> {
+    let Some(item) = t.get(key) else {
+        return Ok(None);
+    };
+    match item.as_bool() {
+        Some(v) => Ok(Some(v)),
+        None => Err(format!("`{key}` 不是布尔")),
+    }
+}
+
+fn toml_str_array(t: &toml_edit::Table, key: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(item) = t.get(key) else {
+        return Ok(None);
+    };
+    let Some(arr) = item.as_array() else {
+        return Err(format!("`{key}` 不是数组"));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let Some(s) = v.as_str() else {
+            return Err(format!("`{key}[{i}]` 不是字符串"));
+        };
+        out.push(s.to_owned());
+    }
+    Ok(Some(out))
+}
+
 impl ContentPack {
     pub const FORMAT_V1: u32 = 1;
 
     pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(text)
+    }
+
+    /// 包内那份 `manifest.toml`（§3.11.1 规定的成员名，`opet pack install` 的第 1 步）→ [`ContentPack`]。
+    ///
+    /// **为什么手写解析而不是开 `toml_edit` 的 serde 反序列化**：本仓库锁定的 `toml_edit`
+    /// **没有开 `serde` feature**（`Cargo.lock` 里它的依赖只有 `indexmap`/`toml_datetime`/
+    /// `toml_parser`/`toml_writer`/`winnow`），开它会把 `serde_core` + `serde_spanned` 拉进依赖图
+    /// ⇒ D8 的 allowlist 要为每个新 crate 逐条核许可证原文，那是"第 N 次真加依赖"量级的事，
+    /// 不该由一个安装器顺手做掉。而本 crate 的 `config.rs` **早就立过同一条口径**：
+    /// 写用 `toml_edit`（保 decor），**读自己写**。这里只借它的解析树（`parse` 是默认 feature）。
+    ///
+    /// ⚠️ 手写解析最容易犯的错有两个，这里各自钉了一条测试：
+    /// ① "某个字段忘了读" ⇒ 静默默认值。所以 12 个字段逐个有用例。
+    /// ② **"未知的键直接忽略"** ⇒ 红线 1 从"结构上不可能"退化成"没人写就不发生"，
+    ///    也就是本项目"假门禁"那一族。所以未知的键**一律拒绝并点名**，
+    ///    且与 JSON 侧同一组敌意键（`weight`/`rarity`/`drop_rate`/`pool`）各测一条。
+    pub fn from_toml(text: &str) -> Result<Self, String> {
+        let doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("`manifest.toml` 不是合法 TOML: {e}"))?;
+        let root = doc.as_table();
+        let bad = |why: String| format!("`manifest.toml`: {why}");
+
+        /// 本版本认识的字段全集 ⇒ 与结构体一一对应。**加字段必须同时加这里**，
+        /// 否则新字段会被当成"未知键"拒掉 —— 红得响亮，比静默忽略好。
+        const KNOWN: [&str; 12] = [
+            "format",
+            "id",
+            "title",
+            "kind",
+            "price_cents",
+            "currency_code",
+            "store",
+            "pack_path",
+            "signature",
+            "release_notes",
+            "is_dlc",
+            "items",
+        ];
+        let extra: Vec<&str> = root
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| !KNOWN.contains(k))
+            .collect();
+        if !extra.is_empty() {
+            return Err(bad(format!(
+                "未知字段 {extra:?} ⇒ 整包拒绝。包清单只许带明码标价的确定性内容，\
+                 概率/稀有度/权重这类键不在认识范围内，本版本也不打算认"
+            )));
+        }
+
+        let format = toml_int(root, "format")?.ok_or_else(|| bad("缺必填字段 `format`".into()))?;
+        let format = u32::try_from(format).map_err(|_| {
+            bad(format!(
+                "`format` = {format} 不是合法的格式版本（要 0 以上的整数）"
+            ))
+        })?;
+        Ok(Self {
+            format,
+            id: toml_str(root, "id")?.ok_or_else(|| bad("缺必填字段 `id`".into()))?,
+            title: toml_str(root, "title")?.ok_or_else(|| bad("缺必填字段 `title`".into()))?,
+            kind: toml_str(root, "kind")?.ok_or_else(|| bad("缺必填字段 `kind`".into()))?,
+            price_cents: toml_int(root, "price_cents")?,
+            currency_code: toml_str(root, "currency_code")?,
+            store: toml_str(root, "store")?.ok_or_else(|| bad("缺必填字段 `store`".into()))?,
+            pack_path: toml_str(root, "pack_path")?
+                .ok_or_else(|| bad("缺必填字段 `pack_path`".into()))?,
+            signature: toml_str(root, "signature")?,
+            release_notes: toml_str(root, "release_notes")?,
+            is_dlc: toml_bool(root, "is_dlc")?.unwrap_or(true),
+            items: toml_str_array(root, "items")?
+                .ok_or_else(|| bad("缺必填字段 `items`".into()))?,
+        })
     }
 
     /// 结构自检：`kind`/`store` 必须落在 DDL 的 CHECK 里，格式版本必须是 1。
@@ -374,6 +499,36 @@ mod tests {
         )
     }
 
+    /// 一份**十二个键写全**的 `manifest.toml`（§3.11.1 规定的包内成员名）。
+    /// 逐行一个键，是为了让下面"删掉某个键"和"把某个键写成别的类型"两组测试能改写它。
+    const FULL_TOML: &str = r#"format = 1
+id = "cat_series_01"
+title = "猫咪系列"
+kind = "pets"
+price_cents = 990
+currency_code = "USD"
+store = "itch"
+pack_path = "packs/cat_series_01.petpack"
+signature = "minisign:r2x9"
+release_notes = "第一版"
+is_dlc = true
+items = ["cat_shiro", "cap_blue"]
+"#;
+
+    /// 删掉这些键所在的行（= "打包的人忘了写"）。
+    fn without(text: &str, keys: &[&str]) -> String {
+        text.lines()
+            .filter(|l| !keys.iter().any(|k| l.starts_with(&format!("{k} ="))))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 把某键那一行换成 `line`（不存在就追加 ⇒ 同一只助手也用来注入未知键）。
+    fn set(text: &str, line: &str) -> String {
+        let key = line.split(" = ").next().expect("测试自己写的行要有 ` = `");
+        format!("{}\n{line}\n", without(text, &[key]))
+    }
+
     #[test]
     fn a_pack_with_weights_does_not_parse() {
         // 红线 1 的结构层：付费包携带概率权重 ⇒ 解析期失败，不是"解析后忽略"。
@@ -390,6 +545,121 @@ mod tests {
             ContentPack::from_json(&pack_json("")).is_ok(),
             "正常包不该被拒"
         );
+    }
+
+    #[test]
+    fn from_toml_reads_every_one_of_the_twelve_fields() {
+        // 手写解析的第一号失效模式 = "忘了一个字段" ⇒ 它静默变成默认值，测试全绿而包里丢了东西。
+        // 所以这份断言写的是**整个结构体字面量**：漏读任何一个字段，这一条就红。
+        let p = ContentPack::from_toml(FULL_TOML).unwrap();
+        assert_eq!(
+            p,
+            ContentPack {
+                format: 1,
+                id: "cat_series_01".into(),
+                title: "猫咪系列".into(),
+                kind: "pets".into(),
+                price_cents: Some(990),
+                currency_code: Some("USD".into()),
+                store: "itch".into(),
+                pack_path: "packs/cat_series_01.petpack".into(),
+                signature: Some("minisign:r2x9".into()),
+                release_notes: Some("第一版".into()),
+                is_dlc: true,
+                items: vec!["cat_shiro".into(), "cap_blue".into()],
+            }
+        );
+        assert_eq!(p.validate(), Ok(()), "这份清单应当是合法包");
+    }
+
+    #[test]
+    fn from_toml_names_whichever_required_field_is_missing() {
+        for key in [
+            "format",
+            "id",
+            "title",
+            "kind",
+            "store",
+            "pack_path",
+            "items",
+        ] {
+            let text = without(FULL_TOML, &[key]);
+            assert!(
+                !text.contains(&format!("{key} =")),
+                "测试自己的删行没删掉 {key}"
+            );
+            let err = ContentPack::from_toml(&text).unwrap_err();
+            assert!(
+                err.contains(&format!("缺必填字段 `{key}`")),
+                "缺 {key} 时报的错没点名它：{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_toml_treats_absent_optionals_as_none_and_is_dlc_as_default_true() {
+        let slim = without(FULL_TOML, &["signature", "release_notes", "is_dlc"]);
+        let p = ContentPack::from_toml(&slim).unwrap();
+        assert_eq!(p.signature, None);
+        assert_eq!(p.release_notes, None);
+        assert!(
+            p.is_dlc,
+            "不写 is_dlc = 独立商品（与 JSON 侧 default_true 同源）"
+        );
+        // price_cents / currency_code 缺省 = 免费包的形状，但 store 必须跟着改成 free 才合法。
+        let free = without(FULL_TOML, &["price_cents", "currency_code"])
+            .replace("store = \"itch\"", "store = \"free\"");
+        let p = ContentPack::from_toml(&free).unwrap();
+        assert_eq!(p.price_cents, None);
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn from_toml_rejects_a_wrongly_typed_field_instead_of_ignoring_it() {
+        // "写成字符串就当没写"正是"少写一个 price_cents ⇒ 白拿"那条灰区，逐键验。
+        for (line, msg) in [
+            ("price_cents = \"990\"", "不是整数"),
+            ("is_dlc = \"yes\"", "不是布尔"),
+            ("items = \"cat_shiro\"", "不是数组"),
+            ("items = [1, 2]", "[0]` 不是字符串"),
+            ("title = 3", "不是字符串"),
+            ("format = \"one\"", "不是整数"),
+            ("format = 4294967296", "不是合法的格式版本"),
+        ] {
+            let text = set(FULL_TOML, line);
+            let err = ContentPack::from_toml(&text).unwrap_err();
+            assert!(err.contains(msg), "`{line}` 本该报「{msg}」，实报：{err}");
+        }
+    }
+
+    #[test]
+    fn from_toml_rejects_probability_bearing_keys_by_name() {
+        // JSON 侧 `a_pack_with_weights_does_not_parse` 的 TOML 同胞。未知键**忽略**就是假门禁：
+        // 红线从"结构上不可能"退化成"没人写就不发生"。
+        for (key, line) in [
+            ("weight", "weight = 0.02"),
+            ("rarity", "rarity = \"SSR\""),
+            ("drop_rate", "drop_rate = 0.5"),
+            ("pool", "pool = \"ssr_only\""),
+            ("formatx", "formatx = 1"), // 拼错的已知键也一样拒 —— 不猜意图
+        ] {
+            let text = format!("{FULL_TOML}{line}\n");
+            let err = ContentPack::from_toml(&text).unwrap_err();
+            assert!(
+                err.contains("未知字段") && err.contains(key),
+                "带 `{key}` 的包本该被点名拒绝，实报：{err}"
+            );
+        }
+        assert!(ContentPack::from_toml(FULL_TOML).is_ok(), "正常包不该被拒");
+    }
+
+    #[test]
+    fn from_toml_passes_the_same_validate_as_json() {
+        // 两个读入口必须共用第二道自检，否则换 manifest 格式就等于换掉了红线。
+        let p =
+            ContentPack::from_toml(&FULL_TOML.replace("store = \"itch\"", "store = \"casino\""))
+                .unwrap();
+        assert!(p.validate().unwrap_err().contains("store"));
     }
 
     #[test]

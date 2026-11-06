@@ -21,7 +21,9 @@ use petcore::assets::{AccessoryManifest, Manifest};
 use petcore::behavior::AssetKey;
 use petcore::behavior::config::{Action, BehaviorConfig};
 use petcore::behavior::machine::Command;
-use petcore::gacha::{Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, Rarity, RatesFile};
+use petcore::gacha::{
+    Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, Owned, Rarity, RatesFile,
+};
 use petcore::geom::{Rect, Vec2};
 use petcore::intent::{PresentationIntent, SURFACE_MARGIN};
 use petcore::sim::{Sim, TICK_HZ};
@@ -118,6 +120,13 @@ pub struct Options {
     pub lang: Option<String>,
     /// `--motion full|reduce|off`，同上存原始字符串
     pub motion: Option<String>,
+    /// `--allow-unowned-accessories`：**开发态豁免** —— 磁盘上有而库存里没有的那几件，
+    /// 照样进换装页、照样能穿。默认关（用户 2026-11-05 第 3 问 = 玩家不能穿未拥有）。
+    ///
+    /// ⚠️ 它**只在给了 `--db` 时有意义**：不给 `--db` = 内存库 ⇒ `owned()` 恒空 = 演示态，
+    /// 那一档由 [`Options::db`] 那条既有的 DRYRUN 决定负责放行与打标（屏上右端那个「演示」），
+    /// 不是这条开关的作用域。启动时把这句话打进 stderr，**别让它变成静默空转的假开关**。
+    pub allow_unowned_accessories: bool,
 }
 
 impl Default for Options {
@@ -134,6 +143,7 @@ impl Default for Options {
             no_cursor: false,
             lang: None,
             motion: None,
+            allow_unowned_accessories: false,
         }
     }
 }
@@ -315,12 +325,195 @@ fn attribute_of(source: Source, outcome: Tick) -> Option<Tick> {
 /// 点下那一行，等于让屏上一个能点而没有反馈的控件（本项目对假按钮的一贯立场）。
 #[derive(Debug)]
 struct Candidate {
+    /// **库存那一侧的身份** = 库目录名。P2 的 `owned()` 过滤、P1 的 INV 门禁、`inventory.item_id`
+    /// 认的都是这一个（`AssetDir` 的 `id` 也是目录名，`source.rs`）⇒ 三条路必须同一个键。
+    id: String,
+    /// 清单里写的 slug（`accessory.json` 的 `slug`，也是 `fits` 比的那个名字）。
+    ///
+    /// ⚠️ 它与 [`Self::id`] **可以不相等**（生产者 `pack.py --accessory` 让两者相等，手工塞进库的
+    /// 未必），而不相等就是"屏上这件叫 A、库存记的是 B"。 [`discover_accessories`] 为此专门打一行。
     slug: String,
     /// 三件套所在目录（`sheet.webp` 与 `accessory.json` 同目录 = 生产者 `pack.py --accessory` 的约定）。
     dir: std::path::PathBuf,
     manifest: AccessoryManifest,
     /// 本体轮廓 ∪ 这件配件的轮廓 ⇒ 穿上 = 把 [`App::regions`] 换成它（一次性的事实，不重算）。
     merged: Regions,
+}
+
+/// 豁免那一句的**纯**版本 = [`App::dress_exempt`] 的函数体。
+///
+/// 单拎出来只为一件事：`--allow-unowned-accessories` 而**没有** `--db` 那一格（演示态）是本轮
+/// 用户拍板专门区分过的（"照 DRYRUN 放行 + 打「演示」标"⇒ 放行但**不**点帽子页那个 `*`），
+/// 而 `App` 要连 compositor 才构造得起来 ⇒ 留在方法里这条判定就没有任何自动化读数，
+/// 只能靠"起一次进程看有没有星号"。拆成自由函数 ⇒ 四格真值表逐格钉住。
+fn dress_exempt_for(allow_unowned: bool, dry_run: bool) -> bool {
+    allow_unowned && !dry_run
+}
+
+/// [`App::dress_view`] 的结果 = 库存那道跑完之后，换装页手里那张表。
+///
+/// 为什么不是一个 `Vec<Candidate>` 而是**下标**：[`App::picked`] 存的就是 `candidates` 的下标，
+/// 而"选中哪一件"与"这一件许不许穿"是两件事 —— 复制一份过滤后的表就会出现第二个"当前选中的
+/// 是哪件"（本项目反复出现的那一族）。留下标 ⇒ `picked` 仍是唯一下标，`visible` 只是它能不能落
+/// 在这几格上。
+struct DressView {
+    /// 通过库存那道判定的 [`App::candidates`] 下标，**升序**（`picked` 的循环序 = 目录序）。
+    visible: Vec<usize>,
+    /// 因为"库存里没有这一件"而出局的数量 ⇒ 只进 stderr 那一句，不上屏（用户内容不进子集字体）。
+    withheld: usize,
+}
+
+impl DressView {
+    /// 库存那道的**纯**判定 = "这些件叫什么" + "库存说拥有哪些" ⇒ 可见下标与出局数。
+    ///
+    /// 拆这一层的唯一理由 = 让这条判据能被自动化打到红。外层 [`App::dress_view`] 要连库、要扫盘，
+    /// 整条只有真机跑得起来 ⇒ "未拥有的件不出现"就只能靠人眼看屏幕，而本项目对门禁的一贯要求是
+    /// "能证明它会红"（`assert_no_paid_randomness`、`--inv` 那两轮红读数同族）。纯函数拿走三档
+    /// 输入 ⇒ 三档各有一条独立读数，真机那一轮只剩"接线对不对"，不再承担"逻辑对不对"。
+    ///
+    /// - `allow_all` = 这一轮**根本没有**库存那道（开发态豁免 ∪ 演示态；两者屏上记号不同，
+    ///   但可见集是同一个，所以在这里合成一个布尔）。
+    /// - `owned = None` = 那道**没读过**（连不上库 / 读失败）⇒ 失败关闭，一件都不给。
+    ///   这一档必须与 `Some(空集)` 分开：后者是"读到了，答案是都没有"，前者的"都没有"没有任何
+    ///   事实支撑过 —— 拿它当后者就是"没验过也当验过"（§9.2 第 20 条要杀的静默形状）。
+    ///
+    /// `ids` 传的是**目录名**（[`Candidate::id`]）而不是清单里的 `slug`：库存那一侧的键从头到尾
+    /// 是目录名，而 `slug` 是打包者填的字符串，两者可以不相等（启动时那行 ⚠️ 报的就是这个）。
+    fn select(allow_all: bool, owned: Option<&Owned>, ids: &[String]) -> Self {
+        let visible: Vec<usize> = match (allow_all, owned) {
+            // 这一轮没有库存那道 ⇒ 全可见（`ids` 只贡献长度，不参与判定）
+            (true, _) => (0..ids.len()).collect(),
+            // 那道没读过 ⇒ 全不可见
+            (false, None) => Vec::new(),
+            // 读过了 ⇒ 逐件问"库存里有没有这个名字"
+            (false, Some(owned)) => ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| owned.contains(*id))
+                .map(|(i, _)| i)
+                .collect(),
+        };
+        let withheld = ids.len() - visible.len();
+        Self { visible, withheld }
+    }
+}
+
+/// 穿着这件事**落不落库**的唯一判据（P3）。两个动作共用一条理由：屏上穿的与库里记着的
+/// 必须是同一件事，否则重启回到另一顶帽子，而"重启后还穿着"（J3）就成了一句注释。
+///
+/// `enum` 而不是 `bool`：这一处有三个**互斥**的结论，而两个布尔量能表示 4 种、其中 2 种
+/// 是没人能解释的（本项目"能表示就迟早会被表示错"那一族）。
+enum WornWrite {
+    /// 真写进库了（`--db` 且连得上）。
+    Written,
+    /// **演示态一个字都不写**，也不报错 —— 但调用方必须打一行，否则用户会以为记下了。
+    DemoSkipped,
+    /// 给了 `--db` 而这一轮连不上库 ⇒ 没地方可写。错误只是一行字（硬约束 3）。
+    NoStore,
+}
+
+/// 穿上 = 把"这一格现在穿这件"写进 `equipped`。**自由函数而不是 `App` 的方法**：
+/// `App` 要连 compositor 才构造得起来，而"演示态不落库"这一句（FLOW §9 P3 明写要在测试里）
+/// 只需要一个 `Option<Gacha>` ⇒ 拆出来它才打得红。
+///
+/// `dry_run` 排在最前且**不调** `ensure_gacha`：演示态连"顺手把内存库那一行写上"都不该做，
+/// 因为那行永远不可能在重启后还在，而屏上没有这件事。
+fn write_equip(
+    gacha: &mut Option<Gacha>,
+    dry_run: bool,
+    slot: &str,
+    item_id: &str,
+) -> Result<WornWrite, String> {
+    if dry_run {
+        return Ok(WornWrite::DemoSkipped);
+    }
+    let Some(g) = gacha.as_mut() else {
+        return Ok(WornWrite::NoStore);
+    };
+    g.store
+        .equip(petstore::DEFAULT_PROFILE, slot, item_id)
+        .map_err(|e| format!("equipped 写入失败: {e}"))?;
+    Ok(WornWrite::Written)
+}
+
+/// 脱下 = 删掉那一格。与 [`write_equip`] 同一条演示态判据，同拆法。
+fn clear_equip(gacha: &mut Option<Gacha>, dry_run: bool, slot: &str) -> Result<WornWrite, String> {
+    if dry_run {
+        return Ok(WornWrite::DemoSkipped);
+    }
+    let Some(g) = gacha.as_mut() else {
+        return Ok(WornWrite::NoStore);
+    };
+    g.store
+        .unequip(petstore::DEFAULT_PROFILE, slot)
+        .map_err(|e| format!("equipped 删除失败: {e}"))?;
+    Ok(WornWrite::Written)
+}
+
+/// [`plan_restore`] 的结论 = 要穿的那一格（`None` = 一件都不穿）+ 每一行的处置。
+struct RestorePlan {
+    wear: Option<usize>,
+    /// 给人看的行，**只进 stderr 不上屏**（用户内容不进子集字体，同 `DressView::withheld`）。
+    /// 每一条都点名"哪一格、哪一件、为什么"。
+    notes: Vec<String>,
+}
+
+/// 启动恢复那一道的**纯**判定（P3 = FLOW §5 那张表的读侧）。
+///
+/// 拆出来同 [`DressView::select`] 一个理由：外层要连库、要解码、要 compositor，只有这里这三样
+/// 都不需要 ⇒ "手工往 `equipped` 塞一行未拥有的 id 必须出局并报一句"（J2 的后半）才有读数。
+///
+/// 四道各管一件事，顺序 = 便宜在前：
+/// 1. **磁盘上找不到这一件** —— 已删除，或五道门禁没过（[`discover_accessories`] 把它跳掉了）。
+///    ⚠️ 这一条把"恢复时重跑五道"整个接住了：恢复能穿的**只能是 discovery 活着交出来的那件**，
+///    所以清单坏了 / 轮廓缺格 / 不 `fits` 本体的那几道，在恢复这一刻都由同一条打到。单独再跑
+///    一遍五道只会多出第二套答案。第五道（解码）不在这里 —— 它是像素，只能穿的那一刻验。
+/// 2. **库存没有这一件** ⇒ 出局并报（这一条拦的正是手工行；可见集 `visible` 来自
+///    [`DressView::select`] ⇒ 换装页"许不许穿"与恢复"穿不穿"从头就是同一道判据，不会有
+///    "换装页看不见而启动却穿上了"那种分裂）。
+/// 3. **这一行记的槽位与清单声明不符** ⇒ 手工行的第二种形状，不穿。槽位的真值在清单
+///    （`Slot` 五值），而 `equipped.slot` 没有 CHECK（FLOW §5 第 2 条），所以只能这样对。
+/// 4. **多于一件**：内存档 M1 只容一件 ⇒ 取第一件，其余只报告、不穿，而**库里那几行原样留着**
+///    （删掉等于把用户没让我删的东西丢了；哪天容得下多件，它们自己会恢复）。
+///    "第一件"可重放的前提 = 行序由 `Store::equipped` 的 `ORDER BY slot, item_id` 给。
+fn plan_restore(
+    rows: &[(String, String)],
+    ids: &[String],
+    slots: &[String],
+    visible: &[usize],
+) -> RestorePlan {
+    let mut wear: Option<usize> = None;
+    let mut notes: Vec<String> = Vec::new();
+    for (slot, item_id) in rows {
+        let at = |i: usize| format!("slot={slot} item={item_id} ⇒ {}", ids[i]);
+        let Some(i) = ids.iter().position(|id| id == item_id) else {
+            notes.push(format!(
+                "{slot}={item_id} 现在装不上：磁盘上找不到这一件（已删除，或五道门禁没过）"
+            ));
+            continue;
+        };
+        if slots[i] != *slot {
+            notes.push(format!(
+                "{} 而清单声明的是 {slots_i} ⇒ 这一行是手工塞的，不穿",
+                at(i),
+                slots_i = slots[i]
+            ));
+            continue;
+        }
+        if !visible.contains(&i) {
+            notes.push(format!("{} 出局：库存里没有这一件 ⇒ 未验过拥有不穿", at(i)));
+            continue;
+        }
+        if wear.is_some() {
+            notes.push(format!(
+                "{} 不恢复：内存档 M1 一次只容一件（库里这一行留着，以后容得下多件会自动穿）",
+                at(i)
+            ));
+            continue;
+        }
+        wear = Some(i);
+    }
+    RestorePlan { wear, notes }
 }
 
 /// 装备中的一件配件（D16 路线 B = **运行时逐格叠加**）。内存档 **M1 = 一次一件**，
@@ -452,6 +645,15 @@ pub struct App {
     /// 与面板共用的错误行上，**不 panic、不置 `exit`**（硬约束 3 同族 —— UI 的故障不许波及宠物，
     /// 更不许波及桌面）。字段不叫 `gacha_error` 了：拍板④ 之后它管的不止抽取，名字跟着事实走。
     ui_error: Option<String>,
+    /// **恢复上次穿着只跑一次**的那道闩（P3）。
+    ///
+    /// 立成字段而不是"在 `run()` 里直接读库"，有两个理由：① FLOW §5 要的时刻是
+    /// **`configured` 之后**（surface 已映射，恢复出来的像素才有人接），而 `run()` 里那句
+    /// `discover_accessories()` 还在 configure 之前；② 这条绝不能落进 tick 环里——第二次
+    /// "恢复"等于把用户刚脱掉的帽子又扣回去，而那正是 §4 禁轮询要防的形状。
+    /// ⚠️ 它同时是"演示态一个字都不读库"的那道门：闩在 [`Self::restore_worn`] 里先放下，
+    /// 条件都写在函数里，别在这里预算。
+    restore_pending: bool,
 }
 
 /// 库与目录成对出现（`connect` 一起建、一起失败），所以没有"有库没目录"的中间态。
@@ -906,6 +1108,14 @@ pub fn run(opts: Options) -> Result<(), String> {
 
     // `--db` 没给 ⇒ 演示模式（不建文件、UI 打 DRYRUN 标）。在 `opts` 被搬进 App 之前取出来。
     let dry_run = opts.db.is_none();
+    // 豁免开关没配 `--db` = 一条永远不会点亮的作用域（演示态本来就放行，未拥有的概念在内存库里
+    // 不存在）。**不报错、也不静默**：静默就是 `--cell` 那个假开关的形状，而它当时只打印了一句
+    // 就继续写产物 —— 区别在于这里没有产物可写，唯一能做的就是把这句话说清。
+    if opts.allow_unowned_accessories && dry_run {
+        eprintln!(
+            "ui: --allow-unowned-accessories 没起作用也不需要 ⇒ 无 --db = 演示态，库存恒空、一律放行（屏上右端那个「演示」标就是这件事的记号）"
+        );
+    }
     let mut app = App {
         conn,
         registry_state: RegistryState::new(&globals),
@@ -960,6 +1170,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         ui: settings,
         gacha: None,
         ui_error: None,
+        restore_pending: true,
         last_press: None,
         pointer_world: Vec2::ZERO,
     };
@@ -1042,24 +1253,15 @@ fn load_asset(
 /// 配件库在哪 —— **只由环境决定，命令行没有第二个入口**（用户 2026-11-02 的原话"配件不是应该由
 /// 菜单选择吗，这也不合理" ⇒ `--accessory` 整个删掉，穿哪件是屏上的活）。
 ///
-/// 优先级照 `petstore::paths` 里 `opet.db` 那一条走：显式覆盖 > `$XDG_DATA_HOME/opet/accessories`
-/// （**只在它是绝对路径时**才算数 —— 相对值会让"库在哪"取决于当前目录，而宠物由 autostart 拉起、
-/// 它的 cwd 不是任何人意义上的事实）> `$HOME/.local/share/opet/accessories`。
+/// 规则本身**不在这里**：它在 [`petstore::paths::AssetRoot`]，与本体侧 `OPET_PETS` 那一根、
+/// 与安装器写入的那一根同源。以前这里是本仓库第二份"三级解析"的实现，而 §9.2 第 20 条
+/// 那个"两块面互不相认"正是这么长出来的 ⇒ 现在只剩一份，这里只负责把它变成 `Option`。
 ///
 /// 返回 `Option` 而不是直接 `PathBuf`：`$HOME` 都读不到（裸 `env -i` 的 CI）时**没有库**，
 /// 不去猜一个根目录下的 `/.local/share`。那一档下换装页三行照样画出来、照样点得到，
 /// 只是"穿上"打一行"库里没有可用配件"——**没有东西可穿不等于没有这个功能**。
 fn accessory_root() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("OPET_ACCESSORIES") {
-        if !p.is_empty() {
-            return Some(std::path::PathBuf::from(p));
-        }
-    }
-    let base = match std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from) {
-        Some(p) if p.is_absolute() => p,
-        _ => std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))?,
-    };
-    Some(base.join("opet").join("accessories"))
+    petstore::paths::AssetRoot::resolve(petcore::gacha::ItemKind::Accessory).map(|r| r.path)
 }
 
 /// [`discover_accessories`] 的内层：一个目录 → 一件候选，或一句点名它错在哪的说明。
@@ -1103,6 +1305,13 @@ fn check_accessory(
         .merged_with(&acc_regions)
         .map_err(|e| format!("拒绝配件 {}: {e}", acc.slug))?;
     Ok(Candidate {
+        // 身份 = **目录名**，不是 slug：库存的 `item_id`、P1 的 INV 门禁、`AssetDir::locate` 认的
+        // 都是这一级（安装器落盘时也是按 `<id>/` 建目录）。slug 是给人看的名字。
+        id: dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("{} 的目录名不是合法 UTF-8 ⇒ 无法与库存对齐", dir.display()))?
+            .to_string(),
         slug: acc.slug.clone(),
         dir: dir.to_path_buf(),
         manifest: acc,
@@ -1154,6 +1363,15 @@ fn discover_accessories(
         // —— 逐件把四道门禁走完；任一道的错都只让**这一件**出局，并点名它是哪一件。
         match check_accessory(&dir, body, body_regions) {
             Ok(cand) => {
+                // 两个名字不一致 ⇒ 库存那本账（认目录名）与屏上那件（叫 slug）会对不上，而
+                // "为什么这件我抽到了却不出现"是问不出来的。生产者不会产出这种包，手工塞的会，
+                // 所以这一行的受众就是"今天这台机器"那个形状（§9.2 第 20 条）。
+                if cand.id != cand.slug {
+                    eprintln!(
+                        "accessories:   ⚠ 目录名 {} 与清单 slug {} 不一致 ⇒ 库存按 {} 记账、屏上叫 {}",
+                        cand.id, cand.slug, cand.id, cand.slug
+                    );
+                }
                 // **覆盖哪些状态**必须打出来，而且缺的时候要把缺的点名。这条行是本轮唯一的
                 // "为什么有些动作看不到帽子"的出口：清单只声明 `idle` 是一件**合法**的配件
                 // （`covers()` 为假 ⇒ `blit_cell` 按设计不叠），而它上屏后的形状与"叠加坏了"
@@ -1556,6 +1774,13 @@ struct MenuState {
     /// 语言现在能在运行中被点着换，不进签名就出现"点了但卡片没换字"）。抄副本而不是
     /// 每处借 `self.lang`：`draw()` 里 `self.pool`/`self.anim` 已经可变借用着 self。
     lang: Lang,
+    /// 从 `App` 抄来的**开发态豁免**标（`--allow-unowned-accessories` 且真有 `--db`）。与
+    /// `dry_run` 同族：每进程恒定 ⇒ 不进 `content_sig`，但帽子页标题必须读得到它，否则屏上就
+    /// 少一个"这一轮穿的是没抽到的东西"的记号 = 假门禁（`--cell` 假开关那一族）。
+    ///
+    /// ⚠️ 演示态（无 `--db`）**不点这个**：那一档右端已有「演示」标，同一件事给两个记号就是
+    /// 两个事实源。点亮与否由 [`App::dress_exempt`] 一处给结论，别在这里重算条件。
+    dress_mark: bool,
     /// 上一次 commit 的内容签名 ⇒ 静止时"什么都不发"
     last_sig: Option<u64>,
     frame_pending: bool,
@@ -1659,6 +1884,9 @@ impl MenuState {
         let motion = self.motion;
         let lang = self.lang;
         let page = self.page;
+        // 与 `dry_run` 同族：每进程恒定 ⇒ 不进签名，但必须在绘制前取出来（`self.pool` 那步是
+        // 可变借用，同一个表达式里不能再不可变借 `self`）。
+        let unowned_exempt = self.dress_mark;
         let bw = self.to_phys(self.logical.0 as f32).max(1);
         let bh = self.to_phys(self.logical.1 as f32).max(1);
         let stride = bw * 4;
@@ -1690,6 +1918,7 @@ impl MenuState {
                 motion,
                 lang,
                 page,
+                unowned_exempt,
             },
         );
         // 句柄克隆（不是对象克隆）：下面的 `self.arm()` 要可变借 self，不能同时留引用
@@ -1985,6 +2214,11 @@ impl App {
         } else {
             0
         };
+        // 豁免标记在**开菜单**这一刻就点亮，不等用户点某一行：它是两个启动参数的函数，
+        // 不读库存 ⇒ 不需要 `dress_view` 那次查询。要读库的是那道过滤，不是这个记号。
+        // 晚一步点亮就会出现"翻页翻到帽子页看不到 `*`，点一下换一件才冒出来"——
+        // 而那正是"屏上读不出这轮是豁免态"的假门禁形状。
+        let dress_mark = self.dress_exempt();
         let dry_run = self.dry_run;
         let motion = self.ui.motion;
         let lang = self.ui.lang;
@@ -2043,6 +2277,7 @@ impl App {
             dry_run,
             motion,
             lang,
+            dress_mark,
             last_sig: None,
             frame_pending: false,
             pending_since: None,
@@ -2495,6 +2730,58 @@ impl App {
         }
     }
 
+    /// 这一轮**开发态豁免**是否成立 = `--allow-unowned-accessories` 且真的有 `--db`。
+    ///
+    /// 单独一处，是因为它同时是两件事的判据：**未拥有的件进不进可见集**（[`Self::dress_view`]）
+    /// 与**帽子页标题打不打那个 `*`**。两处各写一遍条件，就会出现"标打了而没放行"或反过来
+    /// —— 而那正是"提示不是判据"登记过的那一族。
+    fn dress_exempt(&self) -> bool {
+        dress_exempt_for(self.opts.allow_unowned_accessories, self.dry_run)
+    }
+
+    /// 换装页"这一件许不许穿"的**库存那道**（P2 = FLOW §8 第一条的落地）。
+    ///
+    /// **顺序 = 先磁盘后库存**，这不是审美：[`Self::candidates`] 已经过完五道磁盘门禁，这一道
+    /// 只问"库存里有没有这一件"。反过来做（从库存出发再查磁盘）得到同一批件，但"这件不匹配本体"
+    /// 与"你没有这件"会混成一句 —— 那是两句不同的话，都要能打到（FLOW §8 明写的理由）。
+    ///
+    /// 只在点击回调与开菜单那一刻调（§4 禁止定时轮询；D14 那条"余额是事件驱动的"同形状）。
+    ///
+    /// ⚠️ **失败关闭**：给了 `--db` 而库连不上/读不动 ⇒ 可见集为**空**、不放行。宁可这一轮穿不上
+    /// 而 stderr 有一行解释，也不要"没验过拥有就穿上"—— 后者正是 §9.2 第 20 条要杀掉的那类静默。
+    ///
+    /// 这一层只剩"把三档输入问出来"（豁免？演示？库读不读得到？），判定本身在
+    /// [`DressView::select`] —— 拆开的理由写在那条上。
+    fn dress_view(&mut self) -> DressView {
+        // 名字要先取：下面 `ensure_gacha()` 可变借用 self，不能同时留 `candidates` 的引用。
+        let ids: Vec<String> = self.candidates.iter().map(|c| c.id.clone()).collect();
+        if self.dress_exempt() || self.dry_run {
+            // 两档放行合成一次调用，但**屏上记号不同**：豁免态点亮帽子页那个 `*`（判据 =
+            // [`App::dress_exempt`]），演示态不点 —— 右端已有「演示」标，同一件事给两个记号
+            // 就是两个事实源（用户 2026-11-06 拍板"照 DRYRUN 放行 + 打「演示」标"）。
+            return DressView::select(true, None, &ids);
+        }
+        if !self.ensure_gacha() {
+            // 连不上库那件事 `ensure_gacha` → `gacha_bailed` 已经出过一次声，这里只负责不出声地
+            // 关死，不再重复播报（同 `dress_panel` 那条"错误只说一次"的分界）。
+            return DressView::select(false, None, &ids);
+        }
+        let owned = match self.gacha.as_ref().map(|g| g.store.owned()) {
+            Some(Ok(o)) => Some(o),
+            Some(Err(e)) => {
+                eprintln!(
+                    "ui: 换装 ⇒ 读库存失败（{e}）⇒ 未验过的配件一律不放行（库里有什么这轮读不出）"
+                );
+                None
+            }
+            // 走到这里 `ensure_gacha()` 刚返回真，`gacha` 理论上是 `Some` ⇒ 这一支不该存在。
+            // 留着而不是 `expect`：它对应的是"那道没读过"，语义上就该关死，不值得为一条不可达
+            // 分支赌一次 panic（硬约束 3：宠物不能因为一行判据消失）。
+            None => None,
+        };
+        DressView::select(false, owned.as_ref(), &ids)
+    }
+
     /// 点"换一件"：在 [`Self::candidates`] 里把下标往前挪一格，**穿着时立刻换过去**。
     ///
     /// 页导航不在这条行里做（`Dress.next() == Gacha`，标题条就是唯一翻页控件）⇒ 这一行只管
@@ -2514,20 +2801,47 @@ impl App {
     ///   2026-11-03 真机 `VmHWM 148,076 kB` = 本体 45 + 旧 45 + 新 45 + 底子，就是这条撞出来的
     ///   ⇒ 现在 `take_worn` 只返回 `(slug, bytes)`，旧那张在本函数返回时就没了。
     fn cycle_accessory(&mut self) {
-        let n = self.candidates.len();
-        if n == 0 {
+        let view = self.dress_view();
+        if self.candidates.is_empty() {
             eprintln!(
                 "ui: 换一件 ⇒ 库里没有可用配件（上面 `accessories:` 那几行点名了每一件为什么出局）"
             );
             return;
         }
-        self.picked = (self.picked + 1) % n;
+        if view.visible.is_empty() {
+            eprintln!(
+                "ui: 换一件 ⇒ 库里有 {} 件而库存说这一件都不拥有 ⇒ 换装页不出现任何一件\
+                 （要开发态放行就加 `--allow-unowned-accessories`，那条会在屏上打 `*`）",
+                self.candidates.len()
+            );
+            return;
+        }
+        // 循环序 = `visible` 的升序（= 目录序）。`picked` 不在其中是**合法状态**而不是 bug：它
+        // 上一次被选中时也许还在豁免态里，而现在库存那道把它划掉了 ⇒ 落到第一个可见格，
+        // 绝不把下标停在一件穿不上的东西上（那正是"点了没反应"的假按钮形状）。
+        let pos = view.visible.iter().position(|&i| i == self.picked);
+        self.picked = match pos {
+            Some(p) => view.visible[(p + 1) % view.visible.len()],
+            None => view.visible[0],
+        };
+        // 报的是"可见表里的第几格"，不是"库里的第几件"：用户拿这行去对屏上循环，对的就是这一张表。
+        let shown = view
+            .visible
+            .iter()
+            .position(|&i| i == self.picked)
+            .expect("刚赋的值必然来自这张表")
+            + 1;
+        let total = view.visible.len();
         let slug = self.candidates[self.picked].slug.clone();
+        let withheld = view.withheld;
+        let note = if withheld == 0 {
+            String::new()
+        } else {
+            format!(" · 另有 {withheld} 件因未拥有不出现")
+        };
         if self.worn.is_none() {
             eprintln!(
-                "ui: 换一件 ⇒ 选中 {slug}（第 {}/{} 件）；本来就没穿，屏上不变",
-                self.picked + 1,
-                n
+                "ui: 换一件 ⇒ 选中 {slug}（第 {shown}/{total} 件）{note}；本来就没穿，屏上不变"
             );
             return;
         }
@@ -2537,18 +2851,9 @@ impl App {
             "ui: 换一件 ⇒ 释放 {freed_slug}（{:.3} MiB）、装载 {slug}",
             freed_bytes as f64 / (1024.0 * 1024.0)
         );
-        let outcome = decode(&self.candidates[self.picked]);
-        match outcome {
-            Ok(eq) => {
-                let merged = self.candidates[self.picked].merged.clone();
-                self.worn = Some(eq);
-                self.regions = Some(merged);
-                self.force_draw = true;
-                eprintln!(
-                    "ui: 换一件 ⇒ 已穿上 {slug}（第 {}/{} 件）",
-                    self.picked + 1,
-                    n
-                );
+        match self.wear(self.picked) {
+            Ok(worn) => {
+                eprintln!("ui: 换一件 ⇒ 已穿上 {worn}（第 {shown}/{total} 件）{note}");
             }
             Err(e) => eprintln!("ui: 换一件 ⇒ 选中 {slug} 但装载失败：{e}（停在未装备态）"),
         }
@@ -2573,26 +2878,31 @@ impl App {
     /// **同一个图集格**（帽子不改变内核给出的 `{key,row,col}`）⇒ 光靠"格子变了"那道门永远不开。
     /// 这正是 `force_draw` 的合法领地 = 签名与 `drawn_cell` 都看不见的那些像素。
     fn equip(&mut self) {
+        let view = self.dress_view();
         if self.worn.is_some() {
             eprintln!("ui: 穿上 ⇒ 已经穿着（穿的就是当前选中这件），不动");
             return;
         }
-        let outcome = match self.candidates.get(self.picked) {
-            Some(cand) => decode(cand),
-            None => {
-                eprintln!("ui: 穿上 ⇒ 库里没有可用配件 ⇒ 换装页点了不会有效果");
-                return;
-            }
-        };
-        match outcome {
-            Ok(eq) => {
-                let slug = eq.manifest.slug.clone();
-                let merged = self.candidates[self.picked].merged.clone();
-                self.worn = Some(eq);
-                self.regions = Some(merged);
-                self.force_draw = true;
-                eprintln!("ui: 穿上 {slug} ⇒ 换穿透轮廓并重画当前格");
-            }
+        if self.candidates.is_empty() {
+            eprintln!("ui: 穿上 ⇒ 库里没有可用配件 ⇒ 换装页点了不会有效果");
+            return;
+        }
+        // P2 那道：**没验过拥有就不解像素**（不是"解完再把结果丢掉"，那要白付一次解码与几 MiB）。
+        // 三个形状都落在这一支：库存说没这一件、给了 `--db` 而库读不出（失败关闭）、
+        // 以及 `picked` 停在一件已出局的格上。
+        if !view.visible.contains(&self.picked) {
+            eprintln!(
+                "ui: 穿上 ⇒ 选中 {} 但这一轮不许穿（库里 {} 件 · 可穿 {} 件 · 因未拥有出局 {} 件）\
+                 ⇒ 停在未装备态；开发态要放行就加 --allow-unowned-accessories（屏上会打 `*`）",
+                self.candidates[self.picked].slug,
+                self.candidates.len(),
+                view.visible.len(),
+                view.withheld
+            );
+            return;
+        }
+        match self.wear(self.picked) {
+            Ok(slug) => eprintln!("ui: 穿上 {slug} ⇒ 换穿透轮廓并重画当前格"),
             Err(e) => eprintln!("ui: 穿上失败 ⇒ {e}（停在未装备态）"),
         }
     }
@@ -2604,15 +2914,33 @@ impl App {
     /// ⇒ **结构上不可能失败**，所以没有"点了脱下而屏上还有帽子"这一档。
     /// 本来就没穿 ⇒ 只打一行，同样不置 `force_draw`（不置就是"静止不发协议"那条老账，不是遗漏）。
     fn unequip(&mut self) {
-        let Some((slug, bytes)) = self.take_worn() else {
+        let Some((slug, bytes)) = self.unwear() else {
             eprintln!("ui: 脱下 ⇒ 本来就没穿，不动");
             return;
         };
-        self.force_draw = true;
         eprintln!(
             "ui: 脱下 {slug} ⇒ 配件 sheet（{:.3} MiB 解码）已释放，轮廓回到本体那份",
             bytes as f64 / (1024.0 * 1024.0)
         );
+    }
+
+    /// 脱下 = 释放像素 + 把那一格从库里删掉，**一个动作**（与 [`Self::wear`] 对称）。
+    ///
+    /// 合起来的理由和 `wear` 那条一模一样：变异实测把原来 `unequip` 末尾那句
+    /// `persist_unworn` 单独删掉，全套测试照样绿，而用户看到的是"点了脱下，重启帽子自己回来"
+    /// —— 恰好是本项目反复在抓的"屏上 A、记忆里 B"。返回 `None` = 本来就没穿。
+    ///
+    /// ⚠️ [`Self::cycle_accessory`] **故意不走这里**，走裸的 [`Self::take_worn`]：换一件是
+    /// "卸下 A 立刻穿上 B"，中间那一步先把库里那一格删掉再写回来会留一个可见的"库里没有"窗口，
+    /// 而且白写一次；它后面那次 `wear` 的 upsert 直接把该格改成 B，那才是要的语义。
+    fn unwear(&mut self) -> Option<(String, usize)> {
+        // 槽位要在丢掉之前取：[`take_worn`] 只带回打印要用的那两个数（它的注释写了理由），
+        // 而"把这一格从库里删掉"要的正是那个槽位。这一行同时是"本来就没穿"那档的守卫。
+        let slot = self.worn.as_ref().map(|w| w.manifest.slot.to_string())?;
+        let (slug, bytes) = self.take_worn()?;
+        self.force_draw = true;
+        self.persist_unworn(&slot);
+        Some((slug, bytes))
     }
 
     /// 释放穿着的配件 = 丢掉 [`Equipped`]（那张 sheet 从此不在内存）+ 把轮廓换回本体那份。
@@ -2635,6 +2963,133 @@ impl App {
         let worn = self.worn.take()?;
         self.regions = self.body_regions.clone();
         Some((worn.manifest.slug.clone(), worn.atlas.decoded_bytes()))
+    }
+
+    /// **唯一**能把配件放上身的那一步：解码 → 像素与轮廓上身 → 记进 `equipped`。
+    ///
+    /// 为什么这三件必须在一个函数里（本轮变异实测逼出来的）：原先三个装载点各自写"四行赋值 +
+    /// 一句 `persist_worn`"，而把 `equip` 里那句删掉，**全套 526 条测试全绿** —— `App` 在没有
+    /// compositor 的机器上构造不出来 ⇒ "屏上戴着一顶而库里没记这笔"这个本项目反复出现的形状，
+    /// 在 headless 里**根本没有读数**。合成一个动作之后，"改了像素而忘了记账"不再是写得出来的
+    /// 代码；要绕过它就得先删掉这个函数，而那必然在另外两个调用点上报错。
+    ///
+    /// ⚠️ **调用方如果原本穿着，必须先 [`Self::take_worn`]**：这里不做，是因为 [`cycle_accessory`]
+    /// 要在两件之间插一行"释放了多少 MiB"，而那行要在旧 sheet 还在的时候取它的字节数。
+    /// 忘了 take 的代价就是 `take_worn` 那条注释算过的 135 MiB 峰值。
+    ///
+    /// 顺序（先像素后账）是选的：反过来的话"写库成功而解码失败"会在库里留一行屏上没有的帽子
+    /// ⇒ 下次启动凭空多一顶。宁可"这次没留住"并且由 [`Self::persist_worn`] 说出来。
+    ///
+    /// 返回 `slug` 只给人看的那三行用（各处措辞自带上下文：第几件 / 释放了多少 / 恢复）。
+    fn wear(&mut self, index: usize) -> Result<String, String> {
+        let eq = decode(&self.candidates[index])?;
+        let slug = eq.manifest.slug.clone();
+        let merged = self.candidates[index].merged.clone();
+        self.worn = Some(eq);
+        self.regions = Some(merged);
+        self.force_draw = true;
+        self.persist_worn(index);
+        Ok(slug)
+    }
+
+    /// 把"屏上现在穿着第 `index` 件"记进库。**只在像素已经装成功之后调**（三档结论里
+    /// 只有 `Written` 是不多话的 ⇒ 这一行与那句"穿上"是一件事的两半，不是两句日志）。
+    ///
+    /// 顺序（先像素后账）是选的：反过来的话"写库成功而解码失败"会在库里留一行屏上没有的帽子
+    /// ⇒ 下次启动凭空多一顶。宁可"这次没留住"并且说出来。
+    fn persist_worn(&mut self, index: usize) {
+        let slot = self.candidates[index].manifest.slot.to_string();
+        let id = self.candidates[index].id.clone();
+        match write_equip(&mut self.gacha, self.dry_run, &slot, &id) {
+            Ok(WornWrite::Written) => {}
+            Ok(WornWrite::DemoSkipped) => eprintln!(
+                "ui: 演示态 ⇒ 这一次不记进 equipped（无 `--db` = 内存库，重启必然什么都不穿；要留住就加 `--db`）"
+            ),
+            Ok(WornWrite::NoStore) => {
+                eprintln!("ui: 屏上已穿而 equipped 没记上 ⇒ 连不上库 ⇒ 重启不会恢复");
+            }
+            Err(e) => eprintln!("ui: 屏上已穿而 equipped 没记上（{e}）⇒ 重启不会恢复"),
+        }
+    }
+
+    /// 把那一格从库里删掉。同 [`Self::persist_worn`] 的三档与同一句"屏上没了而库里还记着"
+    /// 必须说出来的理由（脱下没留住 = 下次启动帽子自己回来，用户会以为脱下没生效）。
+    fn persist_unworn(&mut self, slot: &str) {
+        match clear_equip(&mut self.gacha, self.dry_run, slot) {
+            Ok(WornWrite::Written) => {}
+            Ok(WornWrite::DemoSkipped) => {
+                eprintln!("ui: 演示态 ⇒ 库里那一格没得删（这一轮从头就没往库里写过）")
+            }
+            Ok(WornWrite::NoStore) => {
+                eprintln!("ui: 屏上已脱而 equipped 没删 ⇒ 连不上库 ⇒ 重启还会穿上");
+            }
+            Err(e) => eprintln!("ui: 屏上已脱而 equipped 没删（{e}）⇒ 重启还会穿上"),
+        }
+    }
+
+    /// 启动时读一次 `equipped` ⇒ 恢复上次穿着（P3 = J3 的全部）。**只跑一次**（闩 =
+    /// [`Self::restore_pending`]，在 [`Self::on_tick`] 里放下）。
+    ///
+    /// 三条早退各有其门，都**不出声**（它们不是"失败了"，是"这一轮压根没有这件事"）：
+    /// 演示态不读库（FLOW §9 P3 明写要测的那条）、本体没像素（`--test-rect` / 内置 fixture
+    /// 不读盘那条路，与启动时 `discover_accessories()` 的 `match` 同一个条件）。
+    ///
+    /// 判定本身在 [`plan_restore`]（四道、可红）；这里只做三件它做不了的事：连库、
+    /// **重跑第五道（解码）**、把结果接到 `worn`/`regions`/`picked` 上。第五道为什么只能在这里：
+    /// 启动扫盘那一轮一像素未解（M1 的前提），而"文件在而 sheet 坏了"这种形状只有穿的那一刻
+    /// 才看得见 —— 报一行、停在未穿，绝不为一次恢复把宠物带崩（硬约束 3）。
+    fn restore_worn(&mut self) {
+        if self.dry_run || self.body_regions.is_none() {
+            return;
+        }
+        let ids: Vec<String> = self.candidates.iter().map(|c| c.id.clone()).collect();
+        let slots: Vec<String> = self
+            .candidates
+            .iter()
+            .map(|c| c.manifest.slot.to_string())
+            .collect();
+        if !self.ensure_gacha() {
+            eprintln!(
+                "ui: 恢复上次穿着 ⇒ 连不上存档，这一轮一件都不恢复（连不上的原因上面已说过一次）"
+            );
+            return;
+        }
+        let rows = match self
+            .gacha
+            .as_ref()
+            .map(|g| g.store.equipped(petstore::DEFAULT_PROFILE))
+        {
+            Some(Ok(rows)) => rows,
+            Some(Err(e)) => {
+                eprintln!("ui: 恢复上次穿着 ⇒ 读 equipped 失败（{e}）⇒ 这一轮一件都不恢复");
+                return;
+            }
+            None => return,
+        };
+        if rows.is_empty() {
+            // 没记过 ⇒ 一行都不打。启动噪音要留给"出事了"，而"上次没穿"是常态。
+            return;
+        }
+        // 可见集与换装页共用同一次判定（`dress_view`）⇒ 不会有"帽子页里不出现而启动却穿上了"。
+        let view = self.dress_view();
+        let plan = plan_restore(&rows, &ids, &slots, &view.visible);
+        for note in &plan.notes {
+            eprintln!("ui: 恢复上次穿着 ⇒ {note}");
+        }
+        let Some(i) = plan.wear else {
+            return;
+        };
+        let slot = slots[i].clone();
+        let id = ids[i].clone();
+        self.picked = i;
+        match self.wear(i) {
+            Ok(_) => {
+                eprintln!("equipped: {slot}={id} ⇒ 恢复上次穿着（五道全过，像素已叠在当前格上）");
+            }
+            Err(e) => eprintln!(
+                "equipped: {slot}={id} 解不开（{e}）⇒ 第五道没过，这一轮不穿（停在未装备态）"
+            ),
+        }
     }
 
     /// 点语言行：zh→en→ja→ko→zh，**本进程立刻生效 + 当场写回 `config.toml`**（拍板④）。
@@ -2885,6 +3340,14 @@ impl App {
             self.last_wake = now;
             self.acc = 0.0;
             return;
+        }
+
+        // 恢复上次穿着 = **这一刻之后跑一次**（P3；FLOW §5 那张表要求的时刻就是"configured 之后、
+        // discover 之后"）。排在早退之后有两个理由：surface 还没映射时 `force_draw` 没人接；
+        // 而排在 tick 环之前是为了让恢复出来的那一格走**正常那一条**出图路径，不是另开一次提交。
+        if self.restore_pending {
+            self.restore_pending = false;
+            self.restore_worn();
         }
 
         let dt = now
@@ -3854,6 +4317,389 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains("DRYRUN")),
             "演示标跑进结果行了 ⇒ 卡片上会有两处，而只有一处是签收过的"
+        );
+    }
+
+    /// P2 的三条读数 = [`DressView::select`] 的三档输入，各打各的。
+    ///
+    /// 为什么这三条值得单独存在，而不是"真机点一下看看"：整条 `App::dress_view` 要连库要扫盘，
+    /// 只有真机跑得起来 ⇒ "未拥有的件不出现"这一句就变成只有人眼能验。拆出纯函数后，判定这部分
+    /// 由下面三条钉住，屏上那个 `*` 由 `card::tests::dress_page_star_marks_only_the_dress_page`
+    /// 钉住，两边都能红。
+    #[test]
+    fn unowned_accessory_never_appears_while_the_owned_one_does() {
+        let ids: Vec<String> = ["hat_a", "hat_b", "hat_c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let owned: Owned = ["hat_b"].into_iter().map(String::from).collect();
+        let v = DressView::select(false, Some(&owned), &ids);
+        // 可见的是**下标**而不是克隆 ⇒ `picked` 仍是"选中哪件"的唯一事实
+        assert_eq!(v.visible, vec![1], "只有库存里那一件能出现");
+        assert_eq!(v.withheld, 2, "出局数要说得出漏了几件（stderr 那一句读它）");
+    }
+
+    #[test]
+    fn exempt_or_demo_makes_nothing_withheld() {
+        let ids: Vec<String> = ["hat_a", "hat_b"].iter().map(|s| s.to_string()).collect();
+        let v = DressView::select(true, None, &ids);
+        assert_eq!(v.visible, vec![0, 1]);
+        assert_eq!(
+            v.withheld, 0,
+            "放行这一档不许报出局数（那会把两句不同的话混成一句）"
+        );
+    }
+
+    /// **失败关闭**那一档（`owned = None` = 库存这道**没读过**：连不上库 / 读失败）。
+    ///
+    /// 光断"什么都不给"抓不到两种坏实现：① 把 `None` 合并成"读过而答案是空集"（那 `--db` 打错
+    /// 路径与"确实没抽到东西"就在屏上分不开了）；② 更坏的**永远返回空**。所以这条真正起作用的是
+    /// 后半 —— **库存里有名字时必须一件不少地放行**，它证明这道门是读出来的，不是常量。
+    #[test]
+    fn unreadable_store_closes_the_door_while_a_real_set_opens_it() {
+        let ids: Vec<String> = ["hat_a", "hat_b"].iter().map(|s| s.to_string()).collect();
+        let closed = DressView::select(false, None, &ids);
+        assert!(closed.visible.is_empty(), "没验过拥有就一件都不给");
+        assert_eq!(closed.withheld, 2);
+        let all: Owned = ["hat_a", "hat_b"].iter().map(|s| s.to_string()).collect();
+        let open = DressView::select(false, Some(&all), &ids);
+        assert_eq!(
+            open.visible,
+            vec![0, 1],
+            "库存说都有 ⇒ 这道门必须真的放行，否则上面那些断言全在测一个常量"
+        );
+        assert_eq!(open.withheld, 0);
+    }
+
+    /// 豁免真值表四格（[`dress_exempt_for`]）。
+    ///
+    /// 第三格 = 用户 2026-11-06 专门拍板的那一格：给了 `--allow-unowned-accessories` 而**没给**
+    /// `--db` ⇒ 放行（照 DRYRUN 那套），但帽子页**不**点 `*`（右端已有「演示」标，同一件事不给
+    /// 两个记号）。这一格以前只有"起进程看屏幕"能验，而 `App` 离开 compositor 构造不起来。
+    #[test]
+    fn exemption_needs_the_flag_and_a_real_store() {
+        assert!(
+            dress_exempt_for(true, false),
+            "开关 + `--db` ⇒ 这才是豁免态"
+        );
+        assert!(
+            !dress_exempt_for(false, false),
+            "没给开关，普通运行轮不许豁免"
+        );
+        assert!(
+            !dress_exempt_for(true, true),
+            "演示态放行但**不点星**：屏上已有「演示」标，两个记号 = 两个事实源"
+        );
+        assert!(
+            !dress_exempt_for(false, true),
+            "演示态没给开关也是放行（DRYRUN 那一套），但同样不许点星"
+        );
+    }
+
+    /// **演示态一个字都不落库**（FLOW §9 P3 明写"这条要写进测试，防顺手修好"）。
+    ///
+    /// 这条要拿**一只真好用的内存库**来测，而不是拿 `None`：`None` 那一档证不了"演示态"起了作用
+    /// （它连得上库而库里没写，才算挡住了那次写）。三档一次测完，顺序就是危险程度。
+    #[test]
+    fn demo_mode_writes_nothing_while_a_real_store_keeps_the_row() {
+        let mut gacha = Some(Gacha::connect(None).expect("内存库该建得起来"));
+        let read = |g: &Option<Gacha>| {
+            g.as_ref()
+                .unwrap()
+                .store
+                .equipped(petstore::DEFAULT_PROFILE)
+        };
+        // ① 演示态：库就在手边，也不许写
+        assert!(
+            matches!(
+                write_equip(&mut gacha, true, "head", "cap").unwrap(),
+                WornWrite::DemoSkipped
+            ),
+            "演示态要的是 DemoSkipped 这个**结论**，不是 Ok(())（调用方按结论决定打哪一行）"
+        );
+        assert!(
+            read(&gacha).unwrap().is_empty(),
+            "无 `--db` 那一轮写进内存库 = 对用户说「记下了」而它必然不还在"
+        );
+        // ② 同一只库、同一个动作，只是这轮不是演示态 ⇒ 必须真写得进去
+        assert!(matches!(
+            write_equip(&mut gacha, false, "head", "cap").unwrap(),
+            WornWrite::Written
+        ));
+        assert_eq!(
+            read(&gacha).unwrap(),
+            vec![("head".to_string(), "cap".to_string())],
+            "①②合起来才证明拦下来的是 `dry_run` 这个条件本身"
+        );
+        // ③ 连不上库（`None`）不许 panic，也不许编出个"写好了"的结论
+        let mut none = None;
+        assert!(matches!(
+            write_equip(&mut none, false, "head", "cap").unwrap(),
+            WornWrite::NoStore
+        ));
+    }
+
+    /// **UI 那两个写函数写的，就是下一个进程要打开的那只文件**（P3 唯一一条走完的写链）。
+    ///
+    /// 为什么单独立一条：上面几条测 `write_equip`/`clear_equip` 用的是**内存库**，而
+    /// `petstore/tests/equipped_roundtrip.rs` 测的是 **`Store` 本体** —— 两边都绿而中间没接上，
+    /// 是一个真实存在的形状（本项目"两个事实源互不相认"那一族，§9.2 第 20 条就是这么登记的）。
+    /// 会两两不一致的三件事至少有四个：UI 挑的 profile、UI 打开的路径、恢复时读的那只库、
+    /// 恢复时读的那张表。⇒ 这里走 UI 的那两个函数 → **落盘** → 换一个 `Gacha` 重新打开同一路径
+    /// → 从 `plan_restore` 的输入端读回来，一条链走完，末尾还带一次正面控制。
+    #[test]
+    fn the_ui_writes_the_very_file_the_next_process_opens() {
+        let dir = tempfile::tempdir().expect("临时目录该建得起来");
+        let path = dir.path().join("opet.db");
+        let path_str = path.to_str().expect("临时路径该是 UTF-8");
+
+        // 进程 A：穿上 → 换一顶 → 脱下 → 再穿上。净效果只该剩最后一笔。
+        let mut a = Some(Gacha::connect(Some(path_str)).expect("带 `--db` 那条路该连得上文件库"));
+        for id in ["cap", "beanie"] {
+            assert!(matches!(
+                write_equip(&mut a, false, "head", id).unwrap(),
+                WornWrite::Written
+            ));
+        }
+        assert!(matches!(
+            clear_equip(&mut a, false, "head").unwrap(),
+            WornWrite::Written
+        ));
+        assert!(matches!(
+            write_equip(&mut a, false, "head", "cap").unwrap(),
+            WornWrite::Written
+        ));
+        drop(a);
+
+        // 进程 B：同一路径重新打开 ⇒ 读到的必须是最后那一笔，而不是空表
+        let b = Some(Gacha::connect(Some(path_str)).expect("第二个进程该开得了同一只文件"));
+        let rows = b
+            .as_ref()
+            .unwrap()
+            .store
+            .equipped(petstore::DEFAULT_PROFILE)
+            .expect("读 equipped 不该失败");
+        assert_eq!(
+            rows,
+            vec![("head".to_string(), "cap".to_string())],
+            "写了四轮而文件里没有净效果 ⇒ 那些笔只活在进程 A 的连接上（J3 必然红）"
+        );
+        // 正面控制：读回来的这一行必须真能被恢复穿上，而不是"库里对而穿不上"。
+        let ids: Vec<String> = ["cap".into()].to_vec();
+        let slots: Vec<String> = ["head".into()].to_vec();
+        let plan = plan_restore(&rows, &ids, &slots, &[0]);
+        assert_eq!(
+            plan.wear,
+            Some(0),
+            "文件里那一行必须能走回 `wear`：{:?}",
+            plan.notes
+        );
+    }
+
+    /// 脱下 = 删那一格。同上一条的三档，方向反过来（"删不掉"的后果是重启帽子自己回来）。
+    #[test]
+    fn unworn_clears_the_row_and_demo_has_nothing_to_clear() {
+        let mut gacha = Some(Gacha::connect(None).expect("内存库该建得起来"));
+        write_equip(&mut gacha, false, "head", "cap").unwrap();
+        assert!(matches!(
+            clear_equip(&mut gacha, true, "head").unwrap(),
+            WornWrite::DemoSkipped
+        ));
+        assert!(
+            !gacha
+                .as_ref()
+                .unwrap()
+                .store
+                .equipped(petstore::DEFAULT_PROFILE)
+                .unwrap()
+                .is_empty(),
+            "演示态的「脱下」也不许动库：屏上没了而库里还记着，是**另一种**谎，不是同一种"
+        );
+        assert!(matches!(
+            clear_equip(&mut gacha, false, "head").unwrap(),
+            WornWrite::Written
+        ));
+        assert!(
+            gacha
+                .as_ref()
+                .unwrap()
+                .store
+                .equipped(petstore::DEFAULT_PROFILE)
+                .unwrap()
+                .is_empty()
+        );
+        let mut none = None;
+        assert!(matches!(
+            clear_equip(&mut none, false, "head").unwrap(),
+            WornWrite::NoStore
+        ));
+    }
+
+    /// 手工往 `equipped` 塞一行 ⇒ **报一句并出局**，不许静默穿上（J2 的后半）。
+    ///
+    /// 两种手工形状都测：未拥有的那件（磁盘有、库存没有）与槽位不符的那行（清单说 `neck`
+    /// 而库里写 `head`）。只测前者会留下后者：后者更阴 —— 像素照解照画，帽子挂错部位，
+    /// 而屏幕上没有任何一处会说"这一行是我自己塞的"。
+    #[test]
+    fn a_hand_made_equipped_row_is_refused_and_named() {
+        let ids: Vec<String> = ["hat_a", "hat_b"]
+            .iter()
+            .copied()
+            .map(String::from)
+            .collect();
+        let slots: Vec<String> = ["head".into(), "head".into()].to_vec();
+        // 库存只有 hat_a ⇒ visible 只有 0（这一档直接沿用 P2 那次判定的输出）
+        let unowned = plan_restore(
+            &[("head".to_string(), "hat_b".to_string())],
+            &ids,
+            &slots,
+            &[0],
+        );
+        assert!(unowned.wear.is_none(), "未拥有的那一件绝不被恢复穿上");
+        assert_eq!(unowned.notes.len(), 1);
+        assert!(
+            unowned.notes[0].contains("hat_b") && unowned.notes[0].contains("库存里没有这一件"),
+            "出局要点名是哪一件、错在哪一道：{:?}",
+            unowned.notes
+        );
+        // 槽位不符：库里说 head，清单说 neck ⇒ 这一行不是这套代码写出来的
+        let crossed = plan_restore(
+            &[("head".to_string(), "hat_a".to_string())],
+            &ids,
+            &["neck".into(), "head".into()],
+            &[0, 1],
+        );
+        assert!(crossed.wear.is_none());
+        assert!(
+            crossed.notes[0].contains("手工"),
+            "要说清这是手工行，不然用户会去查库存而那儿根本没毛病：{:?}",
+            crossed.notes
+        );
+        // 正向对照：同一批输入把槽位改对 ⇒ 必须真的穿上那一格。
+        // 没有这一句，上面四条断言全可能是在测一个"永远返回 None"的函数。
+        let ok = plan_restore(
+            &[("neck".to_string(), "hat_a".to_string())],
+            &ids,
+            &["neck".into(), "head".into()],
+            &[0, 1],
+        );
+        assert_eq!(ok.wear, Some(0), "四道全过就该穿上（门禁不能只会说不）");
+        assert!(ok.notes.is_empty());
+    }
+
+    /// 上次穿的帽子文件没了（被删、或五道门禁没过而被 discovery 跳掉）⇒ 点名，不静默。
+    ///
+    /// 这条**不需要**恢复代码自己再跑一遍五道：库里那一行要能穿，前提是它出现在 `ids` 里，
+    /// 而 `ids` 只由 [`discover_accessories`] 活着交出来 ⇒ "不在磁盘上/不过门禁"这两句是同一条。
+    #[test]
+    fn a_vanished_item_is_named_instead_of_silently_not_worn() {
+        let ids: Vec<String> = ["hat_a".into()].to_vec();
+        let slots: Vec<String> = ["head".into()].to_vec();
+        let plan = plan_restore(
+            &[("head".to_string(), "gone_hat".to_string())],
+            &ids,
+            &slots,
+            &[0],
+        );
+        assert!(plan.wear.is_none());
+        assert!(
+            plan.notes[0].contains("gone_hat") && plan.notes[0].contains("找不到这一件"),
+            "「上次穿的 X 现在装不上」要带上 X 叫什么：{:?}",
+            plan.notes
+        );
+    }
+
+    /// 库里记着好几格 ⇒ 只回第一件（M1 = 一次一件），其余**只报告、不删**。
+    ///
+    /// "第一件"能重放的前提是行序由库给（`Store::equipped` 的 `ORDER BY slot, item_id`）⇒
+    /// 这一条同时是那次排序的消费方：排序坏了这里就是随机一顶。
+    #[test]
+    fn only_the_first_of_several_rows_comes_back_and_the_ledger_stays_intact() {
+        let ids: Vec<String> = ["back_pack".into(), "cap".into()].to_vec();
+        let slots: Vec<String> = ["back".into(), "head".into()].to_vec();
+        let visible: Vec<usize> = vec![0, 1];
+        let plan = plan_restore(
+            &[
+                ("back".to_string(), "back_pack".to_string()),
+                ("head".to_string(), "cap".to_string()),
+            ],
+            &ids,
+            &slots,
+            &visible,
+        );
+        assert_eq!(
+            plan.wear,
+            Some(0),
+            "取行序第一件（back 排在 head 前，因为那个 ORDER BY）"
+        );
+        assert_eq!(plan.notes.len(), 1);
+        assert!(
+            plan.notes[0].contains("M1") && plan.notes[0].contains("留着"),
+            "要说「这一件留在库里没删」，删掉等于丢用户没让我丢的东西：{:?}",
+            plan.notes
+        );
+    }
+
+    /// **"改了像素"与"记进 equipped"在源码里必须是同一个动作**（P3 的接线门禁）。
+    ///
+    /// 这条不是洁癖，是变异实测逼出来的：本轮把 `equip` 里那句 `persist_worn` 删掉，
+    /// **全套 526 条全绿**（变异 G）。原因很简单 —— `App` 在没有 compositor 的机器上构造不出来，
+    /// 所以"屏上戴着一顶而库里没记这笔"这个本项目反复出现的形状，在 headless 里**没有读数**。
+    /// 修法不是再补三句"记得调用"，那是同一个洞换地方：把三处装载合成 [`App::wear`] 一个动作
+    /// （解码 → 上身 → 记账），这条门禁再钉住"只有一个落点"这件事。⇒ 以后要红，得有人往
+    /// `wear` 外面写 `self.worn = Some(` 或删掉 `wear` 里那句记账，两种都在此点名。
+    ///
+    /// 与 `cli.rs` 的 `every_flag_advertised_in_usage_exists` 同族（那条查 `--help` 与解析器是否
+    /// 各说一套）。**读源码文本的门禁天生脆**，所以这里只数三件最小的事，且每一条都带
+    /// "为什么是这一条"的断言文本；重构改名会红，那是**要人来看一眼**的红，不是误报。
+    #[test]
+    fn pixels_and_the_ledger_are_written_by_one_function_only() {
+        let src = include_str!("app.rs");
+        // 只数**测试模块之外**的代码：这条门禁自己的源码里就写着它数的那些字面量，
+        // 不切掉的话它数到的是 5 而不是 1（本轮实测），而那是一个永远不红的假门禁的反面 ——
+        // 一个永远绿的读数。
+        let code = src
+            .split("\nmod tests {")
+            .next()
+            .expect("本文件有 `mod tests`，切不出来说明结构变了");
+
+        // ① 把配件放上身的赋值**全仓库只许有一处**，而那一处必须在 `wear` 的函数体里。
+        let body = |name: &str| -> String {
+            let at = format!("fn {name}(");
+            let start = code
+                .find(&at)
+                .unwrap_or_else(|| panic!("找不到 `{at}` ⇒ 这条门禁白跑"));
+            let rest = &code[start..];
+            let end = rest[at.len()..]
+                .find("\n    fn ")
+                .or_else(|| rest[at.len()..].find("\n    }"))
+                .map(|d| at.len() + d)
+                .unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+        let wears = body("wear");
+        assert!(
+            code.matches("self.worn = Some(").count() == 1,
+            "把配件放上身写了 {} 处 ⇒ 有一处绕过了 `wear`，而它不会记 equipped（本轮变异 G 的形状）",
+            code.matches("self.worn = Some(").count()
+        );
+        assert!(
+            wears.contains("self.worn = Some("),
+            "唯一那处上身必须在 `wear` 里，不然它就不在记账的那条路上"
+        );
+
+        // ② `wear` 自己必须带那句记账（① 只保证"别处没有"，不保证"这里有"）。
+        assert!(
+            wears.contains("persist_worn"),
+            "`wear` 里没有 `persist_worn` ⇒ 三处装载全都不记账，而 headless 测不出来"
+        );
+
+        // ③ 三个装载点都真的走 `wear`（少一个就是"那条路又自己写了一遍像素"）。
+        assert_eq!(
+            code.matches("self.wear(").count(),
+            3,
+            "`wear` 应当被穿上 / 换一件 / 启动恢复 三处共用，实际调用点 {} 个",
+            code.matches("self.wear(").count()
         );
     }
 

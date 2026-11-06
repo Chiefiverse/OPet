@@ -880,8 +880,11 @@ mod tests {
                 ];
                 // 分页后每页各有三行 + 一个页名标题 ⇒ 逐页逐行都单独量一次。
                 // （页码 ` n/N` 全 ASCII，宽度上只是三个字符的成本，不用单列。）
+                // ⚠️ 豁免态那一版（尾随 `" *"`，同样全 ASCII）**也要单列**：它比原文宽两个字符，
+                // 而帽子页是六页里页名最长的一档之一 ⇒ "记号把页名挤出预算"只有这里能量出来。
                 for page in MenuPage::ALL {
                     solo.push(page.header_text(l));
+                    solo.push(page.header_text_marked(l, true));
                     solo.extend(page.rows().iter().map(|&it| it.label(l)));
                 }
                 // 同一行挤两段的最坏情况：标题行 = 标题 + `碎片 余额 演示`，底行 = 碎片 + 余额。

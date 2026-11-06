@@ -508,6 +508,7 @@ mod tests {
                 opet_db: None,
                 xdg_data_home: Some("relative/nope".into()),
                 home: Some("/home/jun".into()),
+                ..crate::paths::Env::default()
             },
             None,
         );

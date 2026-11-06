@@ -215,6 +215,22 @@ impl MenuPage {
             Self::ALL.len()
         )
     }
+
+    /// [`Self::header_text`] 再加一枚**开发态豁免**记号（`帽子 4/6 *`）。
+    ///
+    /// 只有 [`Self::Dress`] 会画：豁免改变的是那一页的候选表，别的页挂星号等于撒谎。
+    ///
+    /// 为什么是一个 `*` 而不是一句四语文案：`*` = **U+002A 已在字体子集清单里**
+    /// （`crates/overlay-wayland/assets/fonts/ui-codepoints.txt`）⇒ 零重裁成本，而新增非 ASCII
+    /// 字要走那条"一处四常数联动"（`l10n.rs` → `subset_font.py` → `text.rs` 字节数 +
+    /// `FONT_SHA256` + `NOTICE`，AGENTS.md 事实 8，历史上红过一次才看清）。
+    /// 先例 = 页码 `n/N`：同一理由、同一条 ASCII 门禁（[`header_page_indicator_is_ascii_only`]）。
+    pub fn header_text_marked(self, lang: Lang, marked: bool) -> String {
+        match (self, marked) {
+            (Self::Dress, true) => format!("{} *", self.header_text(lang)),
+            _ => self.header_text(lang),
+        }
+    }
 }
 
 /// 一个可点矩形（菜单 surface 的 **logical** 坐标，与 margin/region 同口径，物理换算只在 draw 层）。
@@ -1271,6 +1287,54 @@ mod tests {
                     format!("{}/{}", page.index() + 1, MenuPage::ALL.len()),
                     "页码必须来自 `index()` ⇒ 页名顺序与写着的数不许分家"
                 );
+            }
+        }
+    }
+
+    /// 豁免记号的**文字**规则三件事：① 只有帽子页加；② 加的是尾随的 ASCII `" *"`，所以
+    /// **零字体成本**（`font_assets.rs::codepoints_list_is_sorted_unique_and_covers_printable_ascii`
+    /// 已经钉住 0x20..0x7F 全在清单里，`*` = U+002A 在里面 ⇒ 不用重裁、不用改那"一处四常数"）；
+    /// ③ 页码 `n/N` 仍在倒数第二段 ⇒ 星号不许把"标题条是个翻页控件"那条唯一线索挤掉。
+    ///
+    /// 屏上"看得见"那一半不在这里，在 `card::tests::dress_page_star_marks_only_the_dress_page`
+    /// —— 这条测试改的是字，那条改的是像素，两者任缺一样都留下"函数对了而画师没读"的空档。
+    #[test]
+    fn header_mark_is_a_trailing_ascii_star_on_the_dress_page_only() {
+        for page in MenuPage::ALL {
+            for lang in Lang::ALL {
+                let plain = page.header_text(lang);
+                let marked = page.header_text_marked(lang, true);
+                if page == MenuPage::Dress {
+                    assert_eq!(
+                        marked,
+                        format!("{plain} *"),
+                        "{lang:?}：记号必须挂在页名 + 页码**之后**，插在中间会把页码读断"
+                    );
+                    let tail = &marked[plain.len()..];
+                    assert_eq!(tail, " *", "记号只许是尾随的一个空格 + ASCII `*`");
+                    assert!(
+                        tail.is_ascii(),
+                        "记号含非 ASCII（{tail:?}）⇒ 要走重裁字体那条链路，这条决定就是为了避开它"
+                    );
+                    // 页码 = 加了记号之后的**倒数第二段**（没加时是最后一段）。只有帽子页这支
+                    // 有意义：其余五页 `marked == plain`，"倒数第二段"量到的是页名，不是页码。
+                    assert_eq!(
+                        marked.rsplit(' ').nth(1),
+                        plain.rsplit(' ').next(),
+                        "{lang:?}：记号挂尾而把页码挤出末段 ⇒ 翻页那两条线索同时作废"
+                    );
+                } else {
+                    assert_eq!(
+                        marked, plain,
+                        "{lang:?} {page:?}：这一页的行为与豁免无关，挂标就是在撒谎"
+                    );
+                }
+            }
+        }
+        // 关掉时六页一律逐字节等于原文（"标不亮 = 屏上没有"，与上面那条合成双向）
+        for page in MenuPage::ALL {
+            for lang in Lang::ALL {
+                assert_eq!(page.header_text_marked(lang, false), page.header_text(lang));
             }
         }
     }

@@ -1,9 +1,11 @@
 //! `opet` 命令行入口。M1 = headless 模拟与吞吐基准；
 //! M3 起加 `gacha-sim`/`catalog`/`pull`/`redeem`/`audit`（盲盒引擎与存档，见 [`gacha_cmd`]）；
-//! M4 起加 `overlay`（Wayland 宠物客户端，与 `opet-overlay-wayland` 共用参数口径）。
-//! IPC/资产子命令在 M3 之后补（§10.2）。
+//! M4 起加 `overlay`（Wayland 宠物客户端，与 `opet-overlay-wayland` 共用参数口径）；
+//! P1（FLOW §9）加 `pack`（内容包装/卸/预览/校验，见 [`pack_cmd`]）。
+//! IPC 子命令在 M3 之后补（§10.2）。
 
 mod gacha_cmd;
+mod pack_cmd;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -50,6 +52,16 @@ M4 可用（完整参数：`opet overlay --help`）：
       缩到 1/4 并关掉 SSR 白闪，off 整个跳过扩散；两档都不动结果卡停留时间与稀有度色带
   opet overlay --test-rect
       不接内核，画纯色矩形，只验 surface 映射与点击穿透
+
+P1 可用（内容包，完整参数：`opet pack --usage`）：
+  opet pack show|verify FILE
+      只读预览与逐件预检（不解压、不开库）；verify 末行 GATE … result=PASS/FAIL
+  opet pack install FILE [--force] [--max-mb N]
+      装包并落盘到资产根 + 写库存（obtained_from='pack:<id>'）；被拒绝的包一个字都不留
+  opet pack list
+      账本侧与磁盘侧并排 + 点名两侧差异（§9.2 第 20 条那条「互不相认」）
+  opet pack uninstall PACK_ID
+      按归属清单删，别人手工放的一律保留
 
   opet --help
 ";
@@ -243,6 +255,15 @@ fn main() -> ExitCode {
             }
             return gacha_cmd::dispatch(&args);
         }
+    }
+    // `pack` 与上面同一形状（判红/拒绝已经打过原因）。裸 `opet pack` 打完整参数而不是报错：
+    // 五个子命令的名字就在 USAGE 里，"忘了参数"比"参数写错"更常见。
+    if args.first().map(String::as_str) == Some("pack") {
+        if args.len() == 1 || args.get(1).map(String::as_str) == Some("--usage") {
+            print!("{}", pack_cmd::USAGE);
+            return ExitCode::SUCCESS;
+        }
+        return pack_cmd::dispatch(&args[1..]);
     }
     let result = match args.first().map(String::as_str) {
         Some("sim") => {

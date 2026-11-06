@@ -38,6 +38,14 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
   （格子/列数/行表/fps/循环标志），对不上就**点名是哪一档漂移并跳过这一件** —— 错位画在
   屏上只是「帽子歪了」，永远不会有报错，所以只能在装备那一刻判（D16 路线 B 的地基）。
   与旧版唯一不同：坏的一件被跳过而**不影响其余**，宠物照常起（硬约束 3）。
+
+  --allow-unowned-accessories
+                     开发态豁免：**没抽到、没装包得到的配件也进换装页、也能穿**。默认不开
+                     （用户 2026-11-05 第 3 问拍板 = 玩家不能穿未拥有）。开着的每一轮，
+                     帽子页标题带**尾随一个 `*` 并染成警示色** ⇒ 屏上永远读得出「这轮是豁免态」，
+                     不打标的放行就是假门禁（`--cell` 假开关那一族）。
+                     不给 `--db` 时这条**不生效也不需要**：内存库 ⇒ 库存恒空 ⇒ 那是演示态，
+                     本来就放行，由标题行右端已有的「演示」标承担（同 DRYRUN 那一族）。
 ";
 
 #[derive(Debug, Default, PartialEq)]
@@ -57,6 +65,8 @@ pub struct Args {
     /// 解释（大小写/子标签/优先级链）更不在这里 —— 那是 `settings` 唯一的一份口径。
     pub lang: Option<String>,
     pub motion: Option<String>,
+    /// 开发态豁免：未拥有的配件也进换装页。`--db` 没给时不生效（演示态本来就放行）。
+    pub allow_unowned_accessories: bool,
 }
 
 impl Args {
@@ -116,6 +126,7 @@ impl Args {
             no_cursor: self.no_cursor,
             lang: self.lang.clone(),
             motion: self.motion.clone(),
+            allow_unowned_accessories: self.allow_unowned_accessories,
         })
     }
 }
@@ -167,6 +178,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--probe" => a.probe = true,
             "--test-rect" => a.test_rect = true,
             "--no-cursor" => a.no_cursor = true,
+            "--allow-unowned-accessories" => a.allow_unowned_accessories = true,
             other => return Err(format!("未知参数: {other}")),
         }
         i += 1;
@@ -308,6 +320,26 @@ mod tests {
                 "USAGE 广告了 {flag} 而解析器不认: {err}"
             );
         }
+    }
+
+    /// `--allow-unowned-accessories` 必须真的走到 `Options`，且**默认是关的**。
+    ///
+    /// 这条为什么不能只靠 `every_flag_advertised_in_usage_exists`：那条证明的是"解析器不拒绝
+    /// 它"，而"不拒绝"与"下游有人读"是两件事 —— `--cell` 那轮的形状就是帮助里在、解析器认、
+    /// 而两处实现都不读那个值。这一条把最后一段（解析 → `Options`）接上；再下游（可见集与屏上
+    /// 那个 `*`）由 `app::tests` 与 `card::tests` 各断一段。
+    #[test]
+    fn allow_unowned_defaults_off_and_reaches_options() {
+        let off = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert!(
+            !off.allow_unowned_accessories,
+            "默认必须关着 ⇒ 放行未拥有的配件是要显式给的决定（用户 2026-11-05 第 3 问）"
+        );
+        let on = parse(&v(&["--test-rect", "--allow-unowned-accessories"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(on.allow_unowned_accessories);
     }
 
     #[test]

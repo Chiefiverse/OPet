@@ -30,9 +30,10 @@ pub mod config;
 pub mod db;
 pub mod ledger;
 pub mod licenses;
+pub mod pack;
 pub mod paths;
 
-pub use db::{Store, StoreError};
+pub use db::{PackGrant, Store, StoreError};
 pub use ledger::{PullReport, derive_state};
 pub use licenses::{LicenseService, LicenseState, NoopLicenseService};
 pub use paths::DbPath;

@@ -8,8 +8,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use petcore::gacha::{
-    AuditRecord, Catalog, ChainReport, Currency, Engine, GachaError, GachaParams, Owned, PullState,
-    Rarity, unhex, verify_chain, verify_chain_anchored, verify_replay,
+    AuditRecord, Catalog, ChainReport, Currency, Engine, GachaError, GachaParams, ItemKind, Owned,
+    PullState, Rarity, unhex, verify_chain, verify_chain_anchored, verify_replay,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -68,6 +68,11 @@ pub enum StoreError {
     LedgerOutsideCatalog(Vec<String>),
     /// 库里没有这条 banner。
     NoBanner(String),
+    /// 内容包本身不合格 ⇒ **整包拒绝**，不写任何一行（`opet pack install` 的那道门禁）。
+    BadPack(String),
+    /// 包里的内容出现在随机池里 ⇒ 违反 §3.11.5"付费包内容不进随机池"
+    /// 与用户 2026-11-05 第 1 问的拍板（池全免费、付费包卖池外内容）。
+    PackItemInGachaPool(Vec<String>),
     /// 导出文件的格式问题（schema 版本、hex、seq 连续性）。
     Export(super::export::ExportError),
 }
@@ -119,6 +124,13 @@ impl std::fmt::Display for StoreError {
                 f,
                 "库里没有 banner {id:?}（先跑一次 opet pull 或 opet catalog validate）"
             ),
+            BadPack(why) => write!(f, "内容包被拒绝：{why}"),
+            PackItemInGachaPool(ids) => write!(
+                f,
+                "包内容 {ids:?}（共 {} 个）同时在随机抽取池里 ⇒ 违反 §3.11.5：\
+                 付费/装包买的是确定性内容，随机池只装免费内容",
+                ids.len()
+            ),
             Export(e) => write!(f, "{e}"),
         }
     }
@@ -153,6 +165,25 @@ impl From<petcore::gacha::AuditError> for StoreError {
 impl From<super::export::ExportError> for StoreError {
     fn from(e: super::export::ExportError) -> Self {
         Self::Export(e)
+    }
+}
+
+/// [`Store::grant_pack_items`] 的回执：**装这个包得到了什么、又有什么早就在了**。
+///
+/// 两项都是 `"kind/id"`（`"accessory/hat_red"`）而不是 `(ItemKind, String)`：`ItemKind` 没有 `Ord`
+/// （它只是两个变体，排序语义没人规定过），而这份回执要**确定性排序**后原样打给用户
+/// （硬约束 #8 的同族：同输入同输出，diff 得出)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackGrant {
+    /// 本次真的写进库存的项。
+    pub added: Vec<String>,
+    /// 库里已有同 `(kind, item_id)` ⇒ 一行都没写（`count` 也不 +1，见 `grant_pack_items` 第 1 条）。
+    pub already: Vec<String>,
+}
+
+impl PackGrant {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.already.is_empty()
     }
 }
 
@@ -481,6 +512,194 @@ impl Store {
             params![currency.as_str(), i64_sql(amount)],
         )?;
         self.shards(currency)
+    }
+
+    /// 装包 ⇒ 写库存。**判据 J4（"买到的每一件，不用抽也能穿"）唯一的数据落点**（FLOW §3.1
+    /// 的第二条所有权路径：`obtained_from = 'pack:<包 id>'`）。
+    ///
+    /// 与 [`Self::redeem_ssr`] 同族：不掷骰 ⇒ 不进 `gacha_pull`、不进审计链。与抽取**刻意**
+    /// 不同的三条，每条都对着一个具体的被利用者：
+    ///
+    /// 1. **`count` 不随重复装包累加，`duplicates` 永远不写**。`duplicates` 是碎片的来源账
+    ///    （§3.4），而碎片能自选 SSR ⇒ 从包这条路若能 +1，"反复装卸同一个包"就是刷碎片的机器。
+    /// 2. **整包一个事务**（要么全写要么一行都不写）。库存里躺着一件"没落盘的包项"比装失败更糟：
+    ///    换装页会把它列出来，而它的像素不存在 —— 那正是 §9.2 第 20 条那个空列表的反面形状。
+    /// 3. **包内容不许出现在随机池里**（[`StoreError::PackItemInGachaPool`]）。同一件东西有两条
+    ///    获得路径之后，"综合概率"就再也说不出它是几分之一 —— 这条是 §3.11.5 与用户
+    ///    2026-11-05 第 1 问（"池全免费 + 付费包卖池外内容"）在写入点上的那一道。
+    ///
+    /// 所有检查都在写之前 ⇒ 被拒绝时库里一个字都不会多（同 `pack.py` 那条"跨档写会被硬拒绝
+    /// 且一个字都不写"，方法论 = 拒绝要放在最便宜的一侧）。
+    pub fn grant_pack_items(
+        &mut self,
+        pack_id: &str,
+        catalog: &Catalog,
+        items: &[(ItemKind, String)],
+    ) -> Result<PackGrant, StoreError> {
+        let bad = |why: String| StoreError::BadPack(format!("包 {pack_id}: {why}"));
+        if pack_id.is_empty() {
+            return Err(bad("包 id 为空".into()));
+        }
+        // 包 id 不只是账上的字符串：安装器拿它当目录名与 `.installed_by/<id>` 文件名用，
+        // 所以这一层就按"能不能当相对路径"判它（同一条规则只在 `zip::check_safe_name` 里有一份）。
+        if let Err(e) = petcore::assets::zip::check_safe_name(pack_id) {
+            return Err(bad(format!("包 id 不能当目录名用：{}", e.message())));
+        }
+        if items.is_empty() {
+            return Err(bad("包里一件都没有 ⇒ 装它做什么".into()));
+        }
+
+        // 去重 + 抓"同一个 id 挂两种 kind"。那是打包侧的错误，不是我们能替打包的人决定的事
+        // （`inventory` 主键是 `(kind, item_id)`，两条都写 = 同一件东西既在库里又在库外）。
+        let mut kinds: std::collections::BTreeMap<&str, ItemKind> = Default::default();
+        for (kind, id) in items {
+            if let Some(prev) = kinds.insert(id.as_str(), *kind)
+                && prev != *kind
+            {
+                return Err(bad(format!(
+                    "{id} 同时被声明成 {} 与 {} ⇒ 所有权模糊",
+                    prev.as_str(),
+                    kind.as_str()
+                )));
+            }
+        }
+
+        let mut in_pool: Vec<String> = Vec::new();
+        for (id, kind) in &kinds {
+            if let Err(e) = petcore::assets::zip::check_safe_name(id) {
+                return Err(bad(format!("条目名 {id} 不能当目录名用：{}", e.message())));
+            }
+            if catalog.find(id).is_some() {
+                in_pool.push(format!("{}/{id}", kind.as_str()));
+            }
+        }
+        if !in_pool.is_empty() {
+            in_pool.sort();
+            return Err(StoreError::PackItemInGachaPool(in_pool));
+        }
+
+        let now = clock::now_secs();
+        let tx = self.conn.transaction()?;
+        let mut grant = PackGrant::default();
+        for (id, kind) in &kinds {
+            let key = format!("{}/{id}", kind.as_str());
+            let have: Option<i64> = tx
+                .query_row(
+                    "SELECT count FROM inventory WHERE kind = ?1 AND item_id = ?2",
+                    params![kind.as_str(), id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            if have.is_some() {
+                grant.already.push(key);
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO inventory(kind, item_id, count, duplicates, obtained_at, obtained_from)
+                 VALUES (?1, ?2, 1, 0, ?3, ?4)",
+                params![kind.as_str(), id, now, format!("pack:{pack_id}")],
+            )?;
+            grant.added.push(key);
+        }
+        tx.commit()?;
+        grant.added.sort();
+        grant.already.sort();
+        Ok(grant)
+    }
+
+    /// 某个包写进库存的那些项（`uninstall` 与"这个包给了我什么"都要它）。
+    /// 按 `obtained_from` 精确匹配 ⇒ **抽取得来的同 id 不会被误删**（两条所有权路径互不相认，
+    /// 正是 §3.1 的分工）。
+    pub fn pack_items(&self, pack_id: &str) -> Result<Vec<(ItemKind, String)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT kind, item_id FROM inventory WHERE obtained_from = ?1 ORDER BY kind, item_id",
+        )?;
+        let want = format!("pack:{pack_id}");
+        let rows = stmt.query_map(params![want], |r| {
+            let kind = r.get::<_, String>(0)?;
+            let id = r.get::<_, String>(1)?;
+            Ok((kind, id))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (raw_kind, id) = row?;
+            let kind = ItemKind::parse(&raw_kind).ok_or(StoreError::BadEnum {
+                column: "inventory.kind",
+                value: raw_kind,
+            })?;
+            out.push((kind, id));
+        }
+        Ok(out)
+    }
+
+    /// 卸包 ⇒ 删掉**这个包写进库存的**那些行。文件由安装器按 `.installed_by/<id>` 清单删，
+    /// 这里只动账（撤销 ≠ 删文件，§3.4 退款语义；重新装包即刻恢复）。
+    pub fn revoke_pack_items(&mut self, pack_id: &str) -> Result<usize, StoreError> {
+        let n = self.conn.execute(
+            "DELETE FROM inventory WHERE obtained_from = ?1",
+            params![format!("pack:{pack_id}")],
+        )?;
+        Ok(n)
+    }
+
+    // ---- 穿着（`equipped`，FLOW §5 那张表；P3 起它有读有写）----
+
+    /// 穿上 = 把这一格写成"这一件"。PK `(profile_id, slot)` ⇒ **一个槽位只留一件**，
+    /// 换帽子是覆盖而不是加一行（加行的话"上次穿的"就有两个答案，而启动只该穿一件）。
+    ///
+    /// ⚠️ 这里**不查库存**，是刻意的：拥有那道立在写它的地方没有意义 —— 写这一格的调用方
+    /// （换装页）手里已经过了 `owned()` 与五道磁盘门禁，而 FLOW §5 要的正是"手工往这张表里
+    /// 塞一行未拥有的 id ⇒ **启动时必须报一句并把这件出局**"。那两句要同时看到磁盘与库存，
+    /// 所以守卫在**读侧**（`overlay-wayland` 的恢复那一道），不在这条 SQL 上。
+    /// 把守卫放这条写口上，得到的只是"UI 能过而这里过不去"的第二套答案。
+    pub fn equip(&mut self, profile_id: &str, slot: &str, item_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO equipped(profile_id, slot, item_id) VALUES(?1, ?2, ?3)
+             ON CONFLICT(profile_id, slot) DO UPDATE SET item_id = excluded.item_id",
+            params![profile_id, slot, item_id],
+        )?;
+        Ok(())
+    }
+
+    /// 脱下 = 只删那一格。返回删掉的行数：**0 = 本来就没穿**，调用方决定要不要出声
+    /// （UI 那一侧"脱下而本来没穿"是一行日志，不是错误）。
+    pub fn unequip(&mut self, profile_id: &str, slot: &str) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "DELETE FROM equipped WHERE profile_id = ?1 AND slot = ?2",
+            params![profile_id, slot],
+        )?)
+    }
+
+    /// 启动恢复那一读 = `(slot, item_id)`，**`ORDER BY slot, item_id`**。
+    ///
+    /// 那个序是硬要求，不是排版：内存档 M1 只容一件，多于一行时恢复取**第一件**、其余只报告。
+    /// 而没有确定序的"第一行"= 同一台机器两次启动可能穿两顶不同的帽子（硬约束 8 禁的正是
+    /// 这种"顺序由文件系统/查询计划给"的不确定性）。
+    pub fn equipped(&self, profile_id: &str) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT slot, item_id FROM equipped WHERE profile_id = ?1 ORDER BY slot, item_id",
+        )?;
+        let rows = stmt.query_map(params![profile_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<(String, String)>, _>>()?)
+    }
+
+    /// 这个 profile 某一格穿的是哪一件（`None` = 没穿）。恢复与"读回来看写没写进去"都用它，
+    /// 单列的读不必先拿整张表再筛。
+    pub fn equipped_slot(
+        &self,
+        profile_id: &str,
+        slot: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT item_id FROM equipped WHERE profile_id = ?1 AND slot = ?2",
+                params![profile_id, slot],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
     }
 
     // ---- 账本 ----

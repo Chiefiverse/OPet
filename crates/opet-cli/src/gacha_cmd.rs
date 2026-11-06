@@ -34,8 +34,13 @@ M3 可用（headless，不碰显示服务器）：
   opet catalog rates [--out crates/petcore/assets/gacha/rates.json] [--basis N] [--catalog FILE]
       从引擎生成概率公示（含逐件概率）。不写 --out 就打 stdout。
       公示是推导产物，不许手改：改了参数没重跑，gacha-sim 与单测两头都会红
-  opet catalog validate [--catalog FILE] [--strict-assets]
-      结构校验目录；--strict-assets 要求每个 manifest_path 指向的文件真的存在
+  opet catalog validate [--catalog FILE] [--strict-assets] [--inv] [--assets-root DIR]
+      结构校验目录；--strict-assets 要求每个 manifest_path 指向的文件真的存在（旧口径：查那串路径）
+      --inv = INV 门禁（FLOW §3）：池内每一件都要在**加载器真的会读的源**上解析得出
+      （清单可解析 + 清单声明的 sheet 在）。缺的逐件点名 id 与要装的包名。
+      ⚠ **一台从没装过包的机器上这条必然大面积红 —— 那是它在正常工作，别去'修绿'它**；
+      红 = 现在开抽就可能抽到一件加载不出来的东西。--assets-root 额外把开发态 assets/ 当内置源查。
+      末行 GATE inv pool=N ok=N missing=N result=PASS/FAIL，判红即非零退出
   opet pull --count N [--banner ID] [--db PATH] [--dry-run] [--currency NAME] [--seed S] [--allow-reseed]
       抽取并落账本。--dry-run 走内存库：不建库、不写盘、不扣币。
       --currency 一律拒绝（红线 1：随机数不许被真钱驱动），拒绝即 SCHEMA_ERROR。
@@ -119,6 +124,10 @@ struct Flags {
     expect_head: Option<String>,
     dry_run: bool,
     strict_assets: bool,
+    /// INV 门禁（FLOW §3 推论 2）：`catalog validate --inv`。判定本体在 `petstore::pack::inv_check`。
+    inv: bool,
+    /// 开发态那份 `assets/`（内置侧源）。**只跟 `--inv` 一起用**，单独给就拒绝（假开关）。
+    assets_root: Option<PathBuf>,
     allow_default: bool,
     allow_reseed: bool,
     verbose: bool,
@@ -146,6 +155,8 @@ impl Default for Flags {
             expect_head: None,
             dry_run: false,
             strict_assets: false,
+            inv: false,
+            assets_root: None,
             allow_default: false,
             allow_reseed: false,
             verbose: false,
@@ -184,6 +195,10 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "--currency" => f.currency = Some(word(args, &mut i, "--currency")?),
             "--dry-run" => f.dry_run = true,
             "--strict-assets" => f.strict_assets = true,
+            "--inv" => f.inv = true,
+            "--assets-root" => {
+                f.assets_root = Some(PathBuf::from(word(args, &mut i, "--assets-root")?))
+            }
             "--allow-default-archive" => f.allow_default = true,
             "--allow-reseed" => f.allow_reseed = true,
             "--verbose" => f.verbose = true,
@@ -194,7 +209,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
     Ok(f)
 }
 
-fn load_catalog(explicit: Option<&Path>) -> Result<Catalog, String> {
+/// M3 与 M4 的包命令共用这一只（`opet pack install/verify` 的池内冲突判定要同一份目录，
+/// 否则"随机池"就有了两个定义）。
+pub(crate) fn load_catalog(explicit: Option<&Path>) -> Result<Catalog, String> {
     match explicit {
         None => Catalog::default_v1().map_err(|e| e.to_string()),
         Some(p) => {
@@ -468,6 +485,16 @@ fn catalog_rates(args: &[String]) -> Cmd {
 
 fn catalog_validate(args: &[String]) -> Cmd {
     let f = parse_flags(args).map_err(|e| fail(&e))?;
+    // `--assets-root` 只对 `--inv` 有意义 ⇒ 单独给就拒绝，不留"写了却没人读"的开关（假开关那一族）。
+    let root_arg: Option<&Path> = match (&f.assets_root, f.inv) {
+        (Some(_), false) => {
+            return Err(fail(
+                "--assets-root 只在 --inv 下有用（它给的是那条内置源）",
+            ));
+        }
+        (_, true) => f.assets_root.as_deref(),
+        (None, false) => None,
+    };
     let catalog = load_catalog(f.catalog.as_deref()).map_err(|e| fail(&e))?;
     println!(
         "catalog validate: id={} banner={} items={} pets={} accessories={}",
@@ -501,6 +528,32 @@ fn catalog_validate(args: &[String]) -> Cmd {
         }
         if missing > 0 {
             return Err(fail(&format!("{missing} 件物品缺可用资产")));
+        }
+    }
+    // ⚠ 这条与上面 `--strict-assets` **量的不是同一件事**：strict 查的是 catalog 里那串
+    // `manifest_path` 字符串（历史口径，配件名还是旧的 `item.json`），`--inv` 查的是加载器
+    // 真的会去读的那条源（内置 `assets/` + 装机后的资产根），并且逐件解析清单、按清单说的
+    // 名字找 sheet。两者不一致时以 `--inv` 为准（FLOW §3）。
+    if f.inv {
+        let report =
+            petstore::pack::inv_check(&petstore::paths::Env::from_process(), &catalog, root_arg);
+        println!("catalog validate --inv sources={}", report.sources.len());
+        for s in &report.sources {
+            println!("  查 {s}");
+        }
+        for c in report.items.iter().filter(|c| !c.is_ok()) {
+            for p in &c.problems {
+                println!("  MISSING {}/{} ⇒ {p}", c.kind.as_str(), c.id);
+            }
+        }
+        println!(
+            "GATE inv {} sources={} result={}",
+            report.summary(),
+            report.sources.len(),
+            if report.ok() { "PASS" } else { "FAIL" },
+        );
+        if !report.ok() {
+            return Err(ExitCode::FAILURE);
         }
     }
     println!("catalog validate: OK");
