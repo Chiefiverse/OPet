@@ -8,7 +8,7 @@ use crate::assets::scheduler::{Scheduler, SpriteFrame};
 use crate::behavior::config::BehaviorConfig;
 use crate::behavior::machine::Command;
 use crate::behavior::state::{State, Transition};
-use crate::geom::{Rect, Vec2};
+use crate::geom::{Facing, Rect, Vec2};
 use crate::intent::{InputRegion, PresentationIntent, SURFACE_MARGIN};
 use crate::physics::Body;
 use crate::world::{Support, World, WorldEvent};
@@ -91,8 +91,7 @@ impl<'m> Sim<'m> {
         body.support = Some(Support::Ground);
         let machine = crate::behavior::BehaviorMachine::new(cfg, seed);
         let facing = machine.facing();
-        let mut scheduler = Scheduler::new(manifest, facing);
-        scheduler.set_fps_caps(30.0, 5.0);
+        let scheduler = Self::scheduler_for(manifest, facing);
         Sim {
             world,
             body,
@@ -104,6 +103,40 @@ impl<'m> Sim<'m> {
             last_sprite: None,
             stats: SimStats::default(),
         }
+    }
+
+    /// 帧调度器的**唯一**构造处（fps 上限那两个数只在这里出现一次）。
+    fn scheduler_for(manifest: &'m Manifest, facing: Facing) -> Scheduler<'m> {
+        let mut scheduler = Scheduler::new(manifest, facing);
+        scheduler.set_fps_caps(30.0, 5.0);
+        scheduler
+    }
+
+    /// 换成本体清单，**其余一切原样**：`world` / `body`（位置、速度、支撑面）/ `machine`
+    /// （含 rng 计数器与当前状态）/ `last_pos` / `last_sprite` / `stats` / `pending` 都不动。
+    ///
+    /// 只有两样东西是清单的函数，所以只有这两样重建：
+    /// - [`Scheduler`] —— 行表、fps、一次性动画进度全绑在旧清单的行号上，改指针不改对象就是
+    ///   "新清单按旧行表寻址"（那正好是指针陷阱第 2 条说的那个 `grid` 契约）；
+    /// - [`Body::half_width`] —— 它就是宠物体型（`grid.w / 2`）。
+    ///
+    /// ⚠️ `last_pos` **故意不动**，而这条决定整个方法的形状。替代做法（在调用方 `Sim::new`
+    /// 一份新的再把字段搬过去）会把 `last_pos` 留在舞台中心，于是下一格 [`Sim::step`] 拿
+    /// `body.pos` 与**舞台中心**作差 ⇒ `moved` 说一次谎，而 `needs_redraw` 与"这一格算移动还是
+    /// 算提交"的分类都读它；`stats` 同时归零、`pending` 整排指令丢掉。那些都不是"换一只宠物"
+    /// 该做的事。
+    ///
+    /// 换完立刻按新的半宽重新裁剪一次 x：不变量立在**写入点**，不等下一次积分去兜。
+    ///
+    /// 这个方法**不做任何校验**，也**不返回 `Result`**：清单是否自洽、格子档是否对得上，判据都
+    /// 在调用方（overlay 侧的档门禁与五道配件门禁），因为"对不上"在那一侧才有一张能点的脸。
+    /// 内核这里赌的是"调用方已经判过"，而它唯一的防线是下面那条等格续跑的重放测试。
+    pub fn swap_manifest(&mut self, m: &'m Manifest) {
+        self.manifest = m;
+        let facing = self.machine.facing();
+        self.scheduler = Self::scheduler_for(m, facing);
+        self.body.half_width = m.grid.w as f32 / 2.0;
+        self.body.pos.x = self.world.clamp_x(self.body.pos.x, self.body.half_width);
     }
 
     pub fn send(&mut self, cmd: Command) {

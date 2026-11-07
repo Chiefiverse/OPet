@@ -129,6 +129,17 @@ pub enum PanelItem {
     ///
     /// ⚠️ **下标进不了 [`content_sig`]**（那里只混判别量），见函数体里那条条件式纪律。
     Wear(usize),
+    /// 收藏册里**宠物**那一行 ⇒ 点它 = 当场换成那只（[`app`](crate::app) 的 `swap_body`，P5）。
+    ///
+    /// 载荷是 **[`app`](crate::app) 的 `bodies` 下标**，与 [`Self::Wear`] 的 `candidates` 下标
+    /// 是**两套下标空间**，故意不合成一个 `usize`：合并后"这个数字指哪张表"就只剩旁边一段注释在
+    /// 说，而注释不是判据（`the_album_routes_pets_to_the_body_index_space` 那条门禁的全文理由）。
+    /// 分开写还有一层：**没决定过的那一臂会编译不过** —— `on_panel_press` 的 `match` 少一支就是
+    /// 红的，而不是一个"点上去什么都不发生"的静默空洞（D14 那条假按钮形状的源头）。
+    ///
+    /// ⚠️ 与 [`Self::Wear`] 同一条纪律：**下标不进签名**（[`content_sig`] 只混判别量 9）。
+    /// 当前是哪只本体不上屏 —— 它就是宠物自己那几个像素。
+    Body(usize),
     /// 页码控件 ⇒ 这一格**的字**就是页码（`+N 更多 2/5`），点它 = 本 tab 翻下一页、末页回卷。
     ///
     /// 为什么翻页要占一个**行**而不是别的：收藏册逐件后必然超过一屏，而这块面的行数被
@@ -513,6 +524,12 @@ pub fn content_sig(kind: PanelKind, lang: Lang, error: &str, rows: &[PanelRow]) 
             // 拍板的是"选中了什么不上屏、只进日志"，所以今天这一条是**故意的**。
             PanelItem::Wear(_) => 7,
             PanelItem::More => 8,
+            // 同一条纪律的第二次应用（P5）：**只混判别量，不混 `bodies` 的下标**。本体这一格
+            // 比配件那一格更极端 —— 它连"当前选中是哪只"这个概念都不在上屏（当前是哪只就是宠物
+            // 自己那几个像素，再打一行字就是第二个事实源），所以混下标**只会**造出"签名变而
+            // 像素不变"的白投帧。以后要让"当前是哪只"上屏，正解是把它放进 `r.text`（文本本来就
+            // 进签名，下面那三行），绝不是把它放进这个判别量。
+            PanelItem::Body(_) => 9,
         });
         for b in r.text.as_bytes() {
             mix(*b);
@@ -778,6 +795,44 @@ mod tests {
             sig(&row(PanelItem::More)),
             sig(&row(PanelItem::Close)),
             "身份没进签名 ⇒ 页码控件和「关闭」在屏上分不开"
+        );
+    }
+
+    /// 同上一条的**第二个下标空间**（P5 的 `Body`），四条读数一条不能少。
+    ///
+    /// 抄 [`the_wear_index_stays_out_of_the_signature_while_the_identity_does_not`] 的写法，因为
+    /// 那一条只举了 `Wear` 一例，而 `Body` 是后来加的那一格 —— 变异 M7（把 `Body` 的下标混进
+    /// 判别量）**实测让上面那条照旧全绿**：两格是不同的判别量，只测一格等于给另一格留了空档。
+    /// 这一族的判据是"**每一个带下标的臂都要有自己的读数**"，不是"有一条签名测试就覆盖了签名"。
+    #[test]
+    fn the_body_index_stays_out_of_the_signature_while_the_identity_does_not() {
+        let kind = PanelKind::Collection {
+            tab: CollectionTab::Owned,
+            page: 0,
+        };
+        let row = |item: PanelItem| {
+            Vec::from([PanelRow {
+                item,
+                text: "N cat".to_string(),
+            }])
+        };
+        let sig = |rows: &[PanelRow]| content_sig(kind, Lang::Zh, "", rows);
+        assert_eq!(
+            sig(&row(PanelItem::Body(1))),
+            sig(&row(PanelItem::Body(2))),
+            "本体下标进了签名 ⇒ 画师不读它，却每 tick 重投逐位相同的 buffer\
+             （「静止恒 1 提交」是这块面唯一的省电判据）"
+        );
+        assert_ne!(
+            sig(&row(PanelItem::Body(1))),
+            sig(&row(PanelItem::Info)),
+            "本体身份没进签名 ⇒ 可点的宠物行与只读行在屏上分不开"
+        );
+        assert_ne!(
+            sig(&row(PanelItem::Body(1))),
+            sig(&row(PanelItem::Wear(1))),
+            "两个下标空间共用一个判别量 ⇒ 「这个数字指哪张表」又只剩注释在说，而同一条数字\
+             在两套表里是两件不同的事"
         );
     }
 

@@ -106,16 +106,7 @@ impl Atlas {
             });
         }
 
-        // RGBA(直通) → BGRA(预乘)，**原地**做：每个 4 字节只依赖它自己那 4 个字节 ⇒
-        // 不需要第二份缓冲。（原先另开一个 `Vec::with_capacity(need)` 边读边写，峰值
-        // 其实是 2×11.25 MiB，而注释写着"不留第二份"—— 注释是假的。）
-        for px in rgba.chunks_exact_mut(4) {
-            let [b, g, r, a] = premultiplied_bgra(px[0], px[1], px[2], px[3]);
-            px[0] = b;
-            px[1] = g;
-            px[2] = r;
-            px[3] = a;
-        }
+        premultiply_in_place(&mut rgba);
 
         Ok(Atlas {
             pixels: rgba,
@@ -128,6 +119,68 @@ impl Atlas {
             decode_ms: t0.elapsed().as_millis(),
             encoded_bytes,
         })
+    }
+
+    /// **原地**换一张 sheet（P5 换本体唯一的那次解码），峰值 = **一份** sheet。
+    ///
+    /// 三条按便宜排序的自检全部排在**第一笔写之前**：编码尺寸、有无 alpha、
+    /// 解码输出长度 == 现有缓冲长度。所以"格子档不同 / 不是 WebP / 没有 alpha"这三类
+    /// 配错留下的是**原来那只完整的宠物**，而不是半张新图。
+    ///
+    /// ⚠️ 残余风险要明写：`read_image` 本身在**头已过检但文件被截断**时仍可能在写入途中
+    /// 失败，那时 `self.pixels` 里是残缺的一张。不为此先解到临时缓冲，因为那正是
+    /// load-then-swap 的形状 = **峰值两只本体**（≈147 MB），而 150 MiB 那道门禁**抓不到它**
+    /// —— 唯一防线是这段代码本身加上验收量一次 `VmHWM`。同理 `pixels` 是私有字段：
+    /// 外面**没有**"先拿到新的一份再换掉"这条路可走。
+    ///
+    /// `cols/rows/cell_w/cell_h` 不被改动 ⇒ 它们仍是**当前清单**的函数（跨档在发现那一步就
+    /// 出局了，见 `App::check_body`）；`width/height/decode_ms/encoded_bytes` 是新 sheet 的读数。
+    pub fn reload(&mut self, path: &str) -> Result<(), AtlasError> {
+        let t0 = Instant::now();
+        let mut buf = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| AtlasError::Io(format!("{path}: {e}")))?
+            .read_to_end(&mut buf)
+            .map_err(|e| AtlasError::Io(format!("{path}: {e}")))?;
+        let encoded_bytes = buf.len();
+
+        let mut decoder = WebPDecoder::new(std::io::Cursor::new(&buf))
+            .map_err(|e| AtlasError::Decode(e.to_string()))?;
+        let (width, height) = decoder.dimensions();
+        let expected = (self.cols * self.cell_w, self.rows * self.cell_h);
+        if (width, height) != expected {
+            return Err(AtlasError::Geometry {
+                expected,
+                got: (width, height),
+            });
+        }
+        if !decoder.has_alpha() {
+            return Err(AtlasError::Decode(format!(
+                "{path} 没有 alpha 通道，无法做点击穿透"
+            )));
+        }
+        let need = decoder
+            .output_buffer_size()
+            .ok_or_else(|| AtlasError::Decode("尺寸超出 usize".into()))?;
+        if need != self.pixels.len() {
+            // 上面 `(width,height) == cols*cell_w × rows*cell_h` 已经过了还走到这里，
+            // 说明这个 `Atlas` 的格参数和它自己的缓冲长度不一致 —— 那是构造错误，不是配错档。
+            return Err(AtlasError::Decode(format!(
+                "{path} 解码要 {need} 字节，本缓冲 {} 字节",
+                self.pixels.len()
+            )));
+        }
+
+        decoder
+            .read_image(&mut self.pixels)
+            .map_err(|e| AtlasError::Decode(e.to_string()))?;
+        premultiply_in_place(&mut self.pixels);
+
+        self.width = width;
+        self.height = height;
+        self.decode_ms = t0.elapsed().as_millis();
+        self.encoded_bytes = encoded_bytes;
+        Ok(())
     }
 
     /// 单格左上角的字节偏移（格内第 0 行）；越界返回 `None`。
@@ -264,6 +317,22 @@ impl Atlas {
 pub fn premultiplied_bgra(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     let mul = |c: u8| (c as u32 * a as u32).div_ceil(256) as u8;
     [mul(b), mul(g), mul(r), a]
+}
+
+/// 直通 RGBA → 预乘 BGRA，**原地**做：每个 4 字节只依赖它自己那 4 个字节 ⇒ 不留第二份缓冲。
+///
+/// 这条转换只有这一份（[`Atlas::load`] 与 [`Atlas::reload`] 共用）。它值得抽出来而不是两处
+/// 各写一遍循环，是因为"原先另开一个 `Vec::with_capacity` 边读边写、峰值其实是 2 份、而注释
+/// 写着不留第二份"那次修正只能存在一处：复制一份循环 = 给下一次"顺手改成新分配"留一个没人
+/// 复查的落点，而它的症状不是崩，是 RSS 静默翻倍。
+fn premultiply_in_place(px: &mut [u8]) {
+    for px in px.chunks_exact_mut(4) {
+        let [b, g, r, a] = premultiplied_bgra(px[0], px[1], px[2], px[3]);
+        px[0] = b;
+        px[1] = g;
+        px[2] = r;
+        px[3] = a;
+    }
 }
 
 /// 预乘 BGRA 的 **source-over**：`out = src + dst × (1 − src.a)`，alpha 同式。
@@ -593,5 +662,120 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 与 [`synthetic`] **同尺寸、内容不同**的另一张 sheet（`reload` 正向那半的输入）。
+    ///
+    /// 每格故意填**半透明**（`a = 128`）而不是不透明：那样 `premultiply_in_place` 在 reload
+    /// 路径上才真的被测到（不透明时 `mul(c) == c`，忘了预乘也读不出来）。
+    fn synthetic_other() -> Vec<u8> {
+        let (w, h) = (8u32, 8u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        let fill = |rgba: &mut [u8], r: u32, c: u32, col: [u8; 4]| {
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = (((r * 4 + y) * w + c * 4 + x) * 4) as usize;
+                    rgba[i..i + 4].copy_from_slice(&col);
+                }
+            }
+        };
+        fill(&mut rgba, 0, 0, [255, 0, 0, 128]);
+        fill(&mut rgba, 0, 1, [0, 255, 0, 128]);
+        fill(&mut rgba, 1, 0, [0, 0, 255, 128]);
+        fill(&mut rgba, 1, 1, [1, 2, 3, 128]);
+        rgba
+    }
+
+    /// `Atlas::reload` 的两半：**坏件留下原来那只完整的宠物**，**好件真的换掉像素且原地**。
+    ///
+    /// 这条是 P5 那条内存风险（reload 退化成 load-then-swap ⇒ 峰值两只本体 ≈147 MB，而
+    /// 150 MiB 那道门禁**抓不到**）在 headless 侧唯一的连接点。它读的是**行为**：
+    /// `pixels.len()` 在成功 reload 前后逐字节相同 ⇒ 没有第二次分配、没有双份缓冲；
+    /// 三类失败各自把 `pixels` 与四个元数据读数钉回原样 ⇒ 不可回头的半换状态不可达。
+    /// 重量本身（`VmHWM`）另由验收量一次，两半都要有。
+    #[test]
+    fn reload_keeps_the_old_pixels_when_the_new_sheet_is_broken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        let write = |name: &str, bytes: &[u8]| {
+            std::fs::write(dir.path().join(name), bytes).expect("写临时 sheet")
+        };
+        write(
+            "good.webp",
+            &encode_lossless_rgba(&synthetic(), 8, 8).expect("编码"),
+        );
+        write(
+            "other.webp",
+            &encode_lossless_rgba(&synthetic_other(), 8, 8).expect("编码"),
+        );
+        // 档不同：16×8 = 4 列 × 2 行 @4px 的 sheet 喂给一张 2×2 图集（跨档本体就是这个形状）。
+        let wide = vec![200u8; (16 * 8 * 4) as usize];
+        write(
+            "wrong_grid.webp",
+            &encode_lossless_rgba(&wide, 16, 8).expect("编码"),
+        );
+        write("not_webp.webp", b"not a webp at all: no RIFF header here");
+
+        let mut atlas = Atlas::load(&s("good.webp"), 2, 2, 4, 4).expect("起点图集");
+        let pixels_before = atlas.pixels.clone();
+        let meta_before = (atlas.width, atlas.height, atlas.encoded_bytes);
+        assert_eq!(
+            pixels_before.len(),
+            8 * 8 * 4,
+            "fixture 前提：@合成档的缓冲长度"
+        );
+
+        // 三类失败各有各的类型，不许混成一谈（"文件不在"和"档不同"在 stderr 上是两句话）。
+        for (name, want, why) in [
+            ("wrong_grid.webp", "Geometry", "格子档不同"),
+            ("not_webp.webp", "Decode", "不是 WebP"),
+            ("missing.webp", "Io", "文件不在"),
+        ] {
+            let path = s(name);
+            let err = atlas.reload(&path).expect_err("坏件必须失败关闭");
+            let got = match err {
+                AtlasError::Io(_) => "Io",
+                AtlasError::Decode(_) => "Decode",
+                AtlasError::Geometry { .. } => "Geometry",
+                AtlasError::Bounds { .. } => "Bounds",
+            };
+            assert_eq!(got, want, "{why} 必须报 {want}");
+            assert_eq!(
+                atlas.pixels, pixels_before,
+                "reload 失败之后像素必须还是原来那一只（{why}）"
+            );
+            assert_eq!(
+                (atlas.width, atlas.height, atlas.encoded_bytes),
+                meta_before,
+                "reload 失败之后元数据不许先走一步（{why}）"
+            );
+        }
+
+        // 正向那半：同档的另一张必须真的改变像素，而且**原地**（长度不变 = 没有第二份）。
+        atlas
+            .reload(&s("other.webp"))
+            .expect("同档的另一张必须成功");
+        assert_ne!(
+            atlas.pixels, pixels_before,
+            "reload 成功却没换像素 = 空操作"
+        );
+        assert_eq!(
+            atlas.pixels.len(),
+            pixels_before.len(),
+            "缓冲长度必须不变：变长就意味着 reload 被写成了 load-then-swap（峰值两只本体）"
+        );
+        assert_eq!(
+            (atlas.width, atlas.height),
+            (8, 8),
+            "尺寸字段跟着新 sheet 走"
+        );
+        assert!(atlas.encoded_bytes > 0, "编码字节数必须换成新 sheet 的读数");
+        // 逐值核一格：RGBA [255,0,0,128] → 预乘 BGRA = [0, 0, div_ceil(255·128,256)=128, 128]。
+        // 这条同时证明 reload 走过 `premultiply_in_place`（忘了走它，红的那格会是 [0,0,255,128]）。
+        assert_eq!(
+            &atlas.pixels[..4],
+            &[0, 0, 128, 128],
+            "reload 之后第 0 格必须是**预乘**的 BGRA"
+        );
     }
 }

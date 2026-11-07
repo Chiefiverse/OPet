@@ -46,6 +46,21 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
                      不打标的放行就是假门禁（`--cell` 假开关那一族）。
                      不给 `--db` 时这条**不生效也不需要**：内存库 ⇒ 库存恒空 ⇒ 那是演示态，
                      本来就放行，由标题行右端已有的「演示」标承担（同 DRYRUN 那一族）。
+
+本体（换宠物）：库位置同样**只由环境决定**，命令行没有第二个入口（`--accessory` 已被删过
+  的那条先例）：$OPET_PETS → $XDG_DATA_HOME/opet/pets（仅当它是绝对路径）
+  → $HOME/.local/share/opet/pets。一只本体 = 一个子目录里的 `pet.json` + `sheet.webp` +
+  `polygon.json`（生产者 = `tools/pack.py`）。收藏册里每一只宠物一行，点它**当场换成那只**；
+  格档与当前本体不同的那一只在**启动扫盘那一步**就出局（运行时不动 surface 尺寸，跨档只能
+  重启），出局原因逐只点名进 stderr ⇒ 那一行在收藏册里是只读行，不是「点了被拒」。
+  ⚠️ 换本体**不动 `--manifest`**：那条仍是硬要求，它现在的意思是「库里没有 body 行时用什么」。
+
+  --allow-unowned-pets
+                     开发态豁免：**没抽到的宠物也点得动、也能换**。默认不开（与上面那条同一个
+                     拍板）。**故意与 `--allow-unowned-accessories` 分成两条**：那条的屏上记号是
+                     帽子页标题的 `*`，而帽子页的列表里从头就没有宠物 ⇒ 拿一条开关管两类，就会
+                     出现「标打了而没放行」或「放行了而没有标」（本项目登记过的同一族）。
+                     不给 `--db` 时这条同样**不生效也不需要**（演示态一律放行）。
 ";
 
 #[derive(Debug, Default, PartialEq)]
@@ -67,6 +82,9 @@ pub struct Args {
     pub motion: Option<String>,
     /// 开发态豁免：未拥有的配件也进换装页。`--db` 没给时不生效（演示态本来就放行）。
     pub allow_unowned_accessories: bool,
+    /// 开发态豁免：未拥有的宠物也能换。**与上面那条分开**是拍板④：那条的屏上记号（帽子页的
+    /// `*`）作用域里没有宠物，合并就会"标打了而没放行"。`--db` 没给时同样不生效。
+    pub allow_unowned_pets: bool,
 }
 
 impl Args {
@@ -127,6 +145,7 @@ impl Args {
             lang: self.lang.clone(),
             motion: self.motion.clone(),
             allow_unowned_accessories: self.allow_unowned_accessories,
+            allow_unowned_pets: self.allow_unowned_pets,
         })
     }
 }
@@ -179,6 +198,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--test-rect" => a.test_rect = true,
             "--no-cursor" => a.no_cursor = true,
             "--allow-unowned-accessories" => a.allow_unowned_accessories = true,
+            "--allow-unowned-pets" => a.allow_unowned_pets = true,
             other => return Err(format!("未知参数: {other}")),
         }
         i += 1;
@@ -340,6 +360,41 @@ mod tests {
             .options()
             .unwrap();
         assert!(on.allow_unowned_accessories);
+    }
+
+    /// 拍板④：`--allow-unowned-pets` 是**第二条**开关，且与配件那条**互不牵连**。
+    ///
+    /// 为什么单独立一条而不是把上面那条改成两个布尔：合并的后果不是"少一行断言"而是"少一件事
+    /// 的读数" —— 帽子页那个 `*` 的判据读 `allow_unowned_accessories`，而列表里根本没有宠物，
+    /// 所以"给了 pets 而屏上打星号"或"给了 accessories 而宠物点不动"都是拿一条开关冒充两件事。
+    /// 这两格真值表只有分别构造两次输入才打得红。
+    #[test]
+    fn the_two_unowned_switches_are_independent_and_default_off() {
+        let off = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert!(
+            !off.allow_unowned_pets,
+            "默认必须关着 ⇒ 放行未拥有的宠物同样是要显式给的决定"
+        );
+
+        let only_pets = parse(&v(&["--test-rect", "--allow-unowned-pets"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(only_pets.allow_unowned_pets);
+        assert!(
+            !only_pets.allow_unowned_accessories,
+            "只放行宠物不该顺手放行配件 ⇒ 帽子页那个 `*` 不该因此点亮"
+        );
+
+        let only_acc = parse(&v(&["--test-rect", "--allow-unowned-accessories"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(only_acc.allow_unowned_accessories);
+        assert!(
+            !only_acc.allow_unowned_pets,
+            "只放行配件不该顺手放行本体 ⇒ 反过来同样是两个事实源"
+        );
     }
 
     #[test]

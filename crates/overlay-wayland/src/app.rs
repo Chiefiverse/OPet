@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use petcore::assets::{AccessoryManifest, Manifest};
+use petcore::assets::{AccessoryManifest, Grid, Manifest};
 use petcore::behavior::AssetKey;
 use petcore::behavior::config::{Action, BehaviorConfig};
 use petcore::behavior::machine::Command;
@@ -127,6 +127,13 @@ pub struct Options {
     /// 那一档由 [`Options::db`] 那条既有的 DRYRUN 决定负责放行与打标（屏上右端那个「演示」），
     /// 不是这条开关的作用域。启动时把这句话打进 stderr，**别让它变成静默空转的假开关**。
     pub allow_unowned_accessories: bool,
+    /// `--allow-unowned-pets`：**开发态豁免** —— 库存里没有的那几只本体，收藏册里照样点得动。
+    ///
+    /// ⚠️ 故意**不**复用 [`Options::allow_unowned_accessories`]：那条开关的屏上记号是帽子页标题
+    /// 那个 `*`，而换装页的列表里从头就没有宠物 ⇒ 一条开关自称管两类就会出现"标打了而没放行"。
+    /// 本体侧因此**没有**任何屏上记号（拍板④），判据只在 [`App::pet_exempt`] 一处；与配件那条
+    /// 一样，不给 `--db` 时不生效（演示态本来就放行），那一档由启动时一行 stderr 说清。
+    pub allow_unowned_pets: bool,
 }
 
 impl Default for Options {
@@ -144,6 +151,7 @@ impl Default for Options {
             lang: None,
             motion: None,
             allow_unowned_accessories: false,
+            allow_unowned_pets: false,
         }
     }
 }
@@ -450,6 +458,129 @@ fn clear_equip(gacha: &mut Option<Gacha>, dry_run: bool, slot: &str) -> Result<W
     Ok(WornWrite::Written)
 }
 
+/// `equipped.slot` 里代表**本体**那一行的取值（P5 = 拍板③ 的那个接口槽）。
+///
+/// 为什么是一个裸字符串而不是 `Slot` 枚举的成员：`Slot` 是**配件的挂点**（`head`/`face`/…五值，
+/// `accessory.json` 的 `slot` 字段就归它），而本体不挂在任何挂点上 —— 把 `body` 塞进那个枚举会让
+/// "一件配件的槽位是 body"这种组合变得**可以表示**，而它是没有意义的（`schema.sql:61` 那个
+/// `slot` 列**故意没有 CHECK**，正是为这件事留的接口槽；petstore 的
+/// `the_slot_column_accepts_body_by_design` 钉着"写得进去"）。
+///
+/// ⚠️ 全仓库只有 [`App::persist_body`] 写它、只有启动那一道（[`db_body_row`]）读它。
+const BODY_SLOT: &str = "body";
+
+/// 启动那一步读库里的 `body` 行（拍板③ 唯一的读数）。
+///
+/// **只在 `--db` 给了的时候**开库，读完这个 `Store` 就随函数返回一起 drop ⇒ 无 `--db` 那一轮
+/// 一个文件字节都不碰（与"演示态一律放行、也不记本体这一笔"同一条口径）。
+///
+/// 代价明写：带 `--db` 的这一轮库会被开**两次**（这里一次只读、[`App::ensure_gacha`] 一次）。
+/// 选它而不是选"半个初始化的 `App`"：`App` 的构造点排在 surface 之后，而起点本体必须排在
+/// surface **之前**（`logical` / `set_size` / `set_destination` / `SlotPool` 都从清单的格子算），
+/// 让本体去等 surface 就得把清单字段换成 `Option` 并给每一处补一份"还没有清单"的形状 ——
+/// 那比一次 sqlite 打开大得多。**以后若有第三个读取者，先问它能不能并入 `ensure_gacha`。**
+///
+/// 三条出口合成一个 `Option`：**没有那一行**与**读失败**都是 `None`（= 老库、今天的行为逐字节
+/// 不变），而读失败**必须**先点名一行 ⇒ 静默退化成兜底就是假门禁（`--cell` 假开关那一族）。
+///
+/// ⚠️ 它读的是 [`Store::equipped_slot`] 那一条 SQL（`WHERE profile_id = ?1 AND slot = ?2`），
+/// 而 [`split_body_row`] 读的是 [`Store::equipped`] 的整表 ⇒ 同一张表两个读法。它们对
+/// "多于一条 `body` 行"给同一个答案（两条都按 `ORDER BY slot, item_id` 取首条），所以这不是
+/// 两个事实源；合成一条读法的代价是"启动多开一次库"或"恢复侧先跑起来才能拿到本体"那条循环。
+fn db_body_row(db: Option<&str>) -> Option<String> {
+    let path = db?;
+    match Store::open(std::path::Path::new(path))
+        .and_then(|s| s.equipped_slot(petstore::DEFAULT_PROFILE, BODY_SLOT))
+    {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!(
+                "body: 读 `equipped` 的 {BODY_SLOT} 行失败（{e}）⇒ 这一轮用 `--manifest` 那只（兜底）"
+            );
+            None
+        }
+    }
+}
+
+/// [`plan_body_override`] 的结论。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BodyChoice {
+    /// 覆盖成立 = 起点本体换成**启动扫盘交出来的表**里那一格（调用方拿它去 `bodies[i]`）。
+    ///
+    /// ⚠️ 判据来自发现表 ⇒ **覆盖天然同档**（[`check_body`] 第 ② 道已经按 `--manifest` 的
+    /// `Grid` 过滤过）。所以"启动允许跨档"这一句今天是**协议层面的陈述**（surface 尚未建，
+    /// 改尺寸合法），不是这条路径的读数：跨档的那一只在这里落到 `Keep(理由)` 而屏上从来
+    /// 不需要改尺寸。真要支持跨档，改的是发现那道过滤（把它做成启动/运行时两套），不是这里。
+    Override(usize),
+    /// 不覆盖。`Keep(None)` = 库里压根没有那一行（老库、以及一切没换过本体的库）⇒ **一个字
+    /// 都不打**，因为那是常态而启动噪音要留给"出事了"。`Keep(Some(理由))` 必须点名。
+    Keep(Option<&'static str>),
+}
+
+/// "库里那一行能不能当起点本体"的**纯**判定（拆出来的唯一理由 = 让 J3 那条读数在 headless
+/// 里也量得到：外层要开库、要解码、要 compositor，这里三样都不需要）。
+///
+/// 只认**发现表里有的**那一只，而且只按 `id` = 目录名认（库存与 `equipped` 记账用的就是它）。
+/// 那句 `Keep` 的文案要说清"为什么不覆盖"有两个不同的原因（目录不存在 / 档不同被扫盘挡掉），
+/// 而**不**把它们合并成"读不到"：这一行报的是"你上次换的那只现在这只机器上装不上"，
+/// 用户下一步该去找产物，不是去查数据库。
+///
+/// ⚠️ `start_id` 那一条是 11-07 真机 E 轮实测出来的：库里那一行写的就是 `--manifest` 已经给的
+/// 那一只时，旧版无条件走 `Override` ⇒ stderr 打出「起点本体从 cat_shiro 换成这只」而**什么也没
+/// 换**。拍板③ 的原话是"**覆盖发生时必须打一行点名**"，读到的那一行不等于覆盖发生 ⇒ 这一臂今天
+/// 走 `Keep(None)`（静默 = 常态），而它的读数是下面那条真值表里的第 ③⑤ 两格（后者是"发现表为空
+/// 而起点正是它"那一面 —— 判据必须排在 `position()` 之前，否则那台机器上会平白多一行假点名）。
+fn plan_body_override(row: Option<&str>, pet_ids: &[String], start_id: &str) -> BodyChoice {
+    let Some(id) = row else {
+        return BodyChoice::Keep(None);
+    };
+    // **先问"是不是本来就在身上"**，再问它在不在发现表里：那一行就是起点那只时这一轮什么都没
+    // 换，而"没有本体库 / `--test-rect`"的机器上发现表是空的 ⇒ 把这条判据放在 `position()`
+    // 之后会得到一句假点名（"上次换的那只装不上"）—— 它装得上，它就是身上这只。
+    if id == start_id {
+        return BodyChoice::Keep(None);
+    }
+    match pet_ids.iter().position(|p| p == id) {
+        Some(i) => BodyChoice::Override(i),
+        None => BodyChoice::Keep(Some(
+            "库里那一行指的本体不在启动扫盘交出来的表里（目录不存在、清单或产物坏了，或格子档与 `--manifest` 那只不同）",
+        )),
+    }
+}
+
+/// 把 `equipped` 读回的整表分成"本体那一行"与"配件那几行"（P5 给启动恢复补的那道剥壳）。
+///
+/// 为什么**必须**先剥：`Store::equipped` 的 `ORDER BY slot, item_id` 里 `body` 排在**所有**配件
+/// 槽位之前（字母序），于是那一行是整表的第一条，而 [`plan_restore`] 的第 1 道只问"配件表里有没有
+/// 这个 id" ⇒ 它必然走到那句 `磁盘上找不到这一件（已删除，或五道门禁没过）`。**坏的不是行为，是
+/// 那句话**，而这两件事在本项目里从来不是同一个优先级：
+/// ① 它说的是一件**根本不是配件**的账 ⇒ 用户下一次就去查配件库、查 `pack.py`，而真正的下一件事
+///    是"上次换的那只本体在这台机器上装不上"（这句话 [`db_body_row`] 那一段早就该说了）；
+/// ② 每一轮启动都打这一行 ⇒ 一句永久性的假话，而"启动噪音要留给出事了"是 [`App::restore_worn`]
+///    那条既定裁定。
+///
+/// ⚠️ 明写**不构成**危害的那一条，免得后人把它当成更强的理由：本体行**不会**把帽子挤掉。
+/// `plan_restore` 取的是"第一条过了四道的行"，而本体行在第 1 道（或第 3 道 `slot != 清单声明的
+/// 槽位`，因为 `Slot` 五值里没有 `body`）就被 `continue` 掉了，一次都不占 `wear`。⇒ 这条剥壳
+/// 的全部意义是**不说假话**，不是"少剥就丢装备"。
+///
+/// 返回 `(本体的 id, 只剩配件的行)`。多于一条 `body` 行 = 手工行或旧版本写的 ⇒ **取首条**，
+/// 与 [`db_body_row`] 经 [`Store::equipped_slot`] 给的答案一致（同一条 `ORDER BY`）。
+fn split_body_row(rows: &[(String, String)]) -> (Option<String>, Vec<(String, String)>) {
+    let mut body: Option<String> = None;
+    let mut accessories = Vec::new();
+    for (slot, item_id) in rows {
+        if slot == BODY_SLOT {
+            if body.is_none() {
+                body = Some(item_id.clone());
+            }
+        } else {
+            accessories.push((slot.clone(), item_id.clone()));
+        }
+    }
+    (body, accessories)
+}
+
 /// [`plan_restore`] 的结论 = 要穿的那一格（`None` = 一件都不穿）+ 每一行的处置。
 struct RestorePlan {
     wear: Option<usize>,
@@ -576,6 +707,16 @@ pub struct App {
     /// 换装页的"换一件"就是在这个表里挪下标 ⇒ 它必须**不含像素**，否则"浏览一下库"
     /// 会把 M1 那条"一次一件"的档吃光。
     candidates: Vec<Candidate>,
+    /// 本体库（启动时扫过四道门禁、**一像素未解**的那几只）；空 = 没有第二只换得上去。
+    ///
+    /// 收藏册的宠物行点下去就是这张表里的下标（`PanelItem::Body`）。它必须不含像素，理由与
+    /// [`Self::candidates`] 那一段逐字相同：解码一张 sheet 是 45 MiB，而"浏览一下库"不该付它。
+    bodies: Vec<BodyCandidate>,
+    /// 当前本体的身份（= 库目录名那一侧，与 [`Self::bodies`] 的 `id` 同一个键）。
+    ///
+    /// 两件事读它：`equipped` 的 `body` 行写它、收藏册那一行"是不是它"的 `same_id` 判据读它。
+    /// ⚠️ 它**不上屏** —— 当前是哪只本体就是宠物自己那几个像素，再打一行字就是第二个事实源。
+    body_id: String,
     /// [`Self::candidates`] 里当前选中的下标。**只在换装页被读到（画面上没有它）**，
     /// 所以它不进 `menu::content_sig`：没穿东西时点"换一件"，屏上一个像素都没变，
     /// 签名跟着变就是白投一帧（`69fd158` 那个形状的反面用法）。
@@ -808,11 +949,19 @@ impl Gacha {
     /// 同一个集合还有一条好处：名字一律来自 catalog，所以不需要 `recent_lines` 那种"catalog
     /// 不认就退化成 id"的分支（那一条读的是账本，账本可以记着目录里没有的 id）。
     ///
-    /// 三档**可点/只读**由 [`Self::wear`] 一格表示，而它的判据是别人给的（不是这里自己算的）：
+    /// 三档**可点/只读**由 [`AlbumEntry::target`] 一格表示，而它的判据是别人给的（不是这里自己算的）：
     /// `ids` = [`App::candidates`] 的目录名表，`visible` = [`App::dress_view`] 跑完库存那道之后
     /// 的可见下标集。⇒ "抽到但磁盘没产物""磁盘有但库存不认""本体不匹配"三种形状都落在
-    /// `wear = None`，屏上那一行**没有强调条**（画师读的正是可点性，见 [`card::paint_panel`]），
+    /// `target = None`，屏上那一行**没有强调条**（画师读的正是可点性，见 [`card::paint_panel`]），
     /// 用户看得见地能分辨，而我不用为这三种形状各造一个新字形或新标记。
+    ///
+    /// ⚠️ P5 把"宠物永远只读"这一条**换成了第二个判据源**：`pet_ids` / `pet_visible` 是
+    /// [`App::bodies`] 的目录名表与 [`App::pet_view`] 的可见集，形状与上面那一对**完全同构**（同一
+    /// 个 [`DressView::select`]，只是喂的表不同）。所以本体现在有三档路由：配件格 ⇒
+    /// [`AlbumTarget::Accessory`]、宠物格 ⇒ [`AlbumTarget::Body`]、两表都查不到 ⇒
+    /// [`AlbumTarget::None`]。**"没有强调条"这一档对三类原因仍然只有一句实现**（未拥有 / 磁盘没
+    /// 产物 / 跨档出局），跨档那一只在 [`check_body`] 第 ② 道就被扫盘挡掉 ⇒ 它压根不在
+    /// `pet_ids` 里 ⇒ 落到同一支 `None`（= 只读，而不是"点了被拒"，拍板② 的验收形状）。
     ///
     /// `dup` 的折算口径与 [`Self::collection_lines`] **同一个**（`item_count − 1`：第一件不算
     /// 重复），否则逐件行加起来与汇总那一行对不上，就成了"两本账"。
@@ -824,6 +973,8 @@ impl Gacha {
         owned: &Owned,
         ids: &[String],
         visible: &[usize],
+        pet_ids: &[String],
+        pet_visible: &[usize],
     ) -> Result<Vec<AlbumEntry>, String> {
         let mut out = Vec::new();
         for r in Rarity::ALL {
@@ -832,21 +983,27 @@ impl Gacha {
                     continue;
                 }
                 let kind_pet = item.kind == ItemKind::Pet;
-                // 下标只从 `ids` 里反查一次；宠物**永远**不给出下标（`wear()` 解的是配件三件套，
-                // 传一个宠物 id 进去在类型上合法而屏上是什么都没有的那种事故）。
-                let wear = if kind_pet {
-                    None
+                // **两张表各查各的**，而且"查得到 + 过得了那道闸"两个条件都要成立。
+                // 反查一次而不是把下标带进来看起来像"顺手"，其实是要紧的：**id 是唯一入口**，
+                // 下标在这里是查出来的结果 ⇒ catalog 的顺序与磁盘的顺序谁变了都不影响路由。
+                let target = if kind_pet {
+                    pet_ids
+                        .iter()
+                        .position(|c| c == &item.id)
+                        .filter(|i| pet_visible.contains(i))
+                        .map_or(AlbumTarget::None, AlbumTarget::Body)
                 } else {
                     ids.iter()
                         .position(|c| c == &item.id)
                         .filter(|i| visible.contains(i))
+                        .map_or(AlbumTarget::None, AlbumTarget::Accessory)
                 };
                 let n = self
                     .store
                     .item_count(&item.id)
                     .map_err(|e| format!("读 {} 的件数失败: {e}", item.id))?;
                 out.push(AlbumEntry {
-                    wear,
+                    target,
                     name: item.name.clone(),
                     rarity: item.rarity,
                     slot: item.slot,
@@ -1030,19 +1187,40 @@ impl Gacha {
 ///
 /// 它刻意不是 `CatalogItem` 的引用：一件"装包来的池外件"（catalog 不认的 id）也要能进这张表，
 /// 而那时只有 id 字符串可说。
+///
+/// 一行点下去要去**哪张表**（P5 = 这一面第一次同时出现两套下标空间）。
+///
+/// 为什么不写成 `Option<usize>` 加一个"这是宠物还是配件"的布尔：那样能表示
+/// `{ index: Some(3), kind: Accessory }` 而 `candidates[3]` 其实是另一件东西 —— 也就是把"这个数字
+/// 属于哪张表"交给**旁表**去说，而旁表要跨 `show_panel` / `refresh_panel_rows` / `album_screen`
+/// 保持对齐（[`panel::PanelItem::Wear`] 那条注释立的同一条纪律，本项目为它付过学费）。判别式让
+/// "哪张表"和"下标"**必须一起写**，写错一张表就是编译错误而不是运行时的一次错穿。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlbumTarget {
+    /// [`App::candidates`] 的下标 ⇒ 点它走 [`App::pick_and_wear`]。
+    Accessory(usize),
+    /// [`App::bodies`] 的下标 ⇒ 点它走 [`App::swap_body`]。⚠️ 与上面那个数字**不是同一个空间**。
+    Body(usize),
+    /// 只读行：未拥有 / 磁盘没产物 / 不 `fits` 本体 / 跨档在本体侧出局。
+    None,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AlbumEntry {
-    /// `Some(i)` = 这一件**此刻真能穿上**，`i` 是 [`App::candidates`] 的下标 ⇒ 行是
-    /// [`panel::PanelItem::Wear`]。`None` = **只读行**（未拥有 / 磁盘没产物 / 本体不匹配 /
-    /// 那是只宠物不是配件）⇒ 行是 [`panel::PanelItem::Info`]，屏上没有强调条。
-    wear: Option<usize>,
+    /// 这一行**此刻**点得动吗、点下去去哪张表。`None` = 只读行，屏上没有强调条（画师读的可点性
+    /// 正是这一格，见 [`card::paint_panel`]）。
+    target: AlbumTarget,
     /// catalog 里的名字；catalog 不认这个 id 时退化成 id 本身（ASCII）—— 与
     /// [`Gacha::recent_lines`] **同一个既有口径**，不是新洞。
     name: String,
     rarity: Rarity,
     slot: Option<Slot>,
-    /// `kind == Pet` ⇒ 行尾打一个 ASCII `pet` 标，且 `wear` **恒为 `None`**（FLOW §6③ 那句
-    /// "明写而不是灰掉不显示"的最低档实现：灰掉要新字形，而宠物穿上去根本是另一件事 = P5）。
+    /// `kind == Pet` ⇒ 行尾打一个 ASCII `pet` 标。
+    ///
+    /// ⚠️ 它**不参与路由**（路由看 [`AlbumEntry::target`]）：P4 那一轮它同时是"为什么这一行永远
+    /// 不给下标"的理由（那时 `wear()` 解的是配件三件套，传一个宠物 id 进去在类型上合法而屏上什么
+    /// 都没有），P5 之后宠物有了自己的下标空间，这一格就只剩**排版**职责（行尾那个 `pet` 字）。
+    /// 留着一个不参与判定的布尔而它恰好和判别式同真是巧合不是约束 ⇒ 所以这里的注释要说清它不管什么。
     kind_pet: bool,
     /// 重复数 = `item_count − 1`，与 [`Gacha::collection_lines`] 同一个折算口径。
     dup: u64,
@@ -1070,7 +1248,7 @@ fn album_rows(entries: &[AlbumEntry], scale: f32) -> Vec<panel::PanelRow> {
     entries
         .iter()
         .map(|e| {
-            let actionable = e.wear.is_some();
+            let actionable = !matches!(e.target, AlbumTarget::None);
             let width = if actionable {
                 panel::ROW_LABEL_W
             } else {
@@ -1119,9 +1297,10 @@ fn album_rows(entries: &[AlbumEntry], scale: f32) -> Vec<panel::PanelRow> {
                 }
             }
             panel::PanelRow {
-                item: match e.wear {
-                    Some(i) => panel::PanelItem::Wear(i),
-                    None => panel::PanelItem::Info,
+                item: match e.target {
+                    AlbumTarget::Accessory(i) => panel::PanelItem::Wear(i),
+                    AlbumTarget::Body(i) => panel::PanelItem::Body(i),
+                    AlbumTarget::None => panel::PanelItem::Info,
                 },
                 text,
             }
@@ -1154,6 +1333,60 @@ fn plan_pick_wear(gate_passes: bool, worn_some: bool, picked: usize, want: usize
         return PickWear::AlreadyWorn;
     }
     PickWear::SelectAndWear
+}
+
+/// 「点中一只宠物」要判的四档结论（**纯**版本；方法论与 [`PickWear`] 同一条：`App` 在没有
+/// compositor 的机器上构造不起来 ⇒ 判定必须先改写成写得出来、也测得出来的形状）。
+///
+/// 比配件那一族多一档 `Same` 而少一档 `AlreadyWorn` 的写法差别不是审美：**"身上已经是这只"
+/// 是一个不需要"穿着"这个前提的状态**（本体永远在，`worn` 那格才可能是 `None`），所以它的判据
+/// 是 `id` 而不是下标 —— 下标是`Body` 那套（[`App::bodies`]），而"当前是哪只"记在
+/// [`App::body_id`]。用下标比就会有两个"当前本体是谁"。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SwapBody {
+    /// 四道都过 ⇒ 走 [`App::swap_body`] 那九步。
+    Switch,
+    /// 点的就是当前这只 ⇒ 不解像素、不重投帧、**账也不写**（写一次 `body` 行等于给"没发生的
+    /// 那次换"留一条重启读数）。
+    Same,
+    /// 某一道没过 ⇒ 一个字都不动。带**那道的名字**，因为三道的文案是不同的事实：
+    /// "这一格根本没有这只"、"档不同所以运行时换不了"、"库存没验过拥有"是三句不同的回答。
+    Refused(&'static str),
+}
+
+/// [`SwapBody`] 的判定本体，四道的**顺序 = 便宜的、以及"错了会更贵"的在前**。
+///
+/// ⚠️ `same_grid` 排在库存那道**之前**，理由不是"更便宜"而是"更贵的那个错"：`atlas.reload`
+/// 自检的是"新 sheet 的像素尺寸 == `cols×cell_w, rows×cell_h`"，而那三个数仍是**旧**本体的
+/// （[`App::atlas`] 只在构造时由清单算出，`reload` 不动它们）。所以在档不同的时候，失败关闭
+/// 的形状是"白付一次读盘 + 一次解码尝试 + 一句几何错误"，而**赌赢**（两份 WebP 尺寸恰好相同）
+/// 的形状是"新像素配旧行表 ⇒ 屏上是一堆没人能解释的格子"。后者正是本项目反复要杀的静默。
+///
+/// 这一道的现实读数在扫盘那一步（[`check_body`] 第 ② 道 ⇒ 跨档的那只压根进不了
+/// [`App::bodies`]，收藏册里是只读行、点不到）。留在这里是**第二道保险**：唯一合法走到它的
+/// 调用者是"以后有人绕过发现直接往 `bodies` 里塞一只"，而那件事的读数只能来自单测。
+///
+/// `same_id` 排在最后（与 [`plan_pick_wear`] 把 `AlreadyWorn` 排在 `Refused` 之后同一个理由）：
+/// 三道门禁里任何一道没过都不该给出"已经是这一只"这句**听起来像成功**的话 —— 那会把"我为什么
+/// 点不动它"回答成一个不需要回答的问题。
+fn plan_swap_body(in_range: bool, gate_passes: bool, same_id: bool, same_grid: bool) -> SwapBody {
+    if !in_range {
+        return SwapBody::Refused("这一格不在本体库里（启动扫盘之后库被改过？）");
+    }
+    if !same_grid {
+        return SwapBody::Refused(
+            "格子档与当前本体不同 ⇒ 运行时不动 surface 尺寸 / 目标尺寸 / shm 池，跨档只能重启",
+        );
+    }
+    if !gate_passes {
+        return SwapBody::Refused(
+            "库存那道没过（未拥有，或给了 --db 而这一轮读不出库存）⇒ 没验过拥有不换",
+        );
+    }
+    if same_id {
+        return SwapBody::Same;
+    }
+    SwapBody::Switch
 }
 
 /// 「概率」那一屏要上屏的**五行整**：一行图例 + 四档各一行。
@@ -1224,8 +1457,56 @@ pub fn run(opts: Options) -> Result<(), String> {
     // `ShmHandler` 要 `&mut Shm`，所以这层不能包 `Arc`
     let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm 不可用: {e}"))?;
 
-    let manifest = load_manifest(&opts)?;
-    let (atlas, body_regions) = load_asset(&opts, manifest)?;
+    let mut manifest = load_manifest(&opts)?;
+    // 本体库排在**第一次解码之前**扫一遍，因为库里那一行 `body` 可能改写"第一只本体是谁"，
+    // 而那一天绝不该解两张 sheet（峰值 = 两只本体 ≈147 MB，它落在 150 MiB 门禁内 ⇒ 什么都
+    // 不会红，唯一的读数就是这段代码本身）。
+    //
+    // ⚠️ 这道 `pixels` 门槛与 [`load_asset`] 里那两个"没有像素"的分支**是同一个条件**
+    // （`--test-rect` / 没给 `--manifest`）：原先这张表是在 `body_regions` 出来之后按"本体有没有
+    // 像素"算的，换成这个布尔量是为了打断 `discover_pets → load_asset → discover_pets` 那条环。
+    let pixels = !opts.test_rect && opts.manifest.is_some();
+    let mut bodies = match pet_root().filter(|_| pixels) {
+        Some(root) => discover_pets(&root, &manifest.grid),
+        // 本体没像素（`--test-rect` / 内置 fixture 不读盘的那条路）⇒ 换了没东西可画；
+        // `$HOME` 与 `$XDG_DATA_HOME` 都读不到 ⇒ **没有库**。两种都是"收藏册的宠物行全部只读"，
+        // 不是错误（这张表**不**参与"起不起来"的判断）。
+        None => Vec::new(),
+    };
+    // —— 拍板③：库里的 `body` 行**赢**，`--manifest` 退化成"库里没有那一行时用什么"。
+    // 老库（没有那一行）⇒ 这一整段是 `Keep(None)`，一个字都不打，行为与 P4 逐字节相同。
+    let row = db_body_row(opts.db.as_deref());
+    let pet_ids: Vec<String> = bodies.iter().map(|b| b.id.clone()).collect();
+    // 起点本体的身份（`id` = 目录名 = 库存与 `equipped` 认的那个键，见 [`BodyCandidate::id`]）。
+    let mut body_id = start_body_id(opts.manifest.as_deref(), &manifest.slug);
+    // 覆盖成立时要连**目录**一起换：sheet 与 polygon 是从清单所在目录取的。
+    let mut body_dir: Option<std::path::PathBuf> = None;
+    match plan_body_override(row.as_deref(), &pet_ids, &body_id) {
+        BodyChoice::Override(i) => {
+            let b = &mut bodies[i];
+            // 这一行排在 `manifest` 被改写**之前** ⇒ `{fallback}` 念到的还是兜底那只的 `id`。
+            eprintln!(
+                "body: 库里那一行 {slot}={id} ⇒ 起点本体从 {fallback} 换成这只（`--manifest` 退化成\
+                 兜底；格子档与它相同 ⇒ surface 尺寸 / 目标尺寸 / shm 池一个都不必改）",
+                slot = BODY_SLOT,
+                id = b.id,
+                fallback = body_id,
+            );
+            // 第一次用上它才 `Box::leak`（每只进程内只泄一份清单，几 KB）。
+            manifest = b.leaked();
+            body_dir = Some(b.dir.clone());
+            body_id = b.id.clone();
+        }
+        // 点名：库里明明有一行而这一轮不覆盖 ⇒ 必须说得出为什么（静默退回兜底 = 用户上次
+        // 换的本体"自己没了"而没有任何一句话解释，那是本项目反复要杀的静默）。
+        BodyChoice::Keep(Some(why)) => eprintln!(
+            "body: 库里那一行 {slot}={id} ⇒ 不覆盖起点本体：{why} ⇒ 这一轮用 `--manifest` 那只",
+            slot = BODY_SLOT,
+            id = row.clone().unwrap_or_default(),
+        ),
+        BodyChoice::Keep(None) => {}
+    }
+    let (atlas, body_regions) = load_asset(&opts, manifest, body_dir.as_deref())?;
     // 配件库在启动时**只读元数据**（清单 + 轮廓 + 四道门禁里除解码之外的全部），一像素不解，
     // 于是 `regions` 起手就是本体那份 —— 出图路径上没有"这份区域含不含配件"这个问题。
     //
@@ -1304,6 +1585,13 @@ pub fn run(opts: Options) -> Result<(), String> {
             "ui: --allow-unowned-accessories 没起作用也不需要 ⇒ 无 --db = 演示态，库存恒空、一律放行（屏上右端那个「演示」标就是这件事的记号）"
         );
     }
+    // 本体那条豁免的兄弟行（拍板④ = 两条开关分开，所以**两句分开**）。屏上记号这一档**没有**：
+    // 收藏册没有属于"本体"的那一页可以打标，而"当前是哪只"就是宠物自己那几个像素。
+    if opts.allow_unowned_pets && dry_run {
+        eprintln!(
+            "ui: --allow-unowned-pets 没起作用也不需要 ⇒ 无 --db = 演示态，库存恒空、一律放行（本体侧不打屏上记号，见 --help）"
+        );
+    }
     let mut app = App {
         conn,
         registry_state: RegistryState::new(&globals),
@@ -1327,6 +1615,8 @@ pub fn run(opts: Options) -> Result<(), String> {
         body_regions,
         regions,
         candidates,
+        bodies,
+        body_id,
         picked: 0,
         worn: None,
         sim: None,
@@ -1395,9 +1685,15 @@ fn load_manifest(opts: &Options) -> Result<&'static Manifest, String> {
     Ok(Box::leak(Box::new(m)))
 }
 
+/// 解**起点本体**那一张 sheet（本轮唯一一次本体解码）。
+///
+/// `body_dir` = 库里那一行 `body` 覆盖出来的目录（[`plan_body_override`] 那一臂）。给出来时
+/// sheet 与 polygon 都从**它**取，而不是从 `--manifest` 的父目录取 ⇒ 覆盖成立的那一轮
+/// 从头到尾只解**一只**本体的像素。`None` = 没有覆盖（老库、无 `--db`）⇒ 逐字节是 P4 的行为。
 fn load_asset(
     opts: &Options,
     manifest: &Manifest,
+    body_dir: Option<&std::path::Path>,
 ) -> Result<(Option<Atlas>, Option<Regions>), String> {
     if opts.test_rect {
         return Ok((None, None));
@@ -1406,9 +1702,17 @@ fn load_asset(
         // 内置 fixture 只有元数据、没有像素，画不出任何东西
         return Ok((None, None));
     };
-    let dir = std::path::Path::new(path)
-        .parent()
-        .ok_or_else(|| format!("{path} 没有父目录"))?;
+    let owned_dir;
+    let dir = match body_dir {
+        Some(d) => d,
+        None => {
+            owned_dir = std::path::Path::new(path)
+                .parent()
+                .ok_or_else(|| format!("{path} 没有父目录"))?
+                .to_path_buf();
+            &owned_dir
+        }
+    };
     let sheet = dir.join("sheet.webp");
     let atlas = Atlas::load(
         sheet.to_str().ok_or("sheet 路径不是 UTF-8")?,
@@ -1617,6 +1921,202 @@ fn discover_accessories(
         }
     );
     found
+}
+
+/// 本体库在哪 —— **只由环境决定**，与 [`accessory_root`] 是同一根规则的两个分支
+/// （`petstore::paths::AssetRoot`：`OPET_PETS` → `$XDG_DATA_HOME/opet/pets` →
+/// `$HOME/.local/share/opet/pets`）。**没有 `--pets` 命令行入口**：`--accessory` 已被用户删过
+/// 的那条先例（"配件不是应该由菜单选择吗"），本体侧同理，库位置是装机事实不是用户意图。
+fn pet_root() -> Option<std::path::PathBuf> {
+    petstore::paths::AssetRoot::resolve(ItemKind::Pet).map(|r| r.path)
+}
+
+/// 收藏册里一只**换得上去**的本体 = 一个通过全部发现门禁的目录（**一像素未解**）。
+///
+/// 与 [`Candidate`] 同族，但多一个 `leaked`：`Sim<'m>` 与 [`App::manifest`] 的类型是
+/// `&'static Manifest`，而这张表是**自己拥有**清单的 `Vec` ⇒ 借用活不到那一刻。
+/// `load_manifest`（`:1390`）那边是直接 `Box::leak` 一份，这里照同一条策略，但**延到第一次
+/// 真要换上它时才泄**并通过 [`BodyCandidate::leaked`] 缓存 ⇒ 一份进程内每只不同的宠物只泄一份
+/// （几 KB），不是每次换都泄一份。
+/// （不可行的另一条路：把清单存进一个 self-referential arena —— `QueueHandle<App>` 要求
+/// `App: 'static`，任何"挂在 `App` 里的借用"都构造不出来。）
+struct BodyCandidate {
+    /// 库存那一侧的身份 = **库目录名**（与 [`Candidate::id`] 同一条既有裁定：`inventory.item_id`、
+    /// P1 的 INV 门禁、`AssetDir::locate`、`equipped` 的 `body` 行认的都是这一个）。
+    id: String,
+    /// 清单里的 `slug` = `fits` 比的那个名字。⚠️ 它与 [`Self::id`] **可以不相等**，见
+    /// [`discover_pets`] 那行 ⚠（今天四份 @192 产物里三份的 slug 写着 `cat_shiro` 就是这一格）。
+    slug: String,
+    dir: std::path::PathBuf,
+    grid: Grid,
+    manifest: Manifest,
+    /// 本体自己的穿透轮廓（发现第 ④ 道解的，见 [`check_body`]）。
+    ///
+    /// **存下来而不是换的时候再解一次**：`App::swap_body` 的第 3 步于是没有任何 IO、不可能失败，
+    /// "新清单 + 旧轮廓"这个半换形状就构造不出来。代价是每只几 KB，相对一张 sheet 的 45 MiB 是零。
+    regions: Regions,
+    leaked: Option<&'static Manifest>,
+}
+
+impl BodyCandidate {
+    /// 第一次真要换上它时才 `Box::leak`，之后返缓存（字段说明里那三条理由）。
+    fn leaked(&mut self) -> &'static Manifest {
+        match self.leaked {
+            Some(m) => m,
+            None => {
+                let m: &'static Manifest = Box::leak(Box::new(self.manifest.clone()));
+                self.leaked = Some(m);
+                m
+            }
+        }
+    }
+
+    /// 那只本体的 sheet 路径（`Atlas::reload` 的唯一输入，**在**门禁之内**不在**扫盘里读）。
+    fn sheet(&self) -> std::path::PathBuf {
+        self.dir.join("sheet.webp")
+    }
+}
+
+/// [`discover_pets`] 的内层：一个目录 → 一只可换的本体，或一句点名它错在哪的说明。
+///
+/// 门禁按**便宜**排序（清单 → 档 → 存在性 → 轮廓），一像素都不解。与 [`check_accessory`]
+/// 同族，**两处故意不同**：
+///
+/// ② **格子档整块比较**（`Grid: PartialEq` 逐字段含 `cols/rows/w/h`），判据不是只比 `w/h`：
+///    `rows` 决定解码缓冲大小与 polygon 面，`cols` 决定寻址。跨档在**扫盘这一步**出局 ⇒
+///    收藏册那一行是只读、没有强调条（= P4 立好的形状，不是新发明）。为什么不在点击时报错：
+///    `layer.set_size` / `viewport.set_destination` / `SlotPool` 那三处只在 `run()` 里发生一次，
+///    运行时换档要走一遍 configure 往返；**启动允许跨档（surface 还没建），运行时不允许** ——
+///    这条不对称是协议限制不是数据模型限制。
+///
+/// ④ **没有**配件侧那道 `first_missing` 逐格轮廓覆盖检查。本体的 `region_rects` 有设计好的
+///    "整格兜底"，缺一格只是"点击面积稍大"；配件缺格是"帽子画在 region 外"。在这里照抄过来
+///    就是又一条**假门禁**（它会拒绝一堆画得对的本体）。
+fn check_body(dir: &std::path::Path, cur: &Grid) -> Result<BodyCandidate, String> {
+    let path = dir.join("pet.json");
+    let name = path.to_str().ok_or("本体清单路径不是 UTF-8")?;
+    // ① 清单本身。`Manifest::validate` 已覆盖 format / slug / `cols==8` / 格像素 / sheet 像素 /
+    //    `idle` 必在 / 状态名 / rows 越界 / fps / `anchor.feet` 在框内 / `outfit_anchors` /
+    //    `input_polygon` / facing ⇒ 这里不重复任何一道。
+    let manifest = Manifest::load(name).map_err(|e| format!("清单 {name} 加载失败: {e}"))?;
+    // ② 格子档（拍板② 的落点）。
+    if manifest.grid != *cur {
+        let (a, b) = (cur, &manifest.grid);
+        return Err(format!(
+            "拒绝本体 {}：格子档不同（当前 {}×{}、{} 列 × {} 行；这一份 {}×{}、{} 列 × {} 行）\
+             ⇒ 运行时换本体不动 surface 尺寸，跨档只能重启",
+            manifest.slug, a.w, a.h, a.cols, a.rows, b.w, b.h, b.cols, b.rows
+        ));
+    }
+    // ③ 两件伴生产物**存在**（不读内容 ⇒ 把 `discovery_never_touches_the_sheet…` 那条扩到宠物）。
+    for what in ["sheet.webp", "polygon.json"] {
+        if !dir.join(what).is_file() {
+            return Err(format!("拒绝本体 {}：目录里没有 {what}", manifest.slug));
+        }
+    }
+    // ④ 轮廓解得开（`Regions::load` 自己会交叉核对 polygon 的格尺寸 vs 清单）。
+    let polygon = dir.join("polygon.json");
+    let regions = Regions::load(
+        polygon.to_str().ok_or("本体 polygon 路径不是 UTF-8")?,
+        manifest.grid.w,
+        manifest.grid.h,
+        SURFACE_MARGIN,
+    )
+    .map_err(|e| format!("{}: {e}", polygon.display()))?;
+    Ok(BodyCandidate {
+        // 身份 = **目录名**，与配件侧同一条裁定（理由见 [`Candidate::id`] 那段）。
+        id: dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("{} 的目录名不是合法 UTF-8 ⇒ 无法与库存对齐", dir.display()))?
+            .to_string(),
+        slug: manifest.slug.clone(),
+        dir: dir.to_path_buf(),
+        grid: manifest.grid,
+        regions,
+        leaked: None,
+        manifest,
+    })
+}
+
+/// 启动时扫一遍本体库 ⇒ 收藏册里**点得动**的那些宠物行（元数据 + 轮廓，一像素未解）。
+///
+/// 与 [`discover_accessories`] 同一条最要紧的语义：**这里一个 `Err` 都不出**。库里一只坏本体的
+/// 后果是"少一只可换"，不是"宠物起不来"（硬约束 3），每条跳过打一行点名它错在哪道的 stderr。
+///
+/// ⚠️ 起点本体**不要求**在这张表里：`--manifest` 仍是硬要求（`cli.rs:80` 不动），它退化成
+/// "库里没那一行时用什么"（拍板③）。所以这张表空 ⇒ 收藏册的宠物行全部只读，那是**正确行为**。
+fn discover_pets(root: &std::path::Path, cur: &Grid) -> Vec<BodyCandidate> {
+    let mut found: Vec<BodyCandidate> = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!(
+                "pets: 库 {} 打不开（{e}）⇒ 收藏册里的宠物行点了不会有效果",
+                root.display()
+            );
+            return found;
+        }
+    };
+    // 排序理由与配件侧逐字相同：`read_dir` 的顺序由文件系统给，两次启动可能不同。
+    let mut dirs: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("pet.json").is_file())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        match check_body(&dir, cur) {
+            Ok(cand) => {
+                // 与配件侧同一行 ⚠（`:1557`）：不一致就是"库存按 A 记账、屏上叫 B"，而
+                // "为什么这只我抽到了却不让我换"问不出来。**拒绝文案点的是 `fits` 或档，不是这个。**
+                if cand.id != cand.slug {
+                    eprintln!(
+                        "pets:   ⚠ 目录名 {} 与清单 slug {} 不一致 ⇒ 库存按 {} 记账、屏上叫 {}",
+                        cand.id, cand.slug, cand.id, cand.slug
+                    );
+                }
+                eprintln!(
+                    "pets:   {}（{}）换得上去 · {}×{} {}列×{}行 · 轮廓 {} 格 · sheet 未解（点上才读）",
+                    cand.id,
+                    cand.slug,
+                    cand.grid.w,
+                    cand.grid.h,
+                    cand.grid.cols,
+                    cand.grid.rows,
+                    cand.regions.frame_count()
+                );
+                found.push(cand);
+            }
+            Err(err) => eprintln!(
+                "pets: 跳过 {}（{}）⇒ 这一只在收藏册里是只读行，其余不受影响",
+                dir.display(),
+                err
+            ),
+        }
+    }
+    eprintln!(
+        "pets: 库 {} ⇒ {} 只可换{}",
+        root.display(),
+        found.len(),
+        if found.is_empty() {
+            "（宠物行全部只读；把 `tools/pack.py` 的三件套放进这里）"
+        } else {
+            ""
+        }
+    );
+    found
+}
+
+/// 起点本体的身份 = `--manifest` 那个路径的**目录名**（`id = 目录名`那条既有裁定，与收藏册
+/// 那一行同认一个 id ⇒ `same_id` 判据才有读数）。内置 fixture 不读盘 ⇒ 没有目录名可取，
+/// 退化成清单 `slug`，而且**在这里**说清，不留到屏上去猜。
+fn start_body_id(manifest_path: Option<&str>, slug: &str) -> String {
+    manifest_path
+        .and_then(|p| std::path::Path::new(p).parent())
+        .and_then(|d| d.file_name())
+        .and_then(|n| n.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| slug.to_string())
 }
 
 /// **到这一步才解码**第二张 sheet ⇒ [`App::equip`] 是内存档 M1 唯一的执行点。
@@ -2534,10 +3034,11 @@ impl App {
     /// 说得了，而逐件行回答的是"哪一件、能不能点"。代价（明写）= 汇总被挤到后面的页，
     /// 首屏第一眼是逐件列表；要反过来就一行改（把汇总放到 `rows` 头部）。
     ///
-    /// 库存这一趟读了两遍（[`Self::dress_view`] 内部一遍、这里一遍）。为什么不合成一遍：
+    /// 库存这一趟读了三遍（[`Self::dress_view`] 内部一遍、[`Self::pet_view`] 内部一遍、这里一遍）。
+    /// 为什么不合成一遍：
     /// 让 `DressView` 把 `Owned` 带出来会搅浑"豁免态压根不该读库"那条形状，而这一屏要的
-    /// 是**报表**（豁免态照样得知道有什么）。两遍读的是同一个 store、同一次点击之内 ⇒ 是
-    /// 同一个事实问了两次，不是两个事实源；代价 = 一次 sqlite 查询，而它不在 tick 环上
+    /// 是**报表**（豁免态照样得知道有什么）。三遍读的是同一个 store、同一次点击之内 ⇒ 是
+    /// 同一个事实问了三次，不是三个事实源；代价 = 三次 sqlite 查询，而它们不在 tick 环上
     /// （§4 禁的是定时轮询）。
     fn album_screen(&mut self, page: usize) -> Result<(PanelKind, Vec<panel::PanelRow>), String> {
         if self.gacha.is_none() {
@@ -2545,15 +3046,23 @@ impl App {
         }
         // 名字要先取：下面 `dress_view()` 可变借用 self，不能同时留 `candidates` 的引用。
         let ids: Vec<String> = self.candidates.iter().map(|c| c.id.clone()).collect();
+        // 本体那一张表**同形、同一条理由**（P5）：`pet_view()` 也要可变借用 self。
+        let pet_ids: Vec<String> = self.bodies.iter().map(|b| b.id.clone()).collect();
         // 闸门只有一个所有者 = `dress_view`（这一条不许自己实现"许不许穿"）。
         let view = self.dress_view();
+        // 本体那道闸门是它的同形兄弟（同一个 [`DressView::select`]，只是喂的表不同）⇒ 收藏册
+        // 里"这件能不能点"与"这只能不能换"问的是**同一个判据**，不是两套答案。
+        let pet_view = self.pet_view();
         let (lang, scale) = (self.ui.lang, self.scale_f());
         let g = self
             .gacha
             .as_ref()
             .ok_or_else(|| "库还没连上（收藏册读不到东西）".to_string())?;
         let owned = g.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
-        let mut rows = album_rows(&g.album_entries(&owned, &ids, &view.visible)?, scale);
+        let mut rows = album_rows(
+            &g.album_entries(&owned, &ids, &view.visible, &pet_ids, &pet_view.visible)?,
+            scale,
+        );
         rows.extend(
             g.collection_lines(lang)?
                 .into_iter()
@@ -2881,6 +3390,13 @@ impl App {
             // **不走 [`Self::equip`]**：后者的早退读的是 `picked`，而"先写 picked 还是先比
             // picked"就是这一条的全部安全性所在（见那条上的顺序注释）。
             panel::PanelItem::Wear(i) => self.pick_and_wear(i),
+            // 宠物那一行 ⇒ **当场换成那只**（P5，用户 11-07 拍板①"当场换"）。
+            //
+            // ⚠️ 这一臂与上面那臂**数的是两套下标**：`Wear` 数 [`App::candidates`]（磁盘配件），
+            // `Body` 数 [`App::bodies`]（磁盘本体）。把它们分开的地方是 [`album_rows`] 产行的
+            // 那一刻（`AlbumTarget` 的三臂），不是这里靠"看当前是哪一屏"猜 —— 一个数字两个
+            // 事实源就是门禁 `the_album_routes_pets_to_the_body_index_space` 要拦的形状。
+            panel::PanelItem::Body(i) => self.swap_body(i),
             panel::PanelItem::Lang => self.cycle_lang(),
             panel::PanelItem::Motion => self.cycle_motion(),
             // 公示概率不碰库（见 [`Self::rates_lines`]），所以这一臂不过 `gacha_panel`。
@@ -3091,6 +3607,48 @@ impl App {
         DressView::select(false, owned.as_ref(), &ids)
     }
 
+    /// 这一轮**本体侧开发态豁免**是否成立 = `--allow-unowned-pets` 且真的有 `--db`。
+    ///
+    /// 判据函数与配件侧**共用**（[`dress_exempt_for`]），而**开关字段分开**（拍板④）：配件那条
+    /// 的屏上记号是帽子页标题的 `*`，那一页的列表里根本没有宠物 ⇒ 两条合并必然出现"标打了而没
+    /// 放行"。所以本体这一档**没有屏上记号**，只有这一处判据 + 启动那行 stderr。
+    fn pet_exempt(&self) -> bool {
+        dress_exempt_for(self.opts.allow_unowned_pets, self.dry_run)
+    }
+
+    /// 收藏册宠物行的**库存那道** = [`Self::dress_view`] 的同形兄弟，喂的是 [`Self::bodies`] 的
+    /// id。判定共用 [`DressView::select`]（三档输入那一层），所以"未拥有的件不出现"与"未拥有的
+    /// 本体点不动"从头是**同一判据**，不会有两套答案。
+    ///
+    /// 与配件那侧一样**失败关闭**：给了 `--db` 而库存读不出 ⇒ 可见集为空。宁可这一轮换不了本体
+    /// 而 stderr 有一行解释，也不要"没验过拥有就换成那只"—— 后者是 §9.2 第 20 条要杀的静默。
+    ///
+    /// ⚠️ 只在点击回调里调（收藏册那一行点下去、以及 `album_rows` 给不给下标那一刻），不轮询。
+    /// 与 [`Self::dress_view`] 各自开一次库不是两个事实源：库是事实源，两次读的是同一张表。
+    fn pet_view(&mut self) -> DressView {
+        // 名字要先取：下面 `ensure_gacha()` 可变借用 self，不能同时留 `bodies` 的引用。
+        let ids: Vec<String> = self.bodies.iter().map(|b| b.id.clone()).collect();
+        if self.pet_exempt() || self.dry_run {
+            return DressView::select(true, None, &ids);
+        }
+        if !self.ensure_gacha() {
+            return DressView::select(false, None, &ids);
+        }
+        let owned = match self.gacha.as_ref().map(|g| g.store.owned()) {
+            Some(Ok(o)) => Some(o),
+            Some(Err(e)) => {
+                eprintln!(
+                    "ui: 换本体 ⇒ 读库存失败（{e}）⇒ 未验过的本体一律不放行（库里有什么这轮读不出）"
+                );
+                None
+            }
+            // 走到这里 `ensure_gacha()` 刚返回真 ⇒ 这一支理论上不可达，留着而不是 `expect`
+            // （配件那侧同一条理由，写在 [`Self::dress_view`]：不可达分支不该赌一次 panic）。
+            None => None,
+        };
+        DressView::select(false, owned.as_ref(), &ids)
+    }
+
     /// 点"换一件"：在 [`Self::candidates`] 里把下标往前挪一格，**穿着时立刻换过去**。
     ///
     /// 页导航不在这条行里做（`Dress.next() == Gacha`，标题条就是唯一翻页控件）⇒ 这一行只管
@@ -3228,6 +3786,241 @@ impl App {
         }
     }
 
+    /// 换成另一只本体（P5 = 收藏册里点宠物行那一件事）。**唯一入口**。
+    ///
+    /// ⚠️ **顺序就是它的全部安全性**，所以九步一步不许换位置，理由各自写在行上。整体论证：
+    /// * 第 4 步（`atlas.reload`）是**不可回头的那一条线**之前唯一的写点，而它自己的三条自检
+    ///   全排在它第一笔像素写之前（见 [`Atlas::reload`]）⇒ "新图集 + 旧清单"这个半换形状
+    ///   **构造不出来**：3 之后的步骤全是赋值（`regions` 早在扫盘时就解好，见
+    ///   `BodyCandidate::regions` 那条字段注释，所以这一步没有 IO、不可能失败）。
+    /// * 5–9 里唯一还能失败的 IO 是第 7 步那次 `wear()` 的解码；它的失败形状 = 本体新、帽子无、
+    ///   点名一行 ⇒ **自洽**（屏上没有帽子而库里有那一行，重启会在新本体上重新穿上它 —— 而它
+    ///   过得了门禁，因为第 6 步刚刚按这只新本体重跑过一遍）。
+    /// * calloop 单线程 ⇒ `swap_body` 内部不可能发生 commit，所以即便存在瞬时不一致也不可观测。
+    ///   它并不存在：见上一条。
+    ///
+    /// **峰值 = 一只本体 + 一顶帽**（D16 那条 M1 档）。第 2 步排在第 4 步之前不是顺手：
+    /// 反过来就瞬间有"旧本体 45 + 新本体 45 + 帽 45"在场，而 ≈147 MB **仍落在 150 MiB 门禁内
+    /// ⇒ 什么都不会红**（`148,076 kB` 那一族就是这么漏掉的）。所以这条防线的读数是两处：
+    /// 验收量一次 `VmHWM`，以及源级门禁数 `atlas.reload(` 恰好 1 次 + `take_worn` 排在它前面。
+    ///
+    /// 非目标（写在这里以免被读宽）：**不做**"换回默认本体"这一档 ⇒ `body` 行永远只有 UPSERT、
+    /// 没有 DELETE（换本体是"换到某一只"，不是"脱下"；屏幕上任何时刻都有一只本体）。
+    fn swap_body(&mut self, i: usize) {
+        // —— 第 1 步：四道判完，**任何写入之前**（P4 在 [`Self::pick_and_wear`] 立的那条不变量）。
+        let view = self.pet_view();
+        let gate = view.visible.contains(&i);
+        let in_range = i < self.bodies.len();
+        let same_grid = self
+            .bodies
+            .get(i)
+            .is_some_and(|b| b.grid == self.manifest.grid);
+        let same_id = self.bodies.get(i).is_some_and(|b| b.id == self.body_id);
+        // 名字取在判定之前，只为让拒绝那一行点得出名（用户内容 ⇒ 只进 stderr，不上屏）。
+        let name = self
+            .bodies
+            .get(i)
+            .map(|b| b.id.clone())
+            .unwrap_or_else(|| format!("第 {i} 格"));
+        match plan_swap_body(in_range, gate, same_id, same_grid) {
+            SwapBody::Refused(why) => {
+                eprintln!("ui: 换本体 ⇒ 拒绝 {name}：{why} ⇒ 本体、帽子、`equipped` 一律不动");
+                return;
+            }
+            SwapBody::Same => {
+                eprintln!("ui: 换本体 ⇒ 身上已经是 {name} ⇒ 不解像素、不重投帧、账也不写");
+                return;
+            }
+            SwapBody::Switch => {}
+        }
+        // 四道都过 ⇒ 这一格必然在库里。仍用 `get`：取不到就多打一行后返回，不赌一次 panic
+        // （硬约束 3：宠物不能因为一行下标消失）。
+        let Some((pet_slug, new_regions, sheet)) = self
+            .bodies
+            .get(i)
+            .map(|b| (b.slug.clone(), b.regions.clone(), b.sheet()))
+        else {
+            eprintln!("ui: 换本体 ⇒ 判定放行而 {name} 这一格取不到 ⇒ 不动（判据与库对不上）");
+            return;
+        };
+        let Some(sheet_str) = sheet.to_str().map(|s| s.to_string()) else {
+            eprintln!("ui: 换本体 ⇒ {name} 的 sheet 路径不是 UTF-8 ⇒ 本体不动");
+            return;
+        };
+
+        // —— 第 2 步：先释放帽子。身份要在这一步**之前**取全：[`Equipped`] 只带清单（`slug`/
+        // `slot`），而"这一件是谁"（`id` = 目录名 = 库存与 `equipped` 认的那个键）记在
+        // [`Candidate`] 那一侧，第 6 步重建候选表之后就查不到了。读 `candidates[picked]` 依赖的是
+        // 那条既有不变量"**穿着 ⇒ 穿的就是当前选中这件**"（四个装载点共同维持，见
+        // [`Self::equip`] 那条注释）；`id` 取不到时第 7 步不猜，直接按"出局"处理（宁可多删一行
+        // 并报出原因，也不要"给一只戴不上的宠物留着帽子"）。
+        struct WornHat {
+            id: Option<String>,
+            slot: String,
+            slug: String,
+        }
+        let worn_hat = self.worn.as_ref().map(|w| WornHat {
+            id: self.candidates.get(self.picked).map(|c| c.id.clone()),
+            slot: w.manifest.slot.to_string(),
+            slug: w.manifest.slug.clone(),
+        });
+        if let Some((slug, bytes)) = self.take_worn() {
+            eprintln!(
+                "ui: 换本体 ⇒ 先释放帽子 {slug}（{:.3} MiB 解码）⇒ 峰值始终是一只本体 + 一顶帽",
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+
+        // —— 第 3 步：新本体的轮廓**已经在 [`BodyCandidate`] 里**（扫盘第 ④ 道解的那份）⇒ 这一步
+        // 没有 IO。把"到换的时候再读一次 `polygon.json`"排除掉不是省几微秒，而是让"新清单 +
+        // 旧轮廓"这个半换形状**没有对应的代码**：一个不可能失败的步骤不需要错误分支。
+        // —— 第 4 步：解新 sheet。这一步之后就没有可回头的失败了。
+        match self.atlas.as_mut() {
+            Some(atlas) => {
+                if let Err(e) = atlas.reload(&sheet_str) {
+                    eprintln!(
+                        "ui: 换本体 ⇒ {name} 的 sheet 解不开（{e}）⇒ **本体没换**，屏上仍是 {cur}\
+                         （帽子已在第 2 步释放，库里那一行还在：点「穿上」就回来，重启也会回来）",
+                        cur = self.body_id
+                    );
+                    // ⚠️ 这里**必须**补一次重投：`take_worn` 只换轮廓、不置 `force_draw`（它的
+                    // 注释明写"由调用方决定用户要不要看见"），而此刻屏上留着的是**已经不在内存的
+                    // 那顶帽子**的像素 ⇒ 不重画就是"轮廓说是本体、像素里还有帽子"那格点不到的
+                    // 状态，且它要留到下一次格子真变才被洗掉。
+                    self.force_draw = true;
+                    return;
+                }
+            }
+            None => {
+                // 走到这里意味着 `bodies` 非空而 `atlas` 是 `None` —— `run()` 里那两个条件是
+                // 同一个（`body_regions`），所以这是"以后有人绕过 `run()` 构造 App"的形状。
+                // 报一行、不动，而不是 `unwrap`（硬约束 3）。
+                eprintln!("ui: 换本体 ⇒ 这一轮没有图集像素（`--test-rect` 那条路）⇒ 本体不动");
+                return;
+            }
+        }
+
+        // —— 第 5 步：提交元数据。清单的 `&'static` 在这里才泄（第一次用上它，见
+        // [`BodyCandidate::leaked`]）⇒ 一份进程内每只不同的宠物只泄几 KB，不是每次换都泄。
+        let m = self.bodies[i].leaked();
+        self.manifest = m;
+        self.body_regions = Some(new_regions.clone());
+        self.regions = Some(new_regions.clone());
+        self.body_id = name.clone();
+        if let Some(sim) = self.sim.as_mut() {
+            sim.swap_manifest(m);
+        }
+
+        // —— 第 6 步：按**新本体**重跑配件发现 ⇒ `fits` 不含新 `slug` 的那几件当场出局
+        // （`AccessoryManifest::validate_against` 比的就是 `body.slug`），出局的每一件走既有的
+        // skip-and-log 点名 ⇒ 这几行就是 J4a/J4b 的唯一读数。
+        // ⚠️ 库位置是 `accessory_root()`，**不是**本体库那个根：11-07 交互主轮实测错过这一次，那
+        // 一轮把配件库扫成了本体库那个目录（`accessories: 库 …/pets_p5 ⇒ 0 件可用`）⇒ **换完本体
+        // 之后帽子当场掉、且这一轮再也穿不上任何配件**，而第 7 步的按 id 重认永远查不到幸存者。
+        // 那是一条 headless 读不到的接线错（`App` 要 compositor 才构造得起来），所以判据落在下面
+        // 那条 textual 门禁：`swap_body` 的函数体里连注释都不许写那个函数名。
+        self.candidates = accessory_root()
+            .map(|root| discover_accessories(&root, m, &new_regions))
+            .unwrap_or_default();
+
+        // —— 第 7 步：**按 id 重认**身上那顶（不按位置、不按旧下标）。
+        let survivor = worn_hat
+            .as_ref()
+            .and_then(|hat| hat.id.as_ref())
+            .and_then(|old_id| self.candidates.iter().position(|c| &c.id == old_id));
+        match (&worn_hat, survivor) {
+            (None, _) => {}
+            (Some(hat), Some(j)) => {
+                self.picked = j;
+                // 这里**不重跑库存那道**（与 [`Self::equip`] 不同），是选的：这一件本来就穿着，
+                // 重新装上不是"批准一个未验过的请求"，而重跑会把"库这一刻读不出"那档变成**当场脱
+                // 帽** —— 那等于把一次 IO 故障当成一条判定。
+                match self.wear(j) {
+                    Ok(slug) => eprintln!(
+                        "ui: 换本体 ⇒ 换成 {name}；帽子 {slug} 在新本体上仍然匹配 ⇒ 重新穿上（候选第 {} 格）",
+                        j + 1
+                    ),
+                    Err(e) => eprintln!(
+                        "ui: 换本体 ⇒ 换成 {name}，而帽子 {} 重新装载失败（{e}）⇒ 停在未装备态\
+                         （库里那一行还在：{slot}={id}）",
+                        hat.slug,
+                        id = hat.id.clone().unwrap_or_default(),
+                        slot = hat.slot
+                    ),
+                }
+            }
+            (Some(hat), None) => {
+                let why = match &hat.id {
+                    Some(id) => format!(
+                        "{id} 不在新本体的候选里（{name} 的 `slug` = {pet_slug}，`fits` 不含它，或它的产物门禁在这只上过不了）"
+                    ),
+                    None => format!("释放前没能确定这一件是谁（{pet_slug}）⇒ 不猜"),
+                };
+                eprintln!(
+                    "ui: 换本体 ⇒ 换成 {name}；{why} ⇒ 当场脱帽，并删掉库里 {slot}={id} 那一行",
+                    slot = hat.slot,
+                    id = hat.id.clone().unwrap_or_default()
+                );
+                // 用 `persist_unworn`（只删账）而不是 [`Self::unwear`]：像素在第 2 步就释放了，
+                // `unwear` 此刻读 `worn` 是 `None` ⇒ 它会一声不响地什么都不做，而**库里那一行必须
+                // 删掉** —— 留着就是"重启给一只戴不上的宠物戴帽子"（屏上 A、记忆里 B 那一族）。
+                self.persist_unworn(&hat.slot);
+                // `picked` 不该停在一件已经不存在的格上（[`Self::cycle_accessory`] 那条同形理由：
+                // 那正是"点了没反应"的假按钮形状）。候选表整个换了 ⇒ 重问一次**配件**那一侧的
+                // 可见集；这一刻多开一次库不算两个事实源（同一次点击、同一张表、事件驱动）。
+                let fresh = self.dress_view();
+                self.picked = fresh.visible.first().copied().unwrap_or(0);
+            }
+        }
+
+        // —— 第 7′ 步：面板行要按**新的**候选表重算。收藏册里配件那一格的载荷是 `candidates` 的
+        // 下标，而第 6 步整张表重建过 ⇒ 不刷新就是"行上写着 A、点下去穿的是 B"（两个事实源），
+        // 而它**不进 `content_sig`**（下标故意不在签名里）⇒ 光靠签名自己认不出来。
+        self.refresh_panel_rows();
+
+        // —— 第 8 步：**本轮最承重的一行**。四份 @192 产物的行表逐字节相同 ⇒ 内核下一次给出的
+        // `{key,row,col}` 与换之前**完全相同**，而 [`Self::present`] 那道门（`cell != drawn_cell
+        // || force_draw`）永远不开 ⇒ 删掉这两行的后果是一次**屏上静默不变**的换本体：像素与清单
+        // 都真的换了，而屏幕继续投旧格子（变异 M3 的实测形状 = 545 条全绿而 J1 真机失败，只有
+        // 截图抓得到 ⇒ 所以这两行进了源级门禁的读数，不能只留注释）。
+        // `drawn_cell = None` 排在前：它保证"下一格无条件算作新格"，`force_draw` 保证"就算格子
+        // 没变也投一帧"。先例 = [`Self::redraw_for_scale`] 与 [`Self::equip`] 那条"这正是
+        // `force_draw` 的合法领地 = 签名与 `drawn_cell` 都看不见的那些像素"。
+        self.drawn_cell = None;
+        self.force_draw = true;
+
+        // —— 第 9 步：**账排最后**（先像素后账，[`Self::persist_worn`] 同一条口径）。
+        self.persist_body(&name);
+        eprintln!(
+            "ui: 换本体 ⇒ 当前本体 = {name}（`equipped` 的 {slot} 行）",
+            slot = BODY_SLOT
+        );
+    }
+
+    /// 把"当前本体是这只"记进库的 `body` 行。三档结论与 [`Self::persist_worn`] 完全同一套
+    /// （共用 [`write_equip`]），差别只在**槽位**和那句"重启会回到哪一只"。
+    ///
+    /// 拆成单独一条而不是把 `persist_worn` 改造成带槽位参数：后者的 `index` 是 `candidates` 的
+    /// 下标，而本体那套下标是 `bodies` 的（拍板① 之后仍然分开的两个下标空间，收藏册按
+    /// `PanelItem::Body` / `PanelItem::Wear` 两臂路由）。共用一个函数就要共用一个下标空间，那正是
+    /// `the_album_routes_pets_to_the_body_index_space` 那条门禁要杀的形状。
+    ///
+    /// ⚠️ 只有 UPSERT、没有 DELETE：见 [`Self::swap_body`] 那条"非目标"。
+    fn persist_body(&mut self, id: &str) {
+        match write_equip(&mut self.gacha, self.dry_run, BODY_SLOT, id) {
+            Ok(WornWrite::Written) => {}
+            Ok(WornWrite::DemoSkipped) => eprintln!(
+                "ui: 演示态 ⇒ 本体没记进 equipped（无 `--db` = 内存库，重启必然回到 `--manifest` 那只；要留住就加 `--db`）"
+            ),
+            Ok(WornWrite::NoStore) => eprintln!(
+                "ui: 屏上已换而 equipped 没记上 ⇒ 连不上库 ⇒ 重启会回到 `--manifest` 那只"
+            ),
+            Err(e) => {
+                eprintln!("ui: 屏上已换而 equipped 没记上（{e}）⇒ 重启会回到 `--manifest` 那只")
+            }
+        }
+    }
+
     /// 点"穿上"：把当前选中的那件**到这一步才解码**（内存档 M1 = 一次一件 ⇒ 装备 = 装载、
     /// 脱装 = 释放，配件那份 sheet 不在常驻预算里）。
     ///
@@ -3344,12 +4137,15 @@ impl App {
     /// 在 headless 里**根本没有读数**。合成一个动作之后，"改了像素而忘了记账"不再是写得出来的
     /// 代码；要绕过它就得先删掉这个函数，而那必然在其他调用点上报错。
     ///
-    /// ⚠️ **调用点现在是四个**：[`Self::equip`]（换装页点"穿上"）、[`Self::cycle_accessory`]
-    /// （"换一件"）、[`Self::restore_worn`]（启动恢复）、[`Self::pick_and_wear`]（收藏册点名）。
-    /// 数量本身由 `pixels_and_the_ledger_are_written_by_one_function_only` 逐个数着 ⇒ 加第五个
-    /// 不会静默，而**第四个是被不变量逼出来的**，不是重复：`equip` 的早退读 `picked`，而收藏册
-    /// 要在"点 B 而身上是 A"时真的换过去（完整理由写在 [`Self::pick_and_wear`] 那条上）。
-    /// **以后再加装载/卸下路径，必须走 `wear()`/`unwear()`**，且必须问清"它能不能借道已有的那四个"。
+    /// ⚠️ **调用点现在是五个**：[`Self::equip`]（换装页点"穿上"）、[`Self::cycle_accessory`]
+    /// （"换一件"）、[`Self::restore_worn`]（启动恢复）、[`Self::pick_and_wear`]（收藏册点名）、
+    /// [`Self::swap_body`]（换本体后**旧帽子还在新可见集里**的那一次重穿）。
+    /// 数量本身由 `pixels_and_the_ledger_are_written_by_one_function_only` 逐个数着 ⇒ 加下一个
+    /// 不会静默，而**第四个与第五个都是被不变量逼出来的**，不是重复：`equip` 的早退读 `picked`，
+    /// 而收藏册要在"点 B 而身上是 A"时真的换过去（完整理由写在 [`Self::pick_and_wear`] 那条上）；
+    /// `swap_body` 那一次则是"下标整套换了一套房"之后唯一能把那顶帽重新放上身的手法（它排在
+    /// `take_worn` 之后，所以内存里任何时刻仍最多两张 sheet）。
+    /// **以后再加装载/卸下路径，必须走 `wear()`/`unwear()`**，且必须问清"它能不能借道已有的那几个"。
     ///
     /// ⚠️ **调用方如果原本穿着，必须先 [`Self::take_worn`]**：这里不做，是因为 [`cycle_accessory`]
     /// 要在两件之间插一行"释放了多少 MiB"，而那行要在旧 sheet 还在的时候取它的字节数
@@ -3448,9 +4244,27 @@ impl App {
             // 没记过 ⇒ 一行都不打。启动噪音要留给"出事了"，而"上次没穿"是常态。
             return;
         }
+        // —— **先把本体那一行剥掉**（P5）。`body` 按字母序排在所有配件槽位**之前** ⇒ 它是整表的
+        // 第一条，而 [`plan_restore`] 四道里第 1 道只问"配件表里有没有这个 id"、第 3 道比"槽位 vs
+        // 清单声明"，本体行必然撞上其中一道，于是 stderr 打出的是一句**说的是配件的假话**（它压根
+        // 不是配件）而每一轮启动都打。坏的不是行为（那一行 `continue` 掉了，一次都不占 `wear`，帽子
+        // 照旧回来），是那句话 + 那句永久噪音 —— 详见 [`split_body_row`] 那段。
+        // 剥下来的那一行**这里不办事**：起点本体早在 surface 建起来之前就由 [`db_body_row`] 定完了
+        // （那一臂自己点名），所以此刻唯一的活是"库里记的本体与屏上这只不一致"时补一行名 ——
+        // 那种情况只可能是 `Keep(Some(理由))` 那一条（或 `db_body_row` 读失败），而它必须说得出
+        // 来，否则"上次换的那只自己没了"就成了一句没人说过的话。
+        let (body, accessories) = split_body_row(&rows);
+        if let Some(id) = body.as_deref().filter(|id| *id != self.body_id) {
+            eprintln!(
+                "body: 库里那一行 {slot}={id}，而本轮起点本体是 {cur} ⇒ 那一只这一轮没装上\
+                 （扫盘没交出它：目录不存在 / 产物坏了 / 格子档不同）",
+                slot = BODY_SLOT,
+                cur = self.body_id,
+            );
+        }
         // 可见集与换装页共用同一次判定（`dress_view`）⇒ 不会有"帽子页里不出现而启动却穿上了"。
         let view = self.dress_view();
-        let plan = plan_restore(&rows, &ids, &slots, &view.visible);
+        let plan = plan_restore(&accessories, &ids, &slots, &view.visible);
         for note in &plan.notes {
             eprintln!("ui: 恢复上次穿着 ⇒ {note}");
         }
@@ -5072,16 +5886,21 @@ mod tests {
             "`wear` 里没有 `persist_worn` ⇒ 四处装载全都不记账，而 headless 测不出来"
         );
 
-        // ③ 四个装载点都真的走 `wear`（少一个就是"那条路又自己写了一遍像素"）。
+        // ③ 五个装载点都真的走 `wear`（少一个就是"那条路又自己写了一遍像素"）。
         //
         // ⚠️ **这个数从 3 变成 4 是 P4 那一格（收藏册点名）逼出来的，不是顺手加的**：那一条
         // **不能借道 [`App::equip`]**，因为 `equip` 的早退读的是 `picked`，而收藏册要在
         // "身上是 A、点的是 B"时真的换过去（完整理由在 `pick_and_wear` 那条注释上）。
-        // 第五个调用点如果将来出现，红的是这一条，而那正是要人看一眼"它能不能复用前四个"的时刻。
+        // ⚠️ **从 4 变成 5 是 P5（换本体）那一格逼出来的，同一条理由**：换完本体后 `candidates`
+        // 是**新可见集**，旧帽子如果还在里面，它的下标已经不是身上那格的旧下标 ⇒ 只能按 id 重认
+        // 一次再走 `wear`。在这条路上自己写那四行赋值 = 屏上戴着帽子而 `equipped` 记的是上一只
+        // 本体的那一件（= 变异 G 那一族，只是换了主语）。
+        // 第六个调用点如果将来出现，红的是这一条，而那正是要人看一眼"它能不能复用前五个"的时刻。
         assert_eq!(
             code.matches("self.wear(").count(),
-            4,
-            "`wear` 应当被穿上 / 换一件 / 启动恢复 / 收藏册点名 四处共用，实际调用点 {} 个",
+            5,
+            "`wear` 应当被穿上 / 换一件 / 启动恢复 / 收藏册点名 / 换本体后重穿幸存那件 五处共用，\
+             实际调用点 {} 个",
             code.matches("self.wear(").count()
         );
         // ④ 新那条路只有一个入口，别让它被复制一份到某个 `match` 臂里（复制的那份会自己
@@ -5116,6 +5935,127 @@ mod tests {
         assert!(
             at("self.picked = i") < at("self.wear(i)"),
             "装载排在写 `picked` 之前 ⇒ `wear` 装的是上一件，而屏上下标已经换"
+        );
+
+        // ⑥ **P5：换本体这一族的同一件事，换了四个主语**。四条计数各钉一个"唯一落点"，
+        //    第五段（下面 ⑦）钉的是那九步的**次序**。全部理由同一个：`App` 在没有 compositor
+        //    的机器上构造不起来 ⇒ "屏上是那只而记忆里是另一只"、"屏上一个像素没动而日志说换了"
+        //    这两类形状在 headless 里除了读文本没有别的读数（①–⑤ 与 P3 变异 G 同一族）。
+        assert_eq!(
+            code.matches("self.swap_body(").count(),
+            1,
+            "`swap_body` 只许被 `on_panel_press` 的 `Body` 那一臂调用，实际 {} 处 ⇒ 多出来的那份\
+             会自己决定九步的次序",
+            code.matches("self.swap_body(").count()
+        );
+        assert_eq!(
+            code.matches("self.persist_body(").count(),
+            1,
+            "`equipped` 的 `body` 行只许在 `swap_body` 末尾写一次（先像素后账），实际 {} 处",
+            code.matches("self.persist_body(").count()
+        );
+        assert_eq!(
+            code.matches("self.manifest = ").count(),
+            1,
+            "本体清单只有一个写入点（`swap_body` 第 5 步）⇒ 第二处赋值就是\"清单是新的而 atlas \
+             是旧的\"那个半换状态的另一半（实际 {} 处）",
+            code.matches("self.manifest = ").count()
+        );
+        // ⚠️ needle 带 `&`：`atlas.reload(` 这个字面量在 [`Atlas::reload`] 那条**文档注释**里
+        // 也出现过（它把这条门禁的口径写在注释上），不带 `&` 会数到 2 而那是文档不是代码。
+        assert_eq!(
+            code.matches("atlas.reload(&").count(),
+            1,
+            "原地重载只许有一处 ⇒ 写成 load-then-swap（先 `Atlas::load` 再换掉）峰值就是**两只\
+             本体 ≈147 MB，而它落在 150 MiB 门禁内 ⇒ 什么都不会红**，只有这一条 + 验收那一次 \
+             `VmHWM` 能抓（实际 {} 处）",
+            code.matches("atlas.reload(&").count()
+        );
+
+        // ⑦ **九步的次序**（本轮最承重的四行了）。`reload` 是不可回头的那一条线，所以：
+        //    判定与"卸下旧帽"排在它**前**（失败时屏上还是原来那只、账一个字不动），
+        //    记账、`drawn_cell = None`、`candidates` 重跑排在它**后**。
+        //    · 删掉 `drawn_cell = None` = **本轮的变异 G**：四份产物的行表逐字节相同 ⇒
+        //      `cell != drawn_cell` 那条永不开 ⇒ 545 条全绿而真机 J1 失败（屏上静默不变）。
+        //      ⇒ 这一行**只有**下面这条 textual 读数，真机上唯一的读数是一张截图。
+        let swap = body("swap_body");
+        let said = |needle: &str| {
+            swap.find(needle)
+                .unwrap_or_else(|| panic!("`swap_body` 里没有 `{needle}` ⇒ 那九步被拆了"))
+        };
+        assert!(
+            said("plan_swap_body(") < said("atlas.reload(&"),
+            "判定排在解像素之后 ⇒ 被拒的那一次已经改过图集，而日志说的是\"没换\""
+        );
+        assert!(
+            said("self.take_worn()") < said("atlas.reload(&"),
+            "旧帽没先卸下就去解新本体 ⇒ 峰值 = 本体 + 旧帽 + 新本体（M1 档那条 148,076 kB）"
+        );
+        assert!(
+            said("atlas.reload(&") < said("self.persist_body("),
+            "账排在像素之前 ⇒ 解码失败那一轮库里记着一只屏上没有的本体"
+        );
+        assert!(
+            said("atlas.reload(&") < said("self.drawn_cell = None"),
+            "`drawn_cell` 的复位没排在 `reload` 之后 ⇒ 换本体是一次屏上静默不变（变异 G 的 P5 版）"
+        );
+        assert!(
+            said("discover_accessories(") < said("let fresh = self.dress_view()"),
+            "`picked` 在 `candidates` 重跑之前被改写 ⇒ 拿旧下标去索引新表，点下去是另一件"
+        );
+
+        // ⑥′ **第 6 步那个库位置**：11-07 交互主轮实测抓到的一刀，而它**不在**上面任何一条的射程里
+        // （次序全对、只是根取错了）。`swap_body` 当时写的是 `pet_root()` ⇒ 配件库被扫成本体库那个
+        // 目录，读数 `accessories: 库 …/pets_p5 ⇒ 0 件可用` ⇒ 换完本体帽子当场掉、这一轮再也穿不上
+        // 任何配件，而第 7 步按 id 重认幸存者永远查不到。变异（把 `accessory_root` 换回 `pet_root`）
+        // 在 headless 里 545 条全绿 ⇒ 这一族的唯一防线是这两行 + 一张截图。
+        assert!(
+            !swap.contains("pet_root("),
+            "`swap_body` 里出现了 `pet_root(` ⇒ 重扫配件用的是本体库的根，换完本体配件全灭"
+        );
+
+        // ⑧ **启动恢复那条路上，剥壳必须排在判定之前**（变异 M6 唯一的读数）。
+        //
+        // `a_body_row_is_not_an_accessory_note` 测的是 `split_body_row` 与 `plan_restore` 这两个
+        // **纯函数**，而 M6 那一刀（把 `restore_worn` 里的 `&accessories` 换回 `&rows`）**实测
+        // 204 条全绿** ⇒ 那一族的洞原样复发：判定对、接线错，headless 里没人读到接线。这一族
+        // 从 P3 的变异 G 起就是同一个形状，而防线从来只有一种 = 读源码文本。
+        let rw = body("restore_worn");
+        let said_rw = |needle: &str| {
+            rw.find(needle)
+                .unwrap_or_else(|| panic!("`restore_worn` 里没有 `{needle}` ⇒ 剥壳那一步被拆了"))
+        };
+        assert!(
+            said_rw("split_body_row(") < said_rw("plan_restore(&accessories"),
+            "`plan_restore` 收到的不是剥过壳那张表 ⇒ 库里有 `body` 行时每轮启动多一句假话\
+             （「磁盘上找不到这一件」说的是本体）"
+        );
+        assert!(
+            !rw.contains("plan_restore(&rows"),
+            "`plan_restore` 直接吃了整表 ⇒ 同上一条，只是这次是文本形状变了而次序还在"
+        );
+
+        // ⑨ **两道格子档门禁都必须是整块 `Grid` 比较**（变异 M5 的两次读数）。
+        //
+        // `plan_swap_body_partitions_the_four_outcomes` 那张真值表**挡不住这一刀**：`same_grid`
+        // 在那里是一个传进来的 `bool`，把生产它的那一句放松成只比 `w/h`，真值表照旧全绿。
+        // ⇒ 这一族的读数只有两处文本：扫盘那一道（`check_body`）与运行时第二道保险
+        // （`swap_body` 里算 `same_grid` 那一句）。放松任何一处的后果都不是"报错"而是
+        // **换上一只像素错位的新本体**（`rows` 决定解码缓冲长度，`cols` 决定寻址），
+        // 而那在屏上是一只能看的宠物 —— 只有这两条 + `atlas.reload` 的长度自检能红。
+        assert_eq!(
+            code.matches("manifest.grid != *cur").count(),
+            1,
+            "扫盘那道档门禁不是整块 `Grid` 比较了（实际 {} 处）⇒ 判据放松成 `w/h` 的那一天，\
+             行表不同的本体会被放进来",
+            code.matches("manifest.grid != *cur").count()
+        );
+        assert_eq!(
+            code.matches("b.grid == self.manifest.grid").count(),
+            1,
+            "运行时第二道保险必须是整块比较；放松成 `w/h` 只比尺寸不比行数/列数 ⇒\
+             一只 8 行的本体被换进 4 行的缓冲（实际 {} 处）",
+            code.matches("b.grid == self.manifest.grid").count()
         );
     }
 
@@ -5196,9 +6136,13 @@ mod tests {
                 // "报表那五行"单独钉住，而分页那一段钉的是"逐件那几张行 + 页码控件"。
                 let ids: Vec<String> = g.catalog.accessories().map(|i| i.id.clone()).collect();
                 let visible: Vec<usize> = (0..ids.len()).collect();
+                // 本体那一侧同一条**最坏情况**纪律（P5）：`pet_ids` 交全部 catalog 宠物、
+                // `pet_visible` 交全部下标 ⇒ 宠物行全是 `Body`，走的也是那条窄预算。
+                let pet_ids: Vec<String> = g.catalog.pets().map(|i| i.id.clone()).collect();
+                let pet_visible: Vec<usize> = (0..pet_ids.len()).collect();
                 let owned = g.store.owned().expect("刚抽完十连的内存库该读得出库存");
                 let entries = g
-                    .album_entries(&owned, &ids, &visible)
+                    .album_entries(&owned, &ids, &visible, &pet_ids, &pet_visible)
                     .expect("逐件收藏册的行该读得出来");
                 let mut content = album_rows(&entries, scale);
                 content.extend(
@@ -5335,7 +6279,7 @@ mod tests {
             items: vec![
                 pick("hood_night"), // R · 夜兜
                 pick("bell_gold"),  // N · 金铃
-                pick("cat_shiro"),  // N · 小白（宠物：有下标也永远不给点）
+                pick("cat_shiro"),  // N · 小白（宠物：下标在**本体那一张表**里，不在配件表里）
                 pick("cap_blue"),   // N · 蓝帽
                 pick("hat_straw"),  // SSR · 草帽（"抽到了而磁盘没产物"那一件）
             ],
@@ -5361,37 +6305,51 @@ mod tests {
     /// 的写法：`visible` 不是手填的常量，而是**换装页自己那个纯函数**（[`DressView::select`]）
     /// 跑出来的 ⇒ 两边共用同一个下标空间这件事由构造说话。反查用 catalog 的 `name`，因为
     /// [`AlbumEntry`] 刻意不带 id（"catalog 不认的 id 也要能进这张表"那一条）。
+    ///
+    /// ⚠️ **P5 让这一条变成两问而不是一问**：本体走 `Body` 那套下标（`bodies`），配件走
+    /// `Wear` 那套（`candidates`），而 fixture 里 `cat_shiro` **同时**在两张表里 ⇒ 同一个数字
+    /// `1` 在这两块面上指的是两件不同的东西。所以这里两条反查分开写，一条不许替另一条说话
+    /// （"两套下标互不冒充"那条独立门禁 = [`the_album_routes_pets_to_the_body_index_space`]）。
     #[test]
     fn the_row_payload_is_the_same_index_the_dress_page_cycles() {
         let g = album_fixture();
         let ids = album_ids();
         let owned = owned_of(&["bell_gold", "cat_shiro", "cap_blue", "hood_night"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
+        // 本体表刻意与配件表**错位**：`cat_shiro` 在配件表是下标 2，在本体表是下标 1，
+        // 而 `penguin_bolt` 没抽到 ⇒ 它被同一道闸门挡在外面（于是 `pet_visible` 只有 `[1]`，
+        // 拿它当 `[0..len]` 的那点侥幸也一并被测掉）。
+        let pet_ids: Vec<String> = ["penguin_bolt", "cat_shiro"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pet_view = DressView::select(false, Some(&owned), &pet_ids);
         let entries = g
-            .album_entries(&owned, &ids, &visible)
+            .album_entries(&owned, &ids, &visible, &pet_ids, &pet_view.visible)
             .expect("逐件条目该读得出来");
 
         // 条目序 = 档序（N 三件按档内序 → R），而 `hat_straw` 不在 `owned` 里 ⇒ 根本不出现。
+        // 那只猫这一轮**给下标了**，但那是 `Body` 那套下标里的 1（= `pet_ids` 里的 `cat_shiro`）。
+        use AlbumTarget::{Accessory, Body, None as Inert};
         let want = [
-            ("金铃", Some(3usize)),
-            ("小白", None),
-            ("蓝帽", Some(0)),
-            ("夜兜", Some(1)),
+            ("金铃", Accessory(3)),
+            ("小白", Body(1)),
+            ("蓝帽", Accessory(0)),
+            ("夜兜", Accessory(1)),
         ];
         assert_eq!(entries.len(), want.len(), "条目数不等于 catalog ∩ owned");
-        for (e, (name, w)) in entries.iter().zip(want) {
+        for (e, (name, t)) in entries.iter().zip(want) {
             assert_eq!(e.name, name, "条目顺序漂了");
-            assert_eq!(e.wear, w, "{name} 的载荷下标不对");
+            assert_eq!(e.target, t, "{name} 的载荷下标不对");
         }
         assert!(
             entries.iter().all(|e| e.name != "草帽"),
             "未拥有的件不该进逐件册（它出现在汇总那一行就够了）"
         );
 
-        // **真正的那条**：每个载荷都能拿它去 `ids` 里反查出这一件自己的 id。
+        // **真正的那条**：每个载荷都能拿它去**它那一张表**里反查出这一件自己的 id。
         // 写成"等于目录里的枚举序号"的话，这行永远验不出任何东西。
         for e in &entries {
-            let Some(i) = e.wear else { continue };
             let id = g
                 .catalog
                 .items
@@ -5399,28 +6357,49 @@ mod tests {
                 .find(|it| it.name == e.name)
                 .map(|it| it.id.clone())
                 .unwrap_or_else(|| panic!("{} 不在 fixture 目录里", e.name));
-            assert_eq!(
-                ids[i], id,
-                "Wear({i}) 说的不是 {id} 在 candidates 里的位置 ⇒ 点这行会穿错件"
-            );
-            // 载荷必然在闸门放行集里（`pick_and_wear` 的那道 `visible.contains` 恒真，
-            // 而它**必须**仍然查一遍 —— 屏上挂着的行可能已经比这一轮的记忆旧一次）。
-            assert!(
-                visible.contains(&i),
-                "给了下标却没让它过闸 = 屏上给了一个必然被拒的按钮"
-            );
+            match e.target {
+                Accessory(i) => {
+                    assert_eq!(
+                        ids[i], id,
+                        "Wear({i}) 说的不是 {id} 在 candidates 里的位置 ⇒ 点这行会穿错件"
+                    );
+                    // 载荷必然在闸门放行集里（`pick_and_wear` 的那道 `visible.contains` 恒真，
+                    // 而它**必须**仍然查一遍 —— 屏上挂着的行可能已经比这一轮的记忆旧一次）。
+                    assert!(
+                        visible.contains(&i),
+                        "给了下标却没让它过闸 = 屏上给了一个必然被拒的按钮"
+                    );
+                }
+                Body(i) => {
+                    assert_eq!(
+                        pet_ids[i], id,
+                        "Body({i}) 说的不是 {id} 在 bodies 里的位置 ⇒ 点这行会换成另一只"
+                    );
+                    assert!(
+                        pet_view.visible.contains(&i),
+                        "给了本体下标却没让它过库存那道 = 屏上给了一个必然被拒的按钮"
+                    );
+                }
+                Inert => panic!("{id} 这一行既没配件下标也没本体下标 ⇒ 上面 want 里给了它下标"),
+            }
         }
-        // 反面对照：闸门放行了下标 2（那只猫）而条目**不给**载荷 ⇒ "看得见但不给点"这一格
-        // 是本轮唯一的非配件形状，它必须是 visible 里唯一没被任何行认领的一格。
+        // 反面对照（P5 把它**翻过来了**）：配件闸门放行了下标 2（那只猫在配件表里占的那一格）
+        // 而**没有任何配件行**认领它 ⇒ 同一个 id 在两张表里时，路由走本体那一套，
+        // 绝不因为"它在 `candidates` 里也有位置"就产出一条 `Wear(2)`。
         let inert: Vec<usize> = visible
             .iter()
             .copied()
-            .filter(|i| !entries.iter().any(|e| e.wear == Some(*i)))
+            .filter(|i| {
+                !entries
+                    .iter()
+                    .any(|e| matches!(e.target, Accessory(j) if j == *i))
+            })
             .collect();
         assert_eq!(
             inert,
             vec![2],
-            "宠物之外还有格子被放行了却没行认领 ⇒ 那件点不到"
+            "宠物之外还有格子被放行了却没行认领 ⇒ 那件点不到（而 2 那一格**本该**空着：它是本体，\
+             行在那一套下标里）"
         );
     }
 
@@ -5476,10 +6455,319 @@ mod tests {
         assert_eq!(plan_pick_wear(true, true, 3, 4), PickWear::SelectAndWear);
     }
 
+    /// [`plan_swap_body`] 的**全划分**：16 格（四道输入）每一格都落进三档之一，而**换本体那九步
+    /// 只有一格能打**，剩下的 15 格要么"已经是这只"、要么带出**那一道自己的名字**。
+    ///
+    /// 抄 [`plan_pick_wear_partitions_the_three_outcomes`] 的写法（那张 8 格 / 三档输入，这张
+    /// 16 格 / 四档输入）。三条最要紧的格子单独钉：
+    /// ① **任何一道没过都不许给 `Same`**：那句"身上已经是这只"听起来像成功，把它排在门禁之前
+    ///    就是把"我为什么点不动它"回答成一个不需要回答的问题（配件那侧的 `AlreadyWorn` 同一条
+    ///    理由、同一次实现选择，见 [`plan_pick_wear`] ④ 那一格）。
+    /// ② `same_grid = false` 那一族**先于**库存那道被点名 ⇒ 拒绝说的是档、不是库存，因为
+    ///    [`crate::atlas::Atlas::reload`] 自检读回的三个数仍是**旧**本体的（完整理由写在
+    ///    [`plan_swap_body`] 那条注释上；扫盘那一步才是拍板② 的屏上形状，这里只是第二道保险）。
+    /// ③ 三道拒绝的文案**两两不同**（14 格只该有三句不同的话）⇒ "没反应"这一格屏上长得一样，
+    ///    只有 stderr 那一句分得开三种原因，这是"失败关闭必须点名"那条纪律的最低读数。
+    #[test]
+    fn plan_swap_body_partitions_the_four_outcomes() {
+        let mut switched = 0;
+        let mut same = 0;
+        let mut refused = 0;
+        let mut reasons: Vec<&'static str> = Vec::new();
+        for in_range in [false, true] {
+            for gate in [false, true] {
+                for same_id in [false, true] {
+                    for same_grid in [false, true] {
+                        let got = plan_swap_body(in_range, gate, same_id, same_grid);
+                        let cell = format!(
+                            "in_range={in_range} gate={gate} same_id={same_id} same_grid={same_grid}"
+                        );
+                        // 期望值按**判定的顺序**算，不按"哪几道过了"算 ⇒ 次序被改就是这里红。
+                        if !in_range || !same_grid || !gate {
+                            let SwapBody::Refused(why) = got else {
+                                panic!("{cell} ⇒ 门禁没过却给出 {got:?}（那就是放行）");
+                            };
+                            let needle = if !in_range {
+                                "本体库里"
+                            } else if !same_grid {
+                                "格子档"
+                            } else {
+                                "库存"
+                            };
+                            assert!(
+                                why.contains(needle),
+                                "{cell} ⇒ 该点「{needle}」那一道的名，实际给的是「{why}」"
+                            );
+                            refused += 1;
+                            reasons.push(why);
+                        } else if same_id {
+                            assert_eq!(got, SwapBody::Same, "{cell} ⇒ 三道全过而点的就是当前这只");
+                            same += 1;
+                        } else {
+                            assert_eq!(got, SwapBody::Switch, "{cell} ⇒ 四道全过而点的不是这只");
+                            switched += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            switched + same + refused,
+            16,
+            "四道输入的真值表有格子没落进三档"
+        );
+        // `Switch` 与 `Same` **各只有一格**（三道门禁必须全过，只剩 `same_id` 分这两档）。
+        assert_eq!(
+            (switched, same, refused),
+            (1, 1, 14),
+            "三档分布变了 ⇒ 有人动了判定次序，或者把某一道门禁合并进了另一道"
+        );
+        assert_eq!(
+            reasons.iter().filter(|w| w.contains("本体库里")).count(),
+            8,
+            "「这一格没有」那一族该占 16 格里的一半（另外三道全不参与）"
+        );
+        // ③ 三道文案两两不同（14 格拒绝只该有三句不同的话）。
+        let distinct: std::collections::BTreeSet<&str> = reasons.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "14 格拒绝只给出 {} 句不同的话 ⇒ 有三道被合并成了同一句",
+            distinct.len()
+        );
+    }
+
+    /// **一个数字，两张表**（P5 唯一"点错本体"级别的事故）。
+    ///
+    /// 收藏册那一屏上，配件行走 [`panel::PanelItem::Wear`]（载荷 = [`App::candidates`] 的下标），
+    /// 宠物行走 [`panel::PanelItem::Body`]（载荷 = [`App::bodies`] 的下标）。这两套下标**住在同一
+    /// 个 `usize` 空间里**，所以同屏出现 `Wear(1)` 与 `Body(1)` 是完全正常的，而它们必须指着两件
+    /// 不同的东西 —— 反过来说：谁把 `album_entries` 里那两次 `position()` 合并成一次（"反正都是
+    /// 查 id"），屏上就会有一行点下去换成一只猫、另一行点下去戴上夜兜，而**这两次都自洽**，
+    /// headless 里除了这一条没有别的读数。
+    ///
+    /// 抄 [`the_row_payload_is_the_same_index_the_dress_page_cycles`] 的 fixture 与"按 catalog 的
+    /// `name` 反查"的手法（[`AlbumEntry`] 刻意不带 id），差别是这一条**同时**拿两套下标去各自的
+    /// 表里反查，并且**明确禁止**拿它去对面那张表里反查（那两条 `NOT` 断言才是这条的名字）。
+    #[test]
+    fn the_album_routes_pets_to_the_body_index_space() {
+        let g = album_fixture();
+        let ids = album_ids();
+        let owned = owned_of(&["bell_gold", "cat_shiro", "cap_blue", "hood_night"]);
+        let visible = DressView::select(false, Some(&owned), &ids).visible;
+        // `penguin_bolt` 没抽到 ⇒ 被同一道闸挡在 `pet_visible` 外面，于是 `cat_shiro` 在本体
+        // 那一张表里落在**下标 1** —— 而 1 在配件那张表里是 `hood_night`（夜兜）。
+        let pet_ids: Vec<String> = ["penguin_bolt", "cat_shiro"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pet_view = DressView::select(false, Some(&owned), &pet_ids);
+        assert_eq!(
+            pet_view.visible,
+            vec![1],
+            "fixture 的前提变了：未拥有的本体被放行了 ⇒ 下面那两条对照就没意义了"
+        );
+
+        let entries = g
+            .album_entries(&owned, &ids, &visible, &pet_ids, &pet_view.visible)
+            .expect("逐件条目该读得出来");
+        let rows = album_rows(&entries, 1.0);
+        assert_eq!(rows.len(), entries.len(), "一行一件这条断了");
+
+        // **同屏两格同一个数字**：`Wear(1)` 与 `Body(1)` 都在，且各自的文本说的是各自那件。
+        let wear = rows
+            .iter()
+            .find(|r| r.item == panel::PanelItem::Wear(1))
+            .expect("夜兜该是 Wear(1)");
+        let body = rows
+            .iter()
+            .find(|r| r.item == panel::PanelItem::Body(1))
+            .expect("小白该是 Body(1)");
+        assert!(
+            wear.text.contains("夜兜"),
+            "Wear(1) 那行没写夜兜：{:?}",
+            wear.text
+        );
+        assert!(
+            body.text.contains("小白"),
+            "Body(1) 那行没写小白：{:?}",
+            body.text
+        );
+        // 这两条 `NOT` 才是这条门禁的名字：**拿错表**的两种写法各打一条。
+        assert!(
+            !wear.text.contains("小白"),
+            "Wear(1) 那行读到了本体那张表的东西 ⇒ 两套下标混用了（配件那臂去查了 pet_ids）"
+        );
+        assert!(
+            !body.text.contains("夜兜"),
+            "Body(1) 那行读到了配件那张表的东西 ⇒ 两套下标混用了（本体那臂去查了 candidates）"
+        );
+
+        // 可点性这一格**必须一样**：宠物不再是"永远只读"（那是 P4 的形状），而画师读的正是
+        // 可点性 ⇒ 两行都有强调条，用户看不出"这是换一件衣服"和"这是换一只本体"的区别，
+        // 那件事由 `pet` 那个 ASCII 标与本体自己那几个像素承担（不上屏新字形）。
+        for r in [&wear.item, &body.item] {
+            assert!(
+                r.actionable(),
+                "{r:?} 给了下标却不 actionable ⇒ 假按钮的反面：真按钮点不到"
+            );
+        }
+        // 反向对照：那只没抽到的本体**不产行**（它压根不在 fixture 目录里），而目录里那只
+        // 若被 `pet_visible` 挡在外面就退化成只读 —— 后者由
+        // `an_unowned_or_undiskable_entry_stays_inert` 正面钉住，这里只留一句名。
+        assert!(
+            rows.iter().all(|r| r.item != panel::PanelItem::Body(0)),
+            "`penguin_bolt` 没抽到却有一行指着本体第 0 格 ⇒ 库存那道在本体侧空转"
+        );
+    }
+
+    /// [`plan_body_override`] 的五格：**只有两格**能让库里那一行赢，而那一只必须**在启动扫盘
+    /// 交出来的表里**且**不是 `--manifest` 那一只**。
+    ///
+    /// 抄 [`plan_restore`] 那两条"手工行必须出局并报一句"的写法（同一族判据：库里记着一个
+    /// 这轮装不上的东西 ⇒ 不办，但必须点名）。要紧的是三件事各被钉住一次：
+    /// ① `Keep(None)`（老库、没有那一行）**不带理由** ⇒ 启动一个字都不打，那条"行为逐字节
+    ///   不变"的判据（拍板③ 的后半）就是这一格；
+    /// ② 有行而不覆盖 ⇒ 理由必须**非空**（静默退回 `--manifest` 就是假门禁：用户上次换的本体
+    ///   自己没了而没有任何一句话）；
+    /// ③ 库里那一行**就是**起点那只 ⇒ 也是 `Keep(None)` 且无理由 —— 它不是"覆盖"（那一只本来
+    ///   就在身上），给它打一行点名就是把"什么都没变"说成"我替你换了一只"，与 ① 同族。
+    #[test]
+    fn plan_body_override_wins_only_when_the_row_names_a_discovered_pet() {
+        let pet_ids: Vec<String> = ["cat_shiro", "cat_ui", "penguin_bolt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let start = "cat_shiro";
+
+        // ① 没有那一行 ⇒ 不覆盖，而且**没有理由**（那是常态，不是事故）。
+        match plan_body_override(None, &pet_ids, start) {
+            BodyChoice::Keep(None) => {}
+            other => panic!("库里没有 body 行却给出 {other:?} ⇒ 老库的行为变了"),
+        }
+
+        // ② 那一行指的就是表里的第 1 格 ⇒ 覆盖，而且**赢**（`--manifest` 那一只让位）。
+        //    下标必须能反查回同一个 id ⇒ 与 `the_album_routes_pets_to_the_body_index_space`
+        //    同一条"载荷下标 = 那张表自己的位置"的纪律。
+        match plan_body_override(Some("cat_ui"), &pet_ids, start) {
+            BodyChoice::Override(i) => {
+                assert_eq!(
+                    pet_ids[i], "cat_ui",
+                    "Override({i}) 说的不是 cat_ui 在发现表里的位置 ⇒ 起点本体换成另一只"
+                );
+            }
+            other => panic!("库里那一行点的是发现表里有的本体却给出 {other:?} ⇒ 拍板③ 没生效"),
+        }
+
+        // ③ 那一行指的就是**起点那一只**（用户上次没换，或换了又换回来）⇒ 不覆盖，也**没有
+        //    理由**。这一格与 ① 是同一族：这一轮没有发生"覆盖" ⇒ 一行点都不该打；给它点一行
+        //    就是把"什么都没变"说成"我替你换了一只"（`--manifest` 那一只本来就是它）。
+        //    ⚠️ 这一格的存在意味着 `id == start_id` 的判据**必须**在 `position()` 之前问：
+        //    它指的是表里有的东西，走 ④ 那一支会得到一句假话。
+        match plan_body_override(Some("cat_shiro"), &pet_ids, start) {
+            BodyChoice::Keep(None) => {}
+            other => panic!("库里那一行就是起点那只却给出 {other:?} ⇒ 启动凭空多一行点名"),
+        }
+
+        // ④ 有行而表里没有这一只（目录不存在 / 产物坏了 / **格子档不同被扫盘挡掉**）⇒ 不覆盖，
+        //    且必须点出为什么。这三族合并成一句是选过的：它们在启动这一刻**没有可区分的动作**
+        //    （都不覆盖、都照旧用 `--manifest`），而真正区分它们的那一行在 [`check_body`] /
+        //    [`discover_pets`] 的 skip-and-log 里，那里才是点名的地方。
+        for ghost in ["dragon_pip", ""] {
+            match plan_body_override(Some(ghost), &pet_ids, start) {
+                BodyChoice::Keep(Some(why)) => assert!(
+                    why.contains("不在启动扫盘"),
+                    "拒绝覆盖却没说清拦在哪一道：{why}"
+                ),
+                other => panic!("库里那一行指 {ghost:?} 不在表里却给出 {other:?}"),
+            }
+        }
+        // ⑤ 表为空（没有本体库 / `--test-rect`）⇒ 任何一行都不许覆盖 —— 这一格单独钉，因为
+        //    `position()` 在空表上恒 `None`，写成 `bodies.first()` 之类的"顺手"就恒真了。
+        assert!(matches!(
+            plan_body_override(Some("cat_ui"), &[], start),
+            BodyChoice::Keep(Some(_))
+        ));
+        // ⑤ 的另一面：表为空而那一行**恰好就是起点那只**（`--manifest` 与库里记的是同一只，
+        //    而产物没烘出来 ⇒ 起点照旧是它）⇒ 无理由。少了这一格，`id == start_id` 那一支放
+        //    在 `position()` 之后就会在"没有本体库"的机器上打一行假点名。
+        assert!(matches!(
+            plan_body_override(Some("cat_shiro"), &[], start),
+            BodyChoice::Keep(None)
+        ));
+    }
+
+    /// **`body` 那一行不是配件的账**（P5 给启动恢复补的那道剥壳，J3/M6 的读数）。
+    ///
+    /// 这条不测"剥得对"，测的是**不剥会说出哪句假话** —— 那句在 headless 里除了这里没有别的读数，
+    /// 而它是真机上会被当成"功能没生效"的误导：`磁盘上找不到这一件（已删除，或五道门禁没过）`
+    /// 说的是一行**根本不是配件**的账，而且**每一轮启动都打**。
+    ///
+    /// ⚠️ 明写这条**不**测的那一件：不剥**不会**丢帽子。[`plan_restore`] 取的是"第一条过了四道
+    /// 的行"，而本体行在第 1 道就被 `continue` 掉，一次都不占 `wear`。下面那两条 `wear` 断言因此
+    /// 是**同一件事的两面**（剥与不剥都穿上那一件）—— 它守的是"剥壳别把配件行也剥掉"，不是"少剥
+    /// 就丢装备"。这条剥壳的全部意义是**不说假话**。
+    #[test]
+    fn a_body_row_is_not_an_accessory_note() {
+        let rows = vec![
+            ("body".to_string(), "cat_ui".to_string()),
+            ("head".to_string(), "cap_blue".to_string()),
+        ];
+        let ids: Vec<String> = ["cap_blue"].iter().map(|s| s.to_string()).collect();
+        let slots: Vec<String> = ["head"].iter().map(|s| s.to_string()).collect();
+        let visible = vec![0usize];
+
+        // 剥壳本身：`(本体 id, 只剩配件的行)`，两条都不许丢。
+        let (body, accessories) = split_body_row(&rows);
+        assert_eq!(body.as_deref(), Some("cat_ui"), "body 那一行没被认出来");
+        assert_eq!(
+            accessories,
+            vec![("head".to_string(), "cap_blue".to_string())],
+            "剥壳把配件那一行也剥掉了 ⇒ 帽子从此不会恢复"
+        );
+
+        // ✅ 剥完之后：帽子是帽子、本体是本体，两句噪音都不该有。
+        let plan = plan_restore(&accessories, &ids, &slots, &visible);
+        assert_eq!(plan.wear, Some(0), "配件行被 body 行的存在影响到了");
+        assert!(
+            plan.notes.is_empty(),
+            "剥干净了却还有说明：{:?}",
+            plan.notes
+        );
+
+        // ❌ 不剥（这是 M6 那一刀）：那句假话必须**当场**打得出来，否则这条门禁就是在念注释。
+        let bad = plan_restore(&rows, &ids, &slots, &visible);
+        assert_eq!(
+            bad.wear,
+            Some(0),
+            "不剥反而丢了装备 ⇒ `plan_restore` 第 4 条那条取首条的规则变了，上面那段\n\
+             「本体行不会把帽子挤掉」的论证作废，这条得重新想（这是本轮唯一能读到它变没变的地方）"
+        );
+        assert!(
+            bad.notes
+                .iter()
+                .any(|n| n.contains("磁盘上找不到这一件") && n.contains("cat_ui")),
+            "不剥却没有那句假话：{:?}",
+            bad.notes
+        );
+
+        // 只有 body 行（上次只换了本体、没戴帽子）⇒ 配件侧**一行说明都不许有**。
+        let only_body = vec![("body".to_string(), "cat_ui".to_string())];
+        let (b, acc) = split_body_row(&only_body);
+        assert_eq!(b.as_deref(), Some("cat_ui"));
+        let plan = plan_restore(&acc, &ids, &slots, &visible);
+        assert_eq!(plan.wear, None, "只剩本体行却还要穿一件");
+        assert!(
+            plan.notes.is_empty(),
+            "只剩本体行却给出了配件说明：{:?}",
+            plan.notes
+        );
+    }
+
     /// 三种"点不了"的形状都**留在屏上**，只是没有强调条；唯一被点的那一件才有载荷。
     ///
     /// 抄 [`an_info_row_is_hit_but_never_activates_while_the_row_below_does`]（`panel.rs`）
-    /// 那条"逐格列举可点性"的写法，但这一条量的是**生产者侧**：`Wear`/`Info` 这一格是
+    /// 那条"逐格列举可点性"的写法，但这一条量的是**生产者侧**：`Wear`/`Body`/`Info` 这一格是
     /// [`Gacha::album_entries`] 定的，而 `panel::press` 只是照它办事。合在一起才是
     /// "抽到 ≠ 能穿"这件事第一次在屏上读得出来（§9.2 第 20 条那一族的最后一块）。
     #[test]
@@ -5492,8 +6780,15 @@ mod tests {
             .collect();
         let owned = owned_of(&["cap_blue", "hood_night", "hat_straw", "cat_shiro"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
+        // ⚠️ 本体表**交空** = 这一轮磁盘上没有一只本体（裸开发树的真实读数：`$OPET_PETS` 没指、
+        // `$XDG_DATA_HOME/opet/pets` 不存在 ⇒ [`discover_pets`] 返空）。所以那只猫在这里是
+        // "第四种点不了"的形状：抽到了、名字照说、但它不在 `bodies` 里 ⇒ `Info`。
+        // P5 之后宠物行**并非永远只读**，那一条由 [`the_row_payload_is_the_same_index_the_dress_page_cycles`]
+        // 与 [`the_album_routes_pets_to_the_body_index_space`] 正面钉住。
+        let pet_ids: Vec<String> = Vec::new();
+        let pet_visible: Vec<usize> = Vec::new();
         let entries = g
-            .album_entries(&owned, &ids, &visible)
+            .album_entries(&owned, &ids, &visible, &pet_ids, &pet_visible)
             .expect("逐件条目该读得出来");
         assert_eq!(
             entries.len(),
@@ -5524,7 +6819,7 @@ mod tests {
             ),
             "无产物的那一件把档名/挂点/名字丢了 ⇒ 这行读不出自己是什么"
         );
-        // ⚠️ 宠物 ⇒ 只读 + 行尾 ASCII `pet` 标（FLOW §6③ 那句"明写而不是灰掉不显示"）。
+        // ⚠️ 宠物（本体表为空）⇒ 只读 + 行尾 ASCII `pet` 标（FLOW §6③ 那句"明写而不是灰掉不显示"）。
         let pet = row_of("小白");
         assert_eq!(pet.item, panel::PanelItem::Info);
         assert!(
@@ -5580,7 +6875,7 @@ mod tests {
                 "蓝帽".repeat(40),
             ] {
                 let e = AlbumEntry {
-                    wear: Some(0),
+                    target: AlbumTarget::Accessory(0),
                     name: name.clone(),
                     rarity: rar,
                     slot,
@@ -5626,10 +6921,16 @@ mod tests {
         }
 
         // ③ **分页之后**整屏量一遍（`More` 那一行是本地化的 ⇒ 四 locale 各有不同的宽度）：
-        //    每一行都问排版自己的账，且没有一行被截。条目取"最坏情况"= 全部可点（窄预算）。
+        //    每一行都问排版自己的账，且没有一行被截。条目取"最坏情况"= 全部可点（窄预算），
+        //    而 `kind_pet` 那一档可点**只能是 `Body`** —— 造一个"宠物挂着配件下标"的形状
+        //    就是在测一条生产者发不出来的行（P5 之前 `wear: Some(i)` 兼 `kind_pet` 正是那种形状）。
         let entries: Vec<AlbumEntry> = (0..14)
             .map(|i| AlbumEntry {
-                wear: Some(i),
+                target: if i % 7 == 3 {
+                    AlbumTarget::Body(i)
+                } else {
+                    AlbumTarget::Accessory(i)
+                },
                 name: "蓝帽".repeat(1 + i % 4),
                 rarity: Rarity::ALL[i % 4],
                 slot: Slot::ALL.get(i % 5).copied(),
@@ -6126,6 +7427,151 @@ mod tests {
             panic!("本体缺 (1,2) 而帽子有 ⇒ 并进来会取消那次整格退化");
         };
         assert!(err.contains("(1,2)"), "错误要点名那一格: {err}");
+    }
+
+    /// 把一只本体那三样按测试需要落进 `dir/<name>/`（= 本体库里的一只）。
+    ///
+    /// 与 [`hat_in`] 同一条设计：**缺哪样就不写哪样**，"被拒绝时一个字节都没读"这种判据才断得出来。
+    /// `rows == 0` ⇒ 只写清单（`check_body` 的第 ③ 道就是冲它设的）；`polygon = None` ⇒ 不写轮廓。
+    fn pet_in(dir: &std::path::Path, name: &str, pet_json: &str, polygon: Option<&str>, rows: u32) {
+        write(dir, &format!("{name}/pet.json"), pet_json.as_bytes());
+        if let Some(p) = polygon {
+            write(dir, &format!("{name}/polygon.json"), p.as_bytes());
+        }
+        if rows > 0 {
+            write(
+                dir,
+                &format!("{name}/sheet.webp"),
+                &sheet_bytes(rows, |_, _| [255, 0, 0, 255]),
+            );
+        }
+    }
+
+    /// 一套全过的本体库：库里两只同档 + 一只跨档 + 一只缺产物。
+    /// 返回 `(当前档, 库目录)` —— `cur` 就是启动那份本体的 `grid`，与 `check_body` 收的同源。
+    fn pet_kit(dir: &std::path::Path) -> (Grid, Vec<String>) {
+        let cur = Manifest::parse(BODY_JSON).expect("本体清单该合法").grid;
+        let poly = polygon_json(T_CELL, &cells_with(T_ROWS, BODY_SPANS, &[]));
+        // ① 全过，而且目录名 == slug ⇒ 没有 ⚠ 那行
+        pet_in(dir, "tiny", BODY_JSON, Some(&poly), T_ROWS);
+        // ② 全过，但目录名 != slug ⇒ 走那行 ⚠（今天三份 @192 产物就是这个形状）
+        let renamed = BODY_JSON.replace(r#""slug":"tiny""#, r#""slug":"cat_shiro""#);
+        assert_ne!(renamed, BODY_JSON, "替换没生效 ⇒ 这条测试什么也没测");
+        pet_in(dir, "tiny_second", &renamed, Some(&poly), T_ROWS);
+        // ③ 跨档：32 对 16，而且**一件产物都不写** ⇒ 报出来的错不可能来自解码
+        let wide = BODY_JSON.replace(r#""w":16,"h":16"#, r#""w":32,"h":32"#);
+        assert_ne!(wide, BODY_JSON, "替换没生效 ⇒ 这条测试什么也没测");
+        pet_in(dir, "wide", &wide, None, 0);
+        // ④ 同档而缺 polygon/sheet ⇒ 第 ③ 道那句
+        pet_in(dir, "bare", BODY_JSON, None, 0);
+        // ⑤ **只有行数不同**（`w/h` 与 `cols` 全同）：这一只守的是那条门禁"逐字段"的那一半 ——
+        // `rows` 决定解码缓冲长度与 polygon 面，把它当成"档"只比 `w/h` 的写法会放它进来，
+        // 而放进来之后 `Atlas::reload` 的长度自检才炸 ⇒ 屏上是**一只像素错位的新本体**。
+        let tall = BODY_JSON.replace(r#""rows":4"#, r#""rows":8"#);
+        assert_ne!(tall, BODY_JSON, "替换没生效 ⇒ 这条测试什么也没测");
+        let tall_poly = polygon_json(T_CELL, &cells_with(8, BODY_SPANS, &[]));
+        pet_in(dir, "tall", &tall, Some(&tall_poly), 8);
+        (cur, vec!["tiny".into(), "tiny_second".into()])
+    }
+
+    /// **格子档不同 ⇒ 在扫盘那一步就出局**（拍板②），而且另一只同档的照常活着（一坏不害众）。
+    ///
+    /// 三条读数缺一不可：① 跨档那只在 `discover_pets` 的结果里**根本不存在**（⇒ 收藏册那一行
+    /// 是只读、没有强调条，而不是"点了没反应"）；② `check_body` 单独问时错误里必须带
+    /// "格子档不同"这五个字和两边的**四个数**（`cols/rows/w/h`），否则真机上只能靠猜是哪一档；
+    /// ③ 那份资产**没有** `sheet.webp` ⇒ 报出的错不可能来自解码（`Atlas::load` 一旦被人挪进
+    /// 发现这一步，这条立刻红）。
+    ///
+    /// ⚠️ 这里断的是 `check_body`，不是 `plan_swap_body` 的 `same_grid` 那臂 —— 后者是**第二道
+    /// 保险**，其唯一合法走到它的调用者是"有人绕过发现直接往 `bodies` 里塞"，所以它的读数在
+    /// `plan_swap_body_partitions_the_four_outcomes` 那张真值表里，不在这里。
+    #[test]
+    fn a_different_grid_rivet_is_refused_by_name_at_discovery() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let (cur, want_ids) = pet_kit(tmp.path());
+
+        let found = discover_pets(tmp.path(), &cur);
+        let ids: Vec<String> = found.iter().map(|b| b.id.clone()).collect();
+        assert_eq!(
+            ids, want_ids,
+            "跨档与缺产物的两只必须出局，而活着的两只一只都不能少"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "wide"),
+            "跨档那只进了表 ⇒ 收藏册会给一行点了必然失败的可点行"
+        );
+
+        // ② 单独问那道门禁：文案点名"格子档不同"，并带上四个数。
+        let Err(err) = check_body(&tmp.path().join("wide"), &cur) else {
+            panic!("32 对 16 的本体该被拒绝");
+        };
+        assert!(err.contains("格子档不同"), "错误要点名那一族: {err}");
+        for token in ["16", "32", "8", "4"] {
+            assert!(
+                err.contains(token),
+                "错误要带当前档与那份的数（缺 {token}）: {err}"
+            );
+        }
+        assert!(
+            !tmp.path().join("wide/sheet.webp").exists(),
+            "这份资产根本没有本体像素 ⇒ 报出的错不可能来自解码"
+        );
+
+        // ④ 同档而缺 polygon ⇒ 另一句名，而且**不是**"格子档不同"（两族不能混成一谈）。
+        let Err(err) = check_body(&tmp.path().join("bare"), &cur) else {
+            panic!("缺 polygon.json 的本体该被拒绝");
+        };
+        assert!(
+            err.contains("sheet.webp"),
+            "缺产物要点名缺的是哪一件: {err}"
+        );
+        assert!(
+            !err.contains("格子档"),
+            "同档的错不该报成跨档（那样第二道保险就没法区分了）: {err}"
+        );
+
+        // ⑤ **只有行数不同** ⇒ 同一条门禁必须同样挡得住：判据是整块 `Grid` 比较，不是 `w/h`。
+        // 放松成只比 `w/h`（变异 M5）在这一只上立刻放行，而它带的是 8 行的 sheet 与 polygon ⇒
+        // 屏上会是一只像素错位的新本体，而 `Atlas::reload` 那道长度自检才是唯一还亮着的灯。
+        assert!(
+            !ids.iter().any(|id| id == "tall"),
+            "只有行数不同的本体进了表 ⇒ 格子档门禁退化成尺寸门禁（变异 M5）: {ids:?}"
+        );
+        let Err(err) = check_body(&tmp.path().join("tall"), &cur) else {
+            panic!("只有 `rows` 不同（4 对 8）的本体该被同一条门禁拒绝");
+        };
+        assert!(
+            err.contains("格子档不同") && err.contains("4 行") && err.contains("8 行"),
+            "错误要说出**行数**是哪一个数不同: {err}"
+        );
+    }
+
+    /// 扫本体库**一像素不解**（把配件侧那条 `discovery_never_touches_the_sheet…` 扩到宠物）。
+    ///
+    /// 判据选的是"**内容坏而存在**"而不是"删掉文件"：删掉的话读到的是第 ③ 道的存在性检查；
+    /// 而这里 `sheet.webp` 在、内容是三个字节，发现**只会**看它在不在 ⇒ 它照样进表。
+    /// 哪天有人把解码挪进这一步，这份坏字节会当场让它红。
+    ///
+    /// ⚠️ 这份坏 sheet **之后**会怎样（`Atlas::reload` 失败关闭、原像素不动）已有专门的
+    /// `atlas::tests::reload_keeps_the_old_pixels_when_the_new_sheet_is_broken`，这里不重复。
+    /// 两条合起来才是完整的一条路：**扫得到**（不预付费）+ **换不上时不半换**。
+    #[test]
+    fn a_broken_pet_sheet_bytes_still_list_the_body_because_discovery_never_decodes() {
+        let tmp = tempfile::tempdir().expect("临时目录");
+        let cur = Manifest::parse(BODY_JSON).expect("本体清单该合法").grid;
+        let poly = polygon_json(T_CELL, &cells_with(T_ROWS, BODY_SPANS, &[]));
+        pet_in(tmp.path(), "tiny", BODY_JSON, Some(&poly), 0);
+        write(tmp.path(), "tiny/sheet.webp", b"not a webp");
+
+        let found = discover_pets(tmp.path(), &cur);
+        assert_eq!(found.len(), 1, "sheet 内容不参与发现，否则这条就是假的");
+        assert_eq!(found[0].id, "tiny");
+        assert_eq!(found[0].sheet(), tmp.path().join("tiny/sheet.webp"));
+        assert_eq!(
+            found[0].regions.frame_count(),
+            (T_ROWS * T_COLS) as usize,
+            "候选只带轮廓 ⇒ 轮廓该已经解好"
+        );
     }
 
     /// 全过那一趟：并集**不新增格**（配件格是本体格的子集）、拼接就是并集、本体那份没被改。
