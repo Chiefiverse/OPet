@@ -28,7 +28,17 @@ use crate::settings::Motion;
 /// 观感重量都能逐位复用。只有高度变。
 pub const CARD_W: i32 = menu::CARD_W;
 /// 收藏册内容区的上限。**6 = 5 行内容 + 1 行「关闭」**（见 [`collection_rows`]）。
+///
+/// 逐件那一本（「已获得」）用的是另一种切法：**4 行内容 + 1 行页码控件 + 1 行「关闭」**
+/// ⇒ 见 [`ALBUM_PAGE_ROWS`]。同一张卡、两套切法，共同点只有"总行数不超过 `MAX_ROWS`"，
+/// 因为 `MAX_ROWS` 唯一真正钉住的是 [`CARD_H`]（= 那块 `wl_region` 与 placement 的证明）。
 pub const MAX_ROWS: usize = 6;
+/// 逐件收藏册一屏放得下的**条目**行数 = `MAX_ROWS` 减掉「页码控件」与「关闭」那两行。
+///
+/// 它是 `4` 而不是"看内容多不多"：页码控件**只在这一本真的超过一页时**占一格（见
+/// [`album_page`] 里那句"为什么不超过一页就干脆不设这一格"），所以这里按**最坏情况**留位 ⇒
+/// 每屏条目数恒定，翻页时行下标不漂。
+pub const ALBUM_PAGE_ROWS: usize = MAX_ROWS - 2;
 /// 内容区第一行的上沿 = 上边距 + 标题带，与菜单同一条线（两块的标题在同一个 y 上，
 /// 换面时视线不用重新找位置）。
 pub const ROWS_TOP: i32 = menu::PAD + menu::HEAD_H;
@@ -47,6 +57,18 @@ pub const CARD_H: i32 = ROWS_TOP + (MAX_ROWS as i32 - 1) * menu::ROW_STEP + menu
 /// `every_panel_row_is_sayable_and_never_truncated` 量的是真矩形真预算（`menu::row_text`），
 /// 两边一漂移那条就红。
 pub const ROW_TEXT_W: i32 = CARD_W - 3 * menu::PAD;
+
+/// **可点行**（[`PanelItem::Wear`] 那一格）文字能用的逻辑宽度 = [`ROW_TEXT_W`] 再让出左端那条
+/// 强调条（`menu::label_rect` 干的正是这件事，而 `card::paint_panel` 画可点行用的就是它）。
+///
+/// 开这个口子只为一件事：[`app`](crate::app) 的 `album_rows` 要在**产行的那一刻**决定"这一行
+/// 还带不带得上挂点名 / 重复数"，而它手里只有 `scale`、没有画布。可点行的预算比只读行**小 7 px**
+/// ⇒ 拿 `ROW_TEXT_W` 去裁可点行就会差出一个汉字，被排版截成 `…`，而"这件叫什么"是用户点它的
+/// 唯一依据（`69fd158` 的兄弟：生产者和排版各有各的账）。
+///
+/// ⚠️ 同 [`ROW_TEXT_W`]：改这里要同时改 [`layout`] 的矩形算术，而漂移会被
+/// `every_panel_row_is_sayable_and_never_truncated` 量出来（它量的是真矩形真预算）。
+pub const ROW_LABEL_W: i32 = ROW_TEXT_W - (menu::ACCENT_W + menu::ACCENT_GAP);
 
 /// 命中矩形。字段与 [`menu::ItemRect`] 同形而**不共用**：`item` 的类型不同，而把两种
 /// item 塞进一个泛型参数会让"这块矩形属于谁"这件事在类型上消失 —— 面板与菜单的点击分流
@@ -95,10 +117,33 @@ pub enum PanelItem {
     Verify,
     /// 最后一行 ⇒ 收掉面板。**宠物继续跑。**
     Close,
+    /// 收藏册「已获得」里**逐件**的一行 ⇒ 点它 = 把这一件直接穿上身（[`app`](crate::app)
+    /// 的 `pick_and_wear`）。
+    ///
+    /// 载荷是 **[`app`](crate::app) 的 `candidates` 下标**，不是新造一套"收藏条目 id"。两个理由：
+    /// ① `wear()` / `persist_worn()` / `picked` / `DressView::visible` **本来就都说这个下标** ⇒
+    /// 点击时无需任何反查，也就不需要一个和 `rows` 平行保存的 `Vec<CollectionEntry>` 旁表
+    /// （旁表要跨 `show_panel` / `refresh_panel_rows` / `open_panel_lines` 保持对齐 =
+    /// `69fd158` 那一族"命中表与画面分家"的形状，本项目为它付过学费）；
+    /// ② 它让这一格保持 `Copy`，于是 [`press`] 的签名一个字不用动。
+    ///
+    /// ⚠️ **下标进不了 [`content_sig`]**（那里只混判别量），见函数体里那条条件式纪律。
+    Wear(usize),
+    /// 页码控件 ⇒ 这一格**的字**就是页码（`+N 更多 2/5`），点它 = 本 tab 翻下一页、末页回卷。
+    ///
+    /// 为什么翻页要占一个**行**而不是别的：收藏册逐件后必然超过一屏，而这块面的行数被
+    /// [`MAX_ROWS`] 钉死（卡片高度 = 那套 `wl_region` / placement 证明的一部分，撑高就是改证明）。
+    /// 折叠行"还有 N 件没显示"和"下一页"说的是同一件事 ⇒ 让它兼任控件，**零新字形**
+    /// （`l10n::line_more` 四语早已在子集里，分数全 ASCII）。
+    More,
 }
 
 impl PanelItem {
     /// 这一行点下去会不会发生任何事。[`press`] 是唯一的执行者。
+    ///
+    /// 它的形状是"**除只读行外全都能点**"而不是逐格列举 ⇒ 新增一格（如 [`Self::Wear`]、
+    /// [`Self::More`]）**自动可点**，不必动这一条。反过来：以后要让某种新行**只读**，
+    /// **必须**在这里加一支，而不是指望各调用点自己把关（[`press`] 那条注释立的同一道理）。
     pub const fn actionable(self) -> bool {
         !matches!(self, Self::Info)
     }
@@ -151,6 +196,14 @@ impl CollectionTab {
 pub enum PanelKind {
     Collection {
         tab: CollectionTab,
+        /// 「已获得」那一本的**页码**（从 0 起）。另两个 tab 恒 0 —— 它们的行不是逐件产的，
+        /// 装不满一屏，也就永远到不了页码控件那一格（见 [`album_page`]）。
+        ///
+        /// 它为什么在**这里**而不是在 `App` 的某个字段里：这一面"此刻该画哪几条"这件事的
+        /// 全部输入就是 (哪一面, 哪一本, 第几页)，而 [`app`](crate::app) 的 `panel_rows`
+        /// 是**唯一**的行生产者 ⇒ 另立一个 `self.album_page` 字段就是第二个事实源（换 tab
+        /// 忘了归零 = 一屏空白，正是这条纪律反复抓的那族）。
+        page: usize,
     },
     /// 设置只有一屏：五行（语言 / 动画 / 概率 / 复核 / 关闭）**刚好等于 [`MAX_ROWS`]**，
     /// 所以它没有 tab。但标题带**照样是控件**（[`PanelItem::Header`]）—— 这一面会被
@@ -161,16 +214,34 @@ pub enum PanelKind {
 impl PanelKind {
     pub const fn tab(self) -> Option<CollectionTab> {
         match self {
-            Self::Collection { tab } => Some(tab),
+            Self::Collection { tab, .. } => Some(tab),
             Self::Settings => None,
         }
     }
 
-    /// 切 tab。**设置页没有第二屏可切** ⇒ [`CollectionTab::next`] 那一步在这里返回自身；
-    /// 点它做什么由 [`app`](crate::app) 的 `on_panel_press` 解释（重载默认行），不是"点了没反应"。
+    /// 当前页码（非收藏册返回 0）。
+    pub const fn page(self) -> usize {
+        match self {
+            Self::Collection { page, .. } => page,
+            Self::Settings => 0,
+        }
+    }
+
+    /// 切 tab = **换一本，所以页码归零**。不设这一步就是"从「已获得」第 4 页切到「还缺」
+    /// 而那一本只有 1 页" ⇒ 请求一个不存在的页。
+    ///
+    /// ⚠️ **翻页不走这里** —— 页码只由 [`app`](crate::app) 在点到 [`PanelItem::More`] 时
+    /// `+ 1` 得出，而**归一**（末页回卷）只在 [`album_page`] 一处做。一个页两件事分在两条
+    /// 函数里，是为了让"归一"这件事没有第二个实现者。
+    ///
+    /// 设置页没有第二屏可切 ⇒ [`CollectionTab::next`] 那一步在这里返回自身；点它做什么由
+    /// [`app`](crate::app) 的 `on_panel_press` 解释（重载默认行），不是"点了没反应"。
     pub const fn cycle(self) -> Self {
         match self {
-            Self::Collection { tab } => Self::Collection { tab: tab.next() },
+            Self::Collection { tab, .. } => Self::Collection {
+                tab: tab.next(),
+                page: 0,
+            },
             Self::Settings => Self::Settings,
         }
     }
@@ -196,6 +267,10 @@ pub struct PanelRow {
 /// （"一档一行"），所以屏上那句"+2 更多"可能读起来像"还有两件"。正解是调用方只给
 /// `MAX_ROWS - 1` 行 ⇒ 这条分支是保险，不是主路径（真要精确报条数得让 `petstore` 那边
 /// 也交行数以外的计数，那是另一件事，别在这儿顺手改）。
+///
+/// ⚠️ 它和 [`album_page`] 里那套折行算术**故意不同**，别"顺手统一"：这一条是**非分页**生产者
+/// （「还缺」「最近」）的保险 —— 超出就折成一个尾标，反正没有第二屏可去；那一条是**分页**主路径
+/// —— 超出就是下一页，所以它一行的字都不丢。同一个 `MAX_ROWS` 上面着两种语义。
 pub fn collection_rows(lang: Lang, lines: &[String]) -> Vec<PanelRow> {
     let capacity = MAX_ROWS - 1;
     let mut rows: Vec<PanelRow> = if lines.len() <= capacity {
@@ -226,6 +301,59 @@ pub fn collection_rows(lang: Lang, lines: &[String]) -> Vec<PanelRow> {
         text: lang.t(Key::Close).to_string(),
     });
     rows
+}
+
+/// [`album_page`] 的产物：这一屏的行 + **归一后**真正落到的页码 + 总页数。
+///
+/// 为什么要带回 `page`：调用方（[`app`](crate::app) 的 `panel_rows`）交出去的是
+/// "我想要第几页"，而屏上那句 `2/5` 必须是**实际**第几页。丢了这个返回值就只有两条路 ——
+/// 要么在 `App` 里再归一一次（两个事实源），要么让请求越界时显示一个不存在的页号。
+#[derive(Clone, Debug)]
+pub struct AlbumPage {
+    pub rows: Vec<PanelRow>,
+    pub page: usize,
+    pub pages: usize,
+}
+
+/// 逐件收藏册**切出一屏**：`entries` 是这一本的全部条目行（顺序即屏序，由调用方
+/// [`app`](crate::app) 的 `album_rows` 定稿 —— 那里的每一格已经带着自己的身份
+/// [`PanelItem::Wear`] 或 [`PanelItem::Info`]），这里只做**分页**这一件事。
+///
+/// 三处判断，都是"只在这里做一次"的那种：
+/// 1. **页码归一**（`pages == 0 ⇒ 0`，否则 `page % pages`）⇒ 末页点页码控件 = 回卷到第一页，
+///    而调用方可以无条件写 `kind.page() + 1`。别在 `App` 里再夹一次。
+/// 2. **`hidden` = 这一屏之外还剩几条**（不是"下一页有几条"）⇒ 只要真的分了页它就 `> 0`，
+///    屏上不会出现 `+0 更多`。
+/// 3. **页码控件只在这一本超过一页时才占那一格** ⇒ 只有一屏时那一行会写成 `+0 更多 1/1`
+///    而点它什么也不换 —— 那正是本项目 D14 判死过的"假按钮"。省掉它的代价是底部空一条
+///    缝，而这条代价**实际不可达**：`entries` 尾部恒带那 5 行汇总（见 `Gacha::collection_lines`）
+///    ⇒ `pages` 恒 `≥ 2`。
+///
+/// ⚠️ 它**不碰库、不读名字、不算宽度**：那些都在调用方。这条函数是纯切片，所以分页这件事
+/// 能 headless 判定（"每条恰好出现一次"那种覆盖断言写在测试里）。
+pub fn album_page(lang: Lang, entries: &[PanelRow], page: usize) -> AlbumPage {
+    let per = ALBUM_PAGE_ROWS;
+    let pages = entries.len().div_ceil(per);
+    let page = if pages == 0 { 0 } else { page % pages };
+    let start = page * per;
+    let end = (start + per).min(entries.len());
+
+    let mut rows: Vec<PanelRow> = entries[start..end].to_vec();
+    if pages > 1 {
+        let hidden = entries.len() - rows.len();
+        rows.push(PanelRow {
+            item: PanelItem::More,
+            // `line_more` 四语早已在字体子集里（它就是"折叠尾标"那句话），分数全 ASCII
+            // ⇒ 这一格零新字形。顺序 = 先"还有几条"再"第几页"：前者是这一行原本的语义，
+            // 后者是它兼任的职责。
+            text: format!("{} {}/{}", l10n::line_more(lang, hidden), page + 1, pages),
+        });
+    }
+    rows.push(PanelRow {
+        item: PanelItem::Close,
+        text: lang.t(Key::Close).to_string(),
+    });
+    AlbumPage { rows, page, pages }
 }
 
 /// 设置一屏的五行。**每行的值 = 本进程此刻真的在用的那个值**（`lang` / `motion` 由调用方
@@ -326,7 +454,8 @@ pub fn press(rects: &[RowRect], at: (f32, f32)) -> Option<PanelItem> {
 /// 面板是"开着一动不动"的那类面，静止恒 **1 提交**是它唯一的省电判据。
 ///
 /// 每行**文本**都进签名 ⇒ "进了签名的必须被下游读到"这条在这里天然成立（[`card`] 的画师
-/// 读的就是同一份 `rows`）。**`error` 同理但反方向**：它由 [`card::paint_panel`] 画进标题带
+/// 读的就是同一份 `rows`）。**收藏册的页码同理**：它不进签名，是它那一行的**文本**
+/// （`+16 更多 2/5`）进来的 —— 签名读的是画师读的东西。**`error` 同理但反方向**：它由 [`card::paint_panel`] 画进标题带
 /// 右段，而它**不是任何一行** ⇒ 不混进签名就出现"错误行换了字而屏上不重画"，只能靠调用方
 /// 在每个写 `gacha_error` 的地方补一句"记得重画"（[`app`] 的 `cycle_page` 那条注释判死过的
 /// 形状）。菜单的 `content_sig` 早就混了同一个错误行，这里是把两面拉齐。
@@ -347,6 +476,11 @@ pub fn content_sig(kind: PanelKind, lang: Lang, error: &str, rows: &[PanelRow]) 
     if let Some(tab) = kind.tab() {
         mix(tab.index() as u8);
     }
+    // ⚠️ **`page` 不进来**（`PanelKind::Collection { page }` 那个字段）—— 翻页改变的是
+    // 这一屏的**行**（条目换了、页码控件那行的 `2/5` 换了），而那些本来就逐行混在下面。
+    // 再混一次页码 = 一个画师不读的字段进了签名（同一个函数里 `Wear` 下标那条注释判死的形状），
+    // 而且它和 `rows` 是**同一个事实的两种写法**，以后两者谁没更新都能被签名接受。
+    //
     // 语言用 `code()` 的字节而不是枚举序号（同 `menu::content_sig` 的理由：新增一档语言
     // 不需要改这里，也不可能出现"两个不同枚举值混成同一个签名"）。
     for &b in lang.code().as_bytes() {
@@ -368,6 +502,17 @@ pub fn content_sig(kind: PanelKind, lang: Lang, error: &str, rows: &[PanelRow]) 
             PanelItem::Rates => 4,
             PanelItem::Verify => 5,
             PanelItem::Close => 6,
+            // ⚠️ **只混判别量，绝不混 `Wear` 的那个下标** —— 这不是省字，是一条行为裁定：
+            // 画师读的是 [`PanelItem::actionable`]（可点行有强调条、标签缩进，只读行没有，
+            // `card::paint_panel` 那一段），下标在这块面上**没有任何下游读者**。混进去就是
+            // `69fd158` 那一族的正脸：签名变而像素不变 ⇒ 停留期每 tick 重投一帧完全相同的
+            // buffer，而"静止恒 1 提交"是这一面唯一的省电判据。
+            //
+            // ⇒ **条件式，记在这里**：哪天要让"当前穿着的那一件"在下标上画得出区别（描一圈、
+            // 换个标），必须**同时**把下标混进签名，否则那圈东西永远投不出帧。用户 2026-11-07
+            // 拍板的是"选中了什么不上屏、只进日志"，所以今天这一条是**故意的**。
+            PanelItem::Wear(_) => 7,
+            PanelItem::More => 8,
         });
         for b in r.text.as_bytes() {
             mix(*b);
@@ -380,11 +525,16 @@ pub fn content_sig(kind: PanelKind, lang: Lang, error: &str, rows: &[PanelRow]) 
 /// 面板标题带的那串字：收藏册 = `已获得 1/3`，设置 = `设置`。
 /// 页码全 ASCII ⇒ 零字体成本（菜单分页那次同名结论）。
 ///
+/// ⚠️ 那串分数报的是**第几本**（tab），不是第几页 —— 逐件那一本的页码在**页码控件那一行**
+/// 上（[`album_page`] 里 `More` 的文本）。两处各报一个维度而标题带**故意不报页**：它高
+/// [`menu::HEAD_H`]、排的是"这一面叫什么"，把页号塞进去要和 tab 分数抢同一段宽度，而
+/// "还有多少条没显示"这个信息只有在条目行那一栏的宽度里才放得下 `+N 更多` 那半句。
+///
 /// ⚠️ 分母是 [`CollectionTab::ALL`] 的长度而不是 [`MAX_ROWS`] 那一类版面常量：标题要说的是
 /// "一共三个视图"，与一屏能放几行无关。
 pub fn header_text(kind: PanelKind, lang: Lang) -> String {
     match kind {
-        PanelKind::Collection { tab } => format!(
+        PanelKind::Collection { tab, .. } => format!(
             "{} {}/{}",
             lang.t(tab.key()),
             tab.index() + 1,
@@ -492,6 +642,145 @@ mod tests {
         assert_eq!(more.text, l10n::line_more(Lang::Zh, 20 - (MAX_ROWS - 2)));
     }
 
+    /// 逐件那一本的条目行（每条各占一格，下标 = 它自己的序号，当作 `candidates` 下标用）。
+    fn album_entries(n: usize) -> Vec<PanelRow> {
+        (0..n)
+            .map(|i| PanelRow {
+                item: PanelItem::Wear(i),
+                text: format!("R item{i}"),
+            })
+            .collect()
+    }
+
+    /// **分页的覆盖不变量**：每条条目在全部页里**恰好出现一次**，一屏不超过 [`MAX_ROWS`] 行，
+    /// 最后一行永远是「关闭」，而只要真分了页，页码控件那一格就在（每屏至多一个）。
+    ///
+    /// 抄 [`rows_are_capped_and_close_is_always_last`]（同一族"版面产行的硬约束"），但它查的是
+    /// **跨页**那一维 —— 逐件之后这是这块面唯一的新风险：切错一刀就是某件衣服永远点不到，
+    /// 而"永远点不到"在屏上读起来和"这一件本来就不能穿"一模一样。
+    #[test]
+    fn the_album_pages_cover_every_entry_exactly_once() {
+        for lang in Lang::ALL {
+            for n in [0usize, 1, 4, 5, 9, 20, 21, 22] {
+                let entries = album_entries(n);
+                let pages = n.div_ceil(ALBUM_PAGE_ROWS);
+                let mut seen = vec![0usize; n];
+                for p in 0..pages.max(1) {
+                    let screen = album_page(lang, &entries, p);
+                    assert_eq!(screen.pages, pages, "{lang:?} 给 {n} 条 ⇒ 页数报错");
+                    assert_eq!(screen.page, p % pages.max(1), "请求的页没被如实带回");
+                    assert!(
+                        screen.rows.len() <= MAX_ROWS,
+                        "{lang:?} 给 {n} 条第 {p} 页 ⇒ {} 行 > {MAX_ROWS}",
+                        screen.rows.len()
+                    );
+                    assert_eq!(
+                        screen.rows.last().map(|r| r.item),
+                        Some(PanelItem::Close),
+                        "给 {n} 条 ⇒ 最后一行不是「关闭」"
+                    );
+                    let mut control = 0;
+                    for r in &screen.rows {
+                        match r.item {
+                            PanelItem::Wear(i) => seen[i] += 1,
+                            PanelItem::More => control += 1,
+                            PanelItem::Close => {}
+                            other => panic!("逐件那一屏不该出现 {other:?}"),
+                        }
+                    }
+                    assert!(control <= 1, "一屏两个页码控件");
+                    if pages > 1 {
+                        assert_eq!(control, 1, "分了页而第 {p} 页没有页码控件 ⇒ 翻不过去");
+                    }
+                }
+                assert!(
+                    seen.iter().all(|&c| c == 1),
+                    "{lang:?} 给 {n} 条 ⇒ 各页出现次数 {seen:?}"
+                );
+            }
+        }
+    }
+
+    /// 页码控件那一行的**字**：`+N 更多 P/T` —— N = 这一屏之外还剩几条（所以真分页时它
+    /// 恒 `> 0`，屏上不会出现 `+0 更多`），P/T = 实际页号 / 总页数；而**末页再点 = 回卷**
+    /// （[`album_page`] 是唯一做归一的地方）。
+    ///
+    /// 抄 [`the_dwell_never_bumps_the_signature_but_a_tab_or_value_switch_does`] 里"随维变"
+    /// 那一半的写法：把可变的那一维逐值遍历，再断言文本 == 该值对应的那串字。
+    #[test]
+    fn the_page_control_row_names_its_page_and_wraps() {
+        let entries = album_entries(10); // 4 + 4 + 2 ⇒ 三页
+        let total = album_page(Lang::Zh, &entries, 0).pages;
+        assert_eq!(total, 3);
+        for p in 0..total {
+            let screen = album_page(Lang::Zh, &entries, p);
+            let ctrl = screen
+                .rows
+                .iter()
+                .find(|r| r.item == PanelItem::More)
+                .expect("分了页却找不到页码控件");
+            let frac = ctrl.text.rsplit(' ').next().unwrap();
+            assert_eq!(frac, format!("{}/{}", p + 1, total), "分数报的不是当前页");
+            let shown = screen.rows.len() - 2; // 减掉控件与「关闭」自己
+            let hidden = entries.len() - shown;
+            assert!(hidden > 0, "第 {p} 页已经没有隐藏条目却还挂着控件");
+            assert!(
+                ctrl.text.starts_with(&l10n::line_more(Lang::Zh, hidden)),
+                "控件前半句没把「还剩几条」说对：{:?}",
+                ctrl.text
+            );
+        }
+        // 末页 +1 ⇒ 回卷到第一页（调用方因此可以无条件写 `page() + 1`）。
+        assert_eq!(album_page(Lang::Zh, &entries, total).page, 0);
+        assert_eq!(album_page(Lang::Zh, &entries, 0).page, 0);
+        // 空库 ⇒ 第 0 页、零页、只有「关闭」—— 不能因为 `page % 0` 炸在这里。
+        let empty = album_page(Lang::Zh, &[], 7);
+        assert_eq!((empty.page, empty.pages), (0, 0));
+        assert_eq!(empty.rows.len(), 1);
+    }
+
+    /// **"选中了什么不上屏"这条决定的技术形态**（用户 2026-11-07 拍板：只进日志）：
+    /// [`PanelItem::Wear`] 的**下标**不许进签名，而**身份**必须进。
+    ///
+    /// 抄 [`an_info_row_is_hit_but_never_activates_while_the_row_below_does`] 那条"逐格列举"
+    /// 的写法，但它断言的是签名的两个方向：
+    /// - 同文本、不同下标 ⇒ **签名相同**（否则停留期每 tick 重投一帧逐位相同的 buffer，
+    ///   而"静止恒 1 提交"是这块面唯一的省电判据 = `69fd158`）；
+    /// - 同文本、一格 `Wear` 一格 `Info` ⇒ **签名不同**（可点行有强调条，画师真读得到，
+    ///   漏了它屏上就不换）。
+    ///
+    /// ⚠️ 哪天要把"当前穿着的那一件"画出来（描一圈、加个标），**必须同时**把下标混进
+    /// [`content_sig`] —— 否则那圈东西投不出帧。这条测试就是那件事的提醒牌。
+    #[test]
+    fn the_wear_index_stays_out_of_the_signature_while_the_identity_does_not() {
+        let kind = PanelKind::Collection {
+            tab: CollectionTab::Owned,
+            page: 0,
+        };
+        let row = |item: PanelItem| {
+            Vec::from([PanelRow {
+                item,
+                text: "R hat".to_string(),
+            }])
+        };
+        let sig = |rows: &[PanelRow]| content_sig(kind, Lang::Zh, "", rows);
+        assert_eq!(
+            sig(&row(PanelItem::Wear(1))),
+            sig(&row(PanelItem::Wear(2))),
+            "下标进了签名 ⇒ 画师不读它，却每 tick 重投同样的像素"
+        );
+        assert_ne!(
+            sig(&row(PanelItem::Wear(1))),
+            sig(&row(PanelItem::Info)),
+            "身份没进签名 ⇒ 只读行和可点行在屏上分不开"
+        );
+        assert_ne!(
+            sig(&row(PanelItem::More)),
+            sig(&row(PanelItem::Close)),
+            "身份没进签名 ⇒ 页码控件和「关闭」在屏上分不开"
+        );
+    }
+
     /// 行带两两不相交、全部落在卡内，**而带与带之间那 4 px 缝点不着任何东西**（"缝隙不命中"
     /// 在菜单那道证明里的同一条性质）。正对照 = 每条带中心点得着自己那一行，否则
     /// "整面都点不着"也能让这条绿。
@@ -500,6 +789,7 @@ mod tests {
         for kind in [
             PanelKind::Collection {
                 tab: CollectionTab::Owned,
+                page: 0,
             },
             PanelKind::Settings,
         ] {
@@ -563,6 +853,7 @@ mod tests {
     fn both_headers_are_hit_while_only_the_collection_one_changes_face() {
         let tab_kind = PanelKind::Collection {
             tab: CollectionTab::Owned,
+            page: 2,
         };
         let rows = collection_rows(Lang::Zh, &lines(3));
         let rs = rects(tab_kind, &rows);
@@ -572,15 +863,26 @@ mod tests {
         assert_eq!(
             tab_kind.cycle(),
             PanelKind::Collection {
-                tab: CollectionTab::Missing
+                tab: CollectionTab::Missing,
+                // 从 `page: 2` 起步而这里要 0 ⇒ 这条顺带钉住"**切 tab 即归零页码**"：
+                // 换一本之后还停在第 3 页，屏上就是一屏空白（另两本只有一屏）。
+                page: 0
             }
         );
-        // 切满一圈回原点。设置页 `cycle()` 必须冻住 —— 冻不住不是"点得着却换到没内容的一屏"。
+        // 切满一圈回**同一本**。⚠️ 但回不到原来那一**页**（起点 `page: 2`，一圈回来是 `page: 0`），
+        // 而这正是这里要的读数：归零发生在**每一下** `cycle`，不是只在"换到另一本"那一刻 ——
+        // 写成 `k == tab_kind` 就是把"页码也跟着转一圈"当成正确行为钉住了。
         let mut k = tab_kind;
         for _ in 0..CollectionTab::ALL.len() {
             k = k.cycle();
         }
-        assert_eq!(k, tab_kind);
+        assert_eq!(
+            k,
+            PanelKind::Collection {
+                tab: CollectionTab::Owned,
+                page: 0
+            }
+        );
         assert_eq!(PanelKind::Settings.cycle(), PanelKind::Settings);
 
         // 设置页的标题带：`item` 是 `Header` ⇒ `press` 放行，而 `cycle()` 返回自身。
@@ -607,6 +909,7 @@ mod tests {
         let rs = rects(
             PanelKind::Collection {
                 tab: CollectionTab::Owned,
+                page: 0,
             },
             &rows,
         );
@@ -633,10 +936,45 @@ mod tests {
             PanelItem::Rates,
             PanelItem::Verify,
             PanelItem::Close,
+            // 逐件收藏册那两格（P4）⇒ 它们**必须**在这一列里：这一条断言就是"`actionable()`
+            // 是除 `Info` 外全点得着"那个形状的唯一守门人，漏了它就得靠各调用点自己问。
+            PanelItem::Wear(0),
+            PanelItem::More,
         ] {
             assert!(item.actionable(), "{item:?} 被当成只读行了");
         }
         assert!(!PanelItem::Info.actionable());
+        // 正对照：把一件条目真放进一屏，命中它 ⇒ `press` 交回**同一个下标**的那一格
+        // （载荷在命中表里活着 = P4 那条"点一件穿上"唯一的输入）。
+        let album = vec![
+            PanelRow {
+                item: PanelItem::Wear(3),
+                text: "R hat".into(),
+            },
+            PanelRow {
+                item: PanelItem::More,
+                text: l10n::line_more(Lang::Zh, 1),
+            },
+            PanelRow {
+                item: PanelItem::Close,
+                text: Lang::Zh.t(Key::Close).into(),
+            },
+        ];
+        let ar = rects(
+            PanelKind::Collection {
+                tab: CollectionTab::Owned,
+                page: 0,
+            },
+            &album,
+        );
+        assert_eq!(press(&ar, center(ar[0])), Some(PanelItem::Wear(3)));
+        assert_eq!(press(&ar, center(ar[1])), Some(PanelItem::More));
+    }
+
+    /// 一条带子的中心点（"点得着自己"的最小充分坐标；边角 +1 那种写法在缝宽变更小的时候
+    /// 会退化成测缝）。
+    fn center(r: RowRect) -> (f32, f32) {
+        (r.x as f32 + r.w as f32 / 2.0, r.y as f32 + r.h as f32 / 2.0)
     }
 
     /// 设置页五行点下去**各自是各自的那一件**（不是全落到语言、也不是全落空）。
@@ -676,7 +1014,8 @@ mod tests {
             assert_eq!(
                 content_sig(
                     PanelKind::Collection {
-                        tab: CollectionTab::Owned
+                        tab: CollectionTab::Owned,
+                        page: 0
                     },
                     lang,
                     "",
@@ -684,7 +1023,8 @@ mod tests {
                 ),
                 content_sig(
                     PanelKind::Collection {
-                        tab: CollectionTab::Owned
+                        tab: CollectionTab::Owned,
+                        page: 0
                     },
                     lang,
                     "",
@@ -698,7 +1038,8 @@ mod tests {
             assert_ne!(
                 content_sig(
                     PanelKind::Collection {
-                        tab: CollectionTab::Owned
+                        tab: CollectionTab::Owned,
+                        page: 0
                     },
                     lang,
                     "",
@@ -706,7 +1047,8 @@ mod tests {
                 ),
                 content_sig(
                     PanelKind::Collection {
-                        tab: CollectionTab::Missing
+                        tab: CollectionTab::Missing,
+                        page: 0
                     },
                     lang,
                     "",
@@ -732,7 +1074,8 @@ mod tests {
             sig(&zh, Lang::Zh),
             content_sig(
                 PanelKind::Collection {
-                    tab: CollectionTab::Owned
+                    tab: CollectionTab::Owned,
+                    page: 0
                 },
                 Lang::Zh,
                 "",
@@ -783,7 +1126,7 @@ mod tests {
                 }
                 // 随 tab 变的是**标题带**那一串字 ⇒ 三档逐个查，这才是这条的覆盖面所在。
                 for tab in CollectionTab::ALL {
-                    let h = header_text(PanelKind::Collection { tab }, lang);
+                    let h = header_text(PanelKind::Collection { tab, page: 0 }, lang);
                     assert_eq!(crate::text::missing(&h), None, "标题带画不出：{h:?}");
                     checked += 1;
                 }
@@ -813,7 +1156,7 @@ mod tests {
     fn the_page_indicator_is_ascii_only() {
         for lang in Lang::ALL {
             for tab in CollectionTab::ALL {
-                let h = header_text(PanelKind::Collection { tab }, lang);
+                let h = header_text(PanelKind::Collection { tab, page: 0 }, lang);
                 let tail = h.rsplit(' ').next().unwrap();
                 assert!(
                     tail.chars().all(|c| c.is_ascii_digit() || c == '/'),
@@ -821,8 +1164,28 @@ mod tests {
                 );
                 assert_eq!(
                     tail,
-                    format!("{}/{}", tab.index() + 1, CollectionTab::ALL.len())
+                    format!("{}/{}", tab.index() + 1, CollectionTab::ALL.len()),
+                    "{lang:?} {tab:?} 的标题带说了别的事 ⇒ 那句分数说的是**哪一本**，不是第几页"
                 );
+            }
+            // ⚠️ 标题带那一处**只报 tab**（上面那句），而"第几页"这件事本轮真的有了 ⇒ 它落在
+            // **页码控件那一行的文本**里。这个测试的名字原本只指标题带，现在得把那一格也管进来：
+            // 两处分数的形状必须一样是纯 ASCII `P/T`，否则字体门禁（四常数联动）会在"没人改
+            // `l10n.rs`"的那一轮静默变成"屏上一个 `?`"。
+            let entries = album_entries(10); // 三页，页码控件一定在
+            for p in 0..3 {
+                let screen = album_page(lang, &entries, p);
+                let ctrl = screen
+                    .rows
+                    .iter()
+                    .find(|r| r.item == PanelItem::More)
+                    .expect("分了页而控件不在");
+                let frac = ctrl.text.rsplit(' ').next().unwrap();
+                assert!(
+                    frac.chars().all(|c| c.is_ascii_digit() || c == '/'),
+                    "{lang:?} 页码控件的分数不是纯 ASCII：{frac:?}"
+                );
+                assert_eq!(frac, format!("{}/{}", p + 1, screen.pages));
             }
         }
     }

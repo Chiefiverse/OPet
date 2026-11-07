@@ -22,7 +22,7 @@ use petcore::behavior::AssetKey;
 use petcore::behavior::config::{Action, BehaviorConfig};
 use petcore::behavior::machine::Command;
 use petcore::gacha::{
-    Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, Owned, Rarity, RatesFile,
+    Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, ItemKind, Owned, Rarity, RatesFile, Slot,
 };
 use petcore::geom::{Rect, Vec2};
 use petcore::intent::{PresentationIntent, SURFACE_MARGIN};
@@ -800,6 +800,64 @@ impl Gacha {
         Ok(lines)
     }
 
+    /// 「已获得」那一本的**逐件**行（P4 = 收藏册点名 → 直接穿上）。
+    ///
+    /// ⚠️ **遍历的是 `catalog ∩ owned`（稀有度序 + catalog 内序），不是 `candidates`** —— 后者
+    /// 只有磁盘上真的有产物那几件（裸开发树 30 件里只有 1 件），拿它当列表而汇总行读的是
+    /// `catalog ∩ owned`，屏上就是"汇总说 12 件而列表只有 1 行"，两个事实自己打自己。
+    /// 同一个集合还有一条好处：名字一律来自 catalog，所以不需要 `recent_lines` 那种"catalog
+    /// 不认就退化成 id"的分支（那一条读的是账本，账本可以记着目录里没有的 id）。
+    ///
+    /// 三档**可点/只读**由 [`Self::wear`] 一格表示，而它的判据是别人给的（不是这里自己算的）：
+    /// `ids` = [`App::candidates`] 的目录名表，`visible` = [`App::dress_view`] 跑完库存那道之后
+    /// 的可见下标集。⇒ "抽到但磁盘没产物""磁盘有但库存不认""本体不匹配"三种形状都落在
+    /// `wear = None`，屏上那一行**没有强调条**（画师读的正是可点性，见 [`card::paint_panel`]），
+    /// 用户看得见地能分辨，而我不用为这三种形状各造一个新字形或新标记。
+    ///
+    /// `dup` 的折算口径与 [`Self::collection_lines`] **同一个**（`item_count − 1`：第一件不算
+    /// 重复），否则逐件行加起来与汇总那一行对不上，就成了"两本账"。
+    ///
+    /// `owned` 由调用方给（[`App::album_screen`] 一次点击只读一遍库存 ⇒ 逐件那几张行与
+    /// 汇总行问的是**同一份**答案，不是"各问了一遍然后祈祷它们相同"）。
+    fn album_entries(
+        &self,
+        owned: &Owned,
+        ids: &[String],
+        visible: &[usize],
+    ) -> Result<Vec<AlbumEntry>, String> {
+        let mut out = Vec::new();
+        for r in Rarity::ALL {
+            for item in self.catalog.items_of(r) {
+                if !owned.contains(&item.id) {
+                    continue;
+                }
+                let kind_pet = item.kind == ItemKind::Pet;
+                // 下标只从 `ids` 里反查一次；宠物**永远**不给出下标（`wear()` 解的是配件三件套，
+                // 传一个宠物 id 进去在类型上合法而屏上是什么都没有的那种事故）。
+                let wear = if kind_pet {
+                    None
+                } else {
+                    ids.iter()
+                        .position(|c| c == &item.id)
+                        .filter(|i| visible.contains(i))
+                };
+                let n = self
+                    .store
+                    .item_count(&item.id)
+                    .map_err(|e| format!("读 {} 的件数失败: {e}", item.id))?;
+                out.push(AlbumEntry {
+                    wear,
+                    name: item.name.clone(),
+                    rarity: item.rarity,
+                    slot: item.slot,
+                    kind_pet,
+                    dup: n.saturating_sub(1),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// 「还缺」那一屏的行：catalog 里还没拿到的**名字**，按档分组，**每档最多一行**。
     ///
     /// 名字来自 catalog ⇒ 这些字**已经在字体子集里**（`everything_the_ui_can_render_is_in_the_
@@ -966,6 +1024,136 @@ impl Gacha {
             CollectionTab::Recent => self.recent_lines(lang, panel::MAX_ROWS - 1),
         }
     }
+}
+
+/// 逐件收藏册里**一件**要说的事（还没变成能画的行）。
+///
+/// 它刻意不是 `CatalogItem` 的引用：一件"装包来的池外件"（catalog 不认的 id）也要能进这张表，
+/// 而那时只有 id 字符串可说。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AlbumEntry {
+    /// `Some(i)` = 这一件**此刻真能穿上**，`i` 是 [`App::candidates`] 的下标 ⇒ 行是
+    /// [`panel::PanelItem::Wear`]。`None` = **只读行**（未拥有 / 磁盘没产物 / 本体不匹配 /
+    /// 那是只宠物不是配件）⇒ 行是 [`panel::PanelItem::Info`]，屏上没有强调条。
+    wear: Option<usize>,
+    /// catalog 里的名字；catalog 不认这个 id 时退化成 id 本身（ASCII）—— 与
+    /// [`Gacha::recent_lines`] **同一个既有口径**，不是新洞。
+    name: String,
+    rarity: Rarity,
+    slot: Option<Slot>,
+    /// `kind == Pet` ⇒ 行尾打一个 ASCII `pet` 标，且 `wear` **恒为 `None`**（FLOW §6③ 那句
+    /// "明写而不是灰掉不显示"的最低档实现：灰掉要新字形，而宠物穿上去根本是另一件事 = P5）。
+    kind_pet: bool,
+    /// 重复数 = `item_count − 1`，与 [`Gacha::collection_lines`] 同一个折算口径。
+    dup: u64,
+}
+
+/// 逐件那一本的行文本 = **一行一件**，宽度纪律立在产行的这一刻（[`Gacha::missing_lines`]
+/// 那条同族理由：必须问 [`menu::fit_to`] 本身，不许拿 [`menu::line_width`] 自己算）。
+///
+/// ⚠️ **预算按可点/只读分两档**：可点行让出左端那条强调条 ⇒ [`panel::ROW_LABEL_W`]（209），
+/// 只读行是 [`panel::ROW_TEXT_W`]（216）。**用错一档就是"生产者和排版各有各的账"**：按 216
+/// 裁出来的可点行送到 `menu::label_rect` 手里就差出一个汉字，被排版截成 `…`，而"这件叫什么"
+/// 是用户点它的唯一依据。
+///
+/// 装不下时**按 `dup` → `slot` 的顺序丢词**，最后只剩 `{RAR} {name}`，**绝不让 `card` 截成
+/// `…`**：丢掉的两个词都是"能从别处再读到"的信息（重复数在汇总那一行、挂点在换装页），
+/// 而一个 `…` 说的是"这件的名字我不知道"，那是假信息。
+/// 极端情况（名字本身就超预算）无词可丢 ⇒ 只能交给排版，那一条由
+/// `every_panel_row_is_sayable_and_never_truncated` 用**真 catalog 真三档缩放**当场量红，
+/// 不是靠这句注释保证。
+///
+/// 这里**不需要 `lang`**：token 全是 ASCII（`Rarity::as_str` / `Slot::as_str` /
+/// `ItemKind::as_str` / `x{dup}`）加上本来就在子集里的 catalog 名 ⇒ 逐件那几张行**与语言无关**，
+/// 而"签名里有、函数体不读"是本项目反复抓的形状（见 [`panel::collection_rows`] 那条同一纪律）。
+fn album_rows(entries: &[AlbumEntry], scale: f32) -> Vec<panel::PanelRow> {
+    entries
+        .iter()
+        .map(|e| {
+            let actionable = e.wear.is_some();
+            let width = if actionable {
+                panel::ROW_LABEL_W
+            } else {
+                panel::ROW_TEXT_W
+            };
+            let budget = menu::budget_for(width, scale);
+            let slot = e.slot.map(Slot::as_str);
+            let dup = if e.dup > 0 {
+                Some(format!("x{}", e.dup))
+            } else {
+                None
+            };
+            // 从"信息最全"往下退：① 全量 ② 丢重复数 ③ 再丢挂点 ④ 只剩档名 + 名字。
+            let render = |with_slot: bool, with_dup: bool| {
+                let mut s = String::from(e.rarity.as_str());
+                if with_slot {
+                    if let Some(sl) = slot {
+                        s.push(' ');
+                        s.push_str(sl);
+                    }
+                }
+                s.push(' ');
+                s.push_str(&e.name);
+                if e.kind_pet {
+                    s.push(' ');
+                    s.push_str(ItemKind::Pet.as_str());
+                }
+                if with_dup {
+                    if let Some(d) = &dup {
+                        s.push(' ');
+                        s.push_str(d);
+                    }
+                }
+                s
+            };
+            let ladder = [
+                render(true, true),
+                render(true, false),
+                render(false, false),
+            ];
+            let mut text = ladder[ladder.len() - 1].clone();
+            for cand in &ladder {
+                if menu::fit_to(cand, budget, scale) == *cand {
+                    text = cand.clone();
+                    break;
+                }
+            }
+            panel::PanelRow {
+                item: match e.wear {
+                    Some(i) => panel::PanelItem::Wear(i),
+                    None => panel::PanelItem::Info,
+                },
+                text,
+            }
+        })
+        .collect()
+}
+
+/// 「点中一件」要判的三档结论（**纯**版本，方法论同 [`DressView::select`]：`App` 在没有
+/// compositor 的机器上构造不起来 ⇒ 把"要判的那件事"改写成写得出来、也测得出来的形状）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PickWear {
+    /// 库存那道没过（未拥有 / 库读不出 / 这件不匹配本体 / 下标已失效）⇒ 一个字都不动。
+    Refused,
+    /// 点的**就是**身上这一件 ⇒ 不解像素、不重投帧（点了什么都没发生是**对的**，但它必须说话）。
+    AlreadyWorn,
+    /// 先释放身上那件（若有任何一件），再装载这一件。
+    SelectAndWear,
+}
+
+/// [`PickWear`] 的判定本体。拆出来的唯一理由 = 让"先比后写"这件事有一条 headless 读数。
+///
+/// ⚠️ `AlreadyWorn` 的比较**必须**用写之前的 `picked` —— [`App::pick_and_wear`] 里那句
+/// "先比再写"的次序就是这条函数存在的理由：一旦先写 `picked` 再比，`picked == want` 恒真，
+/// 最常见的那一次点击（换一件别的）会读成"已经穿着这一件"⇒ 静默不动 + 一句谎话。
+fn plan_pick_wear(gate_passes: bool, worn_some: bool, picked: usize, want: usize) -> PickWear {
+    if !gate_passes {
+        return PickWear::Refused;
+    }
+    if worn_some && picked == want {
+        return PickWear::AlreadyWorn;
+    }
+    PickWear::SelectAndWear
 }
 
 /// 「概率」那一屏要上屏的**五行整**：一行图例 + 四档各一行。
@@ -2308,11 +2496,21 @@ impl App {
     ///
     /// 设置页不碰库 ⇒ 它永远 `Ok`；`Err` 只可能来自收藏册那三个 tab，而那一路唯一的使用者
     /// 是 [`Self::refresh_panel_rows`]（面板开着时换语言/换动画档），那里库必然已经连着。
-    fn panel_rows(&self, kind: PanelKind) -> Result<Vec<panel::PanelRow>, String> {
+    ///
+    /// ⚠️ 「已获得」那一本**忽略传进来的 `page` 之外的一切**：它不走 [`Gacha::tab_lines`]，
+    /// 因为它的行不是"一串字"而是"一串带下标的可点条目"，分页与归一都在 [`Self::album_screen`]
+    /// 里。另两个 tab 保持 [`panel::collection_rows`]（非分页生产者的保险，见那条的注释）而
+    /// **读不到 `page`** —— `PanelItem::More` 只可能由 [`panel::album_page`] 产在 Owned 那一本，
+    /// 所以"传了 page 而没人读"在这一支是结构上不可达的，不是口子。
+    fn panel_rows(&mut self, kind: PanelKind) -> Result<Vec<panel::PanelRow>, String> {
         let lang = self.ui.lang;
         match kind {
             PanelKind::Settings => Ok(panel::settings_rows(lang, self.ui.motion)),
-            PanelKind::Collection { tab } => {
+            PanelKind::Collection {
+                tab: CollectionTab::Owned,
+                page,
+            } => self.album_screen(page).map(|(_kind, rows)| rows),
+            PanelKind::Collection { tab, .. } => {
                 let g = self
                     .gacha
                     .as_ref()
@@ -2323,6 +2521,55 @@ impl App {
                 ))
             }
         }
+    }
+
+    /// 「已获得」那一本的**一整屏** = 逐件行 + 汇总那五行 → 分页。返回**归一后的** `kind` 与行。
+    ///
+    /// 为什么返回 `kind` 而不是只返回行：页码归一（末页回卷）只由 [`panel::album_page`] 做，
+    /// 而存进 [`PanelState`] 的那一格必须就是归一后的页码 —— 存原始请求值的话，
+    /// `on_panel_press` 的 `kind.page() + 1` 会在回卷之后继续往上加，页码从此漂掉，
+    /// 屏上却永远只有那几页（"两个事实源"的又一形状）。
+    ///
+    /// ⚠️ 汇总那五行是**追加**在逐件行之后，不是被替换掉：`have/all` 与碎片余额只有那一行
+    /// 说得了，而逐件行回答的是"哪一件、能不能点"。代价（明写）= 汇总被挤到后面的页，
+    /// 首屏第一眼是逐件列表；要反过来就一行改（把汇总放到 `rows` 头部）。
+    ///
+    /// 库存这一趟读了两遍（[`Self::dress_view`] 内部一遍、这里一遍）。为什么不合成一遍：
+    /// 让 `DressView` 把 `Owned` 带出来会搅浑"豁免态压根不该读库"那条形状，而这一屏要的
+    /// 是**报表**（豁免态照样得知道有什么）。两遍读的是同一个 store、同一次点击之内 ⇒ 是
+    /// 同一个事实问了两次，不是两个事实源；代价 = 一次 sqlite 查询，而它不在 tick 环上
+    /// （§4 禁的是定时轮询）。
+    fn album_screen(&mut self, page: usize) -> Result<(PanelKind, Vec<panel::PanelRow>), String> {
+        if self.gacha.is_none() {
+            return Err("库还没连上（收藏册读不到东西）".to_string());
+        }
+        // 名字要先取：下面 `dress_view()` 可变借用 self，不能同时留 `candidates` 的引用。
+        let ids: Vec<String> = self.candidates.iter().map(|c| c.id.clone()).collect();
+        // 闸门只有一个所有者 = `dress_view`（这一条不许自己实现"许不许穿"）。
+        let view = self.dress_view();
+        let (lang, scale) = (self.ui.lang, self.scale_f());
+        let g = self
+            .gacha
+            .as_ref()
+            .ok_or_else(|| "库还没连上（收藏册读不到东西）".to_string())?;
+        let owned = g.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
+        let mut rows = album_rows(&g.album_entries(&owned, &ids, &view.visible)?, scale);
+        rows.extend(
+            g.collection_lines(lang)?
+                .into_iter()
+                .map(|text| panel::PanelRow {
+                    item: panel::PanelItem::Info,
+                    text,
+                }),
+        );
+        let screen = panel::album_page(lang, &rows, page);
+        Ok((
+            PanelKind::Collection {
+                tab: CollectionTab::Owned,
+                page: screen.page,
+            },
+            screen.rows,
+        ))
     }
 
     /// 开面板 = **先关菜单**（两块面永不同时在场）+ 按 [`Self::panel_rows`] 现算一行。
@@ -2475,12 +2722,34 @@ impl App {
     ///
     /// 一条而不是两条的理由是 §4 那条口径：**屏上那几行就是日志里那几行**。分两条就会出现
     /// "日志打了 5 行而屏上截断成 +N 更多"这种两边都自称正确的东西。
-    fn collection_panel(&mut self, tab: CollectionTab) {
+    ///
+    /// ⚠️ 「已获得」那一本**从这里岔出去**走 [`Self::collection_album`]：它的行不是"一串字"
+    /// 而是"一串带 candidates 下标的可点条目"，`Vec<String>` 那个中间层装不下它（装得下也要
+    /// 再造一张"第几行 → 第几件"的旁表 = `69fd158` 那一族）。两条路的**出声编配**是同一套
+    /// （先 `ensure_gacha`、失败只写错误行、成功清错误行、日志 == 屏上）。
+    fn collection_panel(&mut self, tab: CollectionTab, page: usize) {
+        if tab == CollectionTab::Owned {
+            self.collection_album(page);
+            return;
+        }
         self.gacha_panel(
             "collection",
-            PanelKind::Collection { tab },
+            PanelKind::Collection { tab, page },
             move |g, l, s| g.tab_lines(tab, l, s),
         );
+    }
+
+    /// 「已获得」那一本（逐件 + 分页）的入口 = [`Self::collection_panel`] 的 Owned 分支。
+    ///
+    /// `page` 是**请求的**页码，可以越界（末页点一下就是下一页）；归一在
+    /// [`panel::album_page`] 里做，而这里把它归一后的结果原样交给 [`Self::show_panel_rows`]
+    /// —— 传请求值上屏就是"页码漂掉"那条形状，见 [`Self::album_screen`] 那条注释。
+    fn collection_album(&mut self, page: usize) {
+        if !self.ensure_gacha() {
+            return;
+        }
+        let screen = self.album_screen(page);
+        self.show_panel_rows("collection", screen);
     }
 
     /// 收藏册 / 复核那几行"连库 → 读 → 上屏"的唯一路径。
@@ -2514,25 +2783,50 @@ impl App {
         self.show_panel_lines(prefix, kind, lines);
     }
 
-    /// `gacha_panel` 的后半（行已经读好 → 打日志 → 上屏）。**不碰库**的那一路（公示概率）
-    /// 从这里直接进，免得它为了复用后半而假造一次 `ensure_gacha()`。
+    /// 面板那两半的后半（行已经算好 → 打日志 → 上屏）的**行版**。
+    ///
+    /// ⚠️ 逐行打的时候**跳过 [`panel::PanelItem::Close`]**：那一格是"关闭"这个动作，不是一行
+    /// 内容，而既有那几屏（`Missing`/`Recent`/概率/复核）的生产者最多给 5 行 ⇒ 加进 `rows` 的
+    /// 只有它 ⇒ 不打它就等于**旧路径的 stderr 文本一个字节都不变**。这条不是洁癖：日志与屏上
+    /// 同字是 §4 的口径，而"关闭"从来没进过日志，现在也不该进。
+    ///
+    /// `Err` 只走 [`Self::gacha_bailed`]（stderr + 错误行），**不关面板**：点了"收藏"而什么都没
+    /// 发生，比读不到东西更糟。
+    fn show_panel_rows(
+        &mut self,
+        prefix: &str,
+        screen: Result<(PanelKind, Vec<panel::PanelRow>), String>,
+    ) {
+        match screen {
+            Ok((kind, rows)) => {
+                self.ui_error = None;
+                for r in &rows {
+                    if r.item != panel::PanelItem::Close {
+                        eprintln!("{prefix}: {}", r.text);
+                    }
+                }
+                self.show_panel(kind, rows);
+            }
+            Err(msg) => self.gacha_bailed(msg),
+        }
+    }
+
+    /// `Vec<String>` 那一版的适配器 = "一串字" → "全是只读行" → [`Self::show_panel_rows`]。
+    ///
+    /// 留着它只有一个理由：**「还缺」/「最近」/概率/复核这几屏的行本来就没有可点的**，
+    /// 把它们强行套进行结构会让每条报表都先变成 `PanelRow` 再变回字（日志侧多一次拷贝，
+    /// 而读的人看不出这两件事有什么区别）。
     fn show_panel_lines(
         &mut self,
         prefix: &str,
         kind: PanelKind,
         lines: Result<Vec<String>, String>,
     ) {
-        match lines {
-            Ok(v) => {
-                self.ui_error = None;
-                for l in &v {
-                    eprintln!("{prefix}: {l}");
-                }
-                let rows = panel::collection_rows(self.ui.lang, &v);
-                self.show_panel(kind, rows);
-            }
-            Err(msg) => self.gacha_bailed(msg),
-        }
+        let lang = self.ui.lang;
+        self.show_panel_rows(
+            prefix,
+            lines.map(|v| (kind, panel::collection_rows(lang, &v))),
+        );
     }
 
     /// 面板开着的行**跟着 `App.ui` 重算**（点语言行 / 点动画行之后调）。
@@ -2569,9 +2863,24 @@ impl App {
             // 标题带：收藏册换 tab；设置页 `cycle()` 返回自身 ⇒ 这一臂的含义是
             // **重载这一面的默认五行**，也就是「概率」/「复核」借走这一面时唯一的回程。
             panel::PanelItem::Header => match kind.cycle().tab() {
-                Some(tab) => self.collection_panel(tab),
+                // `cycle()` 已经把 `page` 归零（换一本当然从第一页起），这里传 0 是**同一个
+                // 意思写两遍**：`tab` 是从归一后的 `kind` 上取的，页码不是。
+                Some(tab) => self.collection_panel(tab, 0),
                 None => self.open_panel(PanelKind::Settings),
             },
+            // 页码控件 ⇒ 翻这一本的第二页（末页回卷由 [`panel::album_page`] 归一）。
+            //
+            // ⚠️ 这一格**只可能出现在「已获得」**（另两本与设置页都不产 `PanelItem::More`），
+            // 而这里不写 `unreachable!`：这一面被「概率」/「复核」借走过，`kind` 与行**分家**
+            // 的窗口是存在的，命中一张旧表而办事办到新的一屏，比赌一次 panic 好（硬约束 3）。
+            panel::PanelItem::More => match kind.tab() {
+                Some(tab) => self.collection_panel(tab, kind.page() + 1),
+                None => self.open_panel(PanelKind::Settings),
+            },
+            // 逐件那一行 ⇒ **直接穿上**（用户 11-07 拍板②）。走 [`Self::pick_and_wear`]，
+            // **不走 [`Self::equip`]**：后者的早退读的是 `picked`，而"先写 picked 还是先比
+            // picked"就是这一条的全部安全性所在（见那条上的顺序注释）。
+            panel::PanelItem::Wear(i) => self.pick_and_wear(i),
             panel::PanelItem::Lang => self.cycle_lang(),
             panel::PanelItem::Motion => self.cycle_motion(),
             // 公示概率不碰库（见 [`Self::rates_lines`]），所以这一臂不过 `gacha_panel`。
@@ -2650,12 +2959,12 @@ impl App {
             // ── 收藏册页：三行各自**开出面板的那一个 tab**（全是只读，不掷骰、不花钱、不改库）──
             // 这一批起它们不再"只进 stderr"：点下去 = 第三块面上看得见那几行，而 stderr 打的
             // 是同一批字（`Gacha::tab_lines` 是唯一的生产者，两边都从它过）。
-            menu::MenuItem::Owned => self.collection_panel(CollectionTab::Owned),
-            menu::MenuItem::Missing => self.collection_panel(CollectionTab::Missing),
+            menu::MenuItem::Owned => self.collection_panel(CollectionTab::Owned, 0),
+            menu::MenuItem::Missing => self.collection_panel(CollectionTab::Missing, 0),
             // 条数 = 一屏装得下的行数（`panel::MAX_ROWS - 1`，见 [`Gacha::tab_lines`]）。
             // 不是"最近十次 = 一次十连"那种口径：那个说法属于只打日志的年代，而现在这一屏
             // 第六格是 `Close`，多一条就得靠截断补「+N 更多」，那是保险而不是主路径。
-            menu::MenuItem::Recent => self.collection_panel(CollectionTab::Recent),
+            menu::MenuItem::Recent => self.collection_panel(CollectionTab::Recent, 0),
             // ── 设置页：菜单那三行是**入口**，功能在面板上办 ──
             // `MenuItem::Settings` 不存在（也不该有 —— 加一个变体要动 `rows()`、命中表、
             // l10n 四个 locale、字体重裁），所以"动画"那一行的循环职责交给面板里的
@@ -2859,14 +3168,76 @@ impl App {
         }
     }
 
+    /// 收藏册点名一件 ⇒ **直接穿上**（P4 = 用户 11-07 拍板②）。第 4 个 [`Self::wear`] 调用点，
+    /// 也是唯一一个"下标来自屏上一行"的。
+    ///
+    /// 为什么不借道 [`Self::equip`]（这点很反直觉，值得看完）：`equip` 的第一条出口是
+    /// "已经穿着 ⇒ 当场返回"，而它成立靠的是**"穿着的就是 `picked` 那一件"这条不变量**
+    /// （原来只有 [`Self::cycle_accessory`] 会改 `picked`，它改下标时总是连像素一起换）。
+    /// 收藏册要点的是**任意一格**，那条不变量在这一条路上还没建立就要求它 ⇒ 借道 `equip` 的
+    /// 话，"身上是 A、点的是 B"会读成"已经穿着"⇒ **静默不动 + 一句谎话**。所以顺序是：
+    ///
+    /// 1. `dress_view()` —— 所有权闸**照旧只有一个所有者**，这一条不自己实现"许不许穿"；
+    /// 2. 判 `plan_pick_wear`（**比 `picked` 必须在这里，任何写入之前**）；
+    /// 3. `SelectAndWear` 时**先** [`Self::take_worn`] 释放身上那件，**再**写 `picked`、再 [`Self::wear`]。
+    ///
+    /// 3 里"先释放"是 M1 内存档的字面要求（[`Self::take_worn`] 那条算过 135 MiB 的峰值），
+    /// 而"释放排在写 `picked` 之前"是为了让 2 的判据读到的还是**用户点之前**的那个世界。
+    /// 用 `take_worn` 不用 [`Self::unwear`]：后者会先把库里那一格 DELETE 再写回来，白写一次
+    /// 且留一个"库里没有"的可见窗口（[`Self::cycle_accessory`] 同一处理由）。
+    ///
+    /// **面板不关**：[`panel::placement`] 优先右/左/上/下不压宠物 ⇒ 换的像素看得见，而关掉会
+    /// 连 `page` 一起丢（用户翻页翻到第 3 页点一件，屏跳回第一页 = 白翻）。这一条也不重画
+    /// 面板：本轮面板的行**一个字没变**（选中了什么不上屏 = 用户 11-07 拍板③）。
+    fn pick_and_wear(&mut self, i: usize) {
+        let view = self.dress_view();
+        match plan_pick_wear(
+            view.visible.contains(&i),
+            self.worn.is_some(),
+            self.picked,
+            i,
+        ) {
+            PickWear::Refused => {
+                // 屏上这一行是 `Wear(i)` 才被点到的，而 `Wear(i)` 是产行的那一刻按同一道闸
+                // 给的下标 ⇒ 走到这里只能是**两次点击之间**世界变了（库被另一进程改了 / 磁盘
+                // 产物被删了）。不赌 panic，也不"顺手穿上"：失败关闭。
+                eprintln!(
+                    "ui: 收藏册 ⇒ 点名第 {i} 格而这一轮不许穿（可穿 {} 件 · 因未拥有出局 {} 件）⇒ 不动",
+                    view.visible.len(),
+                    view.withheld
+                );
+            }
+            PickWear::AlreadyWorn => {
+                eprintln!("ui: 收藏册 ⇒ 身上已经是第 {i} 格这一件，不解像素、不重投帧");
+            }
+            PickWear::SelectAndWear => {
+                if let Some((slug, bytes)) = self.take_worn() {
+                    eprintln!(
+                        "ui: 收藏册 ⇒ 先释放 {slug}（{:.3} MiB 解码）⇒ 峰值始终是一件",
+                        bytes as f64 / (1024.0 * 1024.0)
+                    );
+                }
+                self.picked = i;
+                match self.wear(i) {
+                    Ok(slug) => eprintln!("ui: 收藏册 ⇒ 穿上 {slug}（点名自第 {i} 格）"),
+                    Err(e) => {
+                        eprintln!("ui: 收藏册 ⇒ 点名第 {i} 格而装载失败：{e}（停在未装备态）")
+                    }
+                }
+            }
+        }
+    }
+
     /// 点"穿上"：把当前选中的那件**到这一步才解码**（内存档 M1 = 一次一件 ⇒ 装备 = 装载、
     /// 脱装 = 释放，配件那份 sheet 不在常驻预算里）。
     ///
     /// 三条出口都必须是"什么都不做"而不是"做一遍再把结果丢掉"，而只有第一条由本函数自己判：
     /// * **已经穿着** ⇒ 当场返回，不重解码。重复点同一行要再付一次解码的几十毫秒与几 MiB，
     ///   还会把同一格像素再投一帧（签名看不见变化而照样提交 = `69fd158` 那个形状）。
-    ///   这里**不需要比"是不是同一件"**：[`cycle_accessory`] 改下标时总是连像素一起换 ⇒
-    ///   "穿着"永远意味着"穿的就是当前选中这件"，这是那一条维持的不变量。
+    ///   这里**不需要比"是不是同一件"**：[`cycle_accessory`] 与 [`pick_and_wear`] 改 `picked`
+    ///   时都是"当场就装载"（后者连"比了再写"的顺序都写在那条里）⇒ "穿着"永远意味着
+    ///   "穿的就是当前选中这件"，这是那**两条**共同维持的不变量。**以后任何"只改下标不装像素"
+    ///   的新路径都会当场把这句话变成假话**，而 `equip` 的第一条出口就会静默吞掉一次点击。
     /// * **库里没有可用配件**（库不存在 / 空 / 每一件都过不了门禁）⇒ 一行日志。
     ///   **不预先把这行画成灰的**：那要求客户端在绘制时读"扫到了几件"，而灰掉的行正是本项目
     ///   禁止的假按钮形状反过来（[`send_action`] 那条同族理由，用户已判"照发、接受不响应"）。
@@ -2967,20 +3338,27 @@ impl App {
 
     /// **唯一**能把配件放上身的那一步：解码 → 像素与轮廓上身 → 记进 `equipped`。
     ///
-    /// 为什么这三件必须在一个函数里（本轮变异实测逼出来的）：原先三个装载点各自写"四行赋值 +
+    /// 为什么这三件必须在一个函数里（本轮变异实测逼出来的）：原先几个装载点各自写"四行赋值 +
     /// 一句 `persist_worn`"，而把 `equip` 里那句删掉，**全套 526 条测试全绿** —— `App` 在没有
     /// compositor 的机器上构造不出来 ⇒ "屏上戴着一顶而库里没记这笔"这个本项目反复出现的形状，
     /// 在 headless 里**根本没有读数**。合成一个动作之后，"改了像素而忘了记账"不再是写得出来的
-    /// 代码；要绕过它就得先删掉这个函数，而那必然在另外两个调用点上报错。
+    /// 代码；要绕过它就得先删掉这个函数，而那必然在其他调用点上报错。
+    ///
+    /// ⚠️ **调用点现在是四个**：[`Self::equip`]（换装页点"穿上"）、[`Self::cycle_accessory`]
+    /// （"换一件"）、[`Self::restore_worn`]（启动恢复）、[`Self::pick_and_wear`]（收藏册点名）。
+    /// 数量本身由 `pixels_and_the_ledger_are_written_by_one_function_only` 逐个数着 ⇒ 加第五个
+    /// 不会静默，而**第四个是被不变量逼出来的**，不是重复：`equip` 的早退读 `picked`，而收藏册
+    /// 要在"点 B 而身上是 A"时真的换过去（完整理由写在 [`Self::pick_and_wear`] 那条上）。
+    /// **以后再加装载/卸下路径，必须走 `wear()`/`unwear()`**，且必须问清"它能不能借道已有的那四个"。
     ///
     /// ⚠️ **调用方如果原本穿着，必须先 [`Self::take_worn`]**：这里不做，是因为 [`cycle_accessory`]
-    /// 要在两件之间插一行"释放了多少 MiB"，而那行要在旧 sheet 还在的时候取它的字节数。
-    /// 忘了 take 的代价就是 `take_worn` 那条注释算过的 135 MiB 峰值。
+    /// 要在两件之间插一行"释放了多少 MiB"，而那行要在旧 sheet 还在的时候取它的字节数
+    /// （[`Self::pick_and_wear`] 同理）。忘了 take 的代价就是 `take_worn` 那条注释算过的 135 MiB 峰值。
     ///
     /// 顺序（先像素后账）是选的：反过来的话"写库成功而解码失败"会在库里留一行屏上没有的帽子
     /// ⇒ 下次启动凭空多一顶。宁可"这次没留住"并且由 [`Self::persist_worn`] 说出来。
     ///
-    /// 返回 `slug` 只给人看的那三行用（各处措辞自带上下文：第几件 / 释放了多少 / 恢复）。
+    /// 返回 `slug` 只给人看的那几行用（各处措辞自带上下文：第几件 / 释放了多少 / 恢复 / 点名）。
     fn wear(&mut self, index: usize) -> Result<String, String> {
         let eq = decode(&self.candidates[index])?;
         let slug = eq.manifest.slug.clone();
@@ -4691,15 +5069,53 @@ mod tests {
         // ② `wear` 自己必须带那句记账（① 只保证"别处没有"，不保证"这里有"）。
         assert!(
             wears.contains("persist_worn"),
-            "`wear` 里没有 `persist_worn` ⇒ 三处装载全都不记账，而 headless 测不出来"
+            "`wear` 里没有 `persist_worn` ⇒ 四处装载全都不记账，而 headless 测不出来"
         );
 
-        // ③ 三个装载点都真的走 `wear`（少一个就是"那条路又自己写了一遍像素"）。
+        // ③ 四个装载点都真的走 `wear`（少一个就是"那条路又自己写了一遍像素"）。
+        //
+        // ⚠️ **这个数从 3 变成 4 是 P4 那一格（收藏册点名）逼出来的，不是顺手加的**：那一条
+        // **不能借道 [`App::equip`]**，因为 `equip` 的早退读的是 `picked`，而收藏册要在
+        // "身上是 A、点的是 B"时真的换过去（完整理由在 `pick_and_wear` 那条注释上）。
+        // 第五个调用点如果将来出现，红的是这一条，而那正是要人看一眼"它能不能复用前四个"的时刻。
         assert_eq!(
             code.matches("self.wear(").count(),
-            3,
-            "`wear` 应当被穿上 / 换一件 / 启动恢复 三处共用，实际调用点 {} 个",
+            4,
+            "`wear` 应当被穿上 / 换一件 / 启动恢复 / 收藏册点名 四处共用，实际调用点 {} 个",
             code.matches("self.wear(").count()
+        );
+        // ④ 新那条路只有一个入口，别让它被复制一份到某个 `match` 臂里（复制的那份会自己
+        //    决定"要不要先释放"，而那是这一整条设计的全部安全性所在）。
+        assert_eq!(
+            code.matches("self.pick_and_wear(").count(),
+            1,
+            "`pick_and_wear` 只许被 `on_panel_press` 的 `Wear` 那一臂调用，实际 {} 处",
+            code.matches("self.pick_and_wear(").count()
+        );
+
+        // ⑤ **`pick_and_wear` 内部的次序**就是这一整条设计的安全性所在，而 headless 构造不出
+        //    `App` ⇒ 这件事除了读文本没有别的读数（①②③④ 同一族，也是 P3 变异 G 那次的教训）。
+        //    次序 = 判定（读**旧** `picked`）→ 释放身上那件 → 写 `picked` → 装载：
+        //    · 颠倒"判定/写" ⇒ 最常见的那一次点击（身上 A、点 B）被读成"已经穿着这一件"
+        //      ⇒ 静默不动 + 一句谎话；
+        //    · 删掉"释放" ⇒ 两份 45 MiB 同时在内存，正是历史上 `VmHWM 148,076 kB` 那次越线的成因。
+        //    两次变异抽查各打这一条，红了就说明这条门禁有读数。
+        let pick = body("pick_and_wear");
+        let at = |needle: &str| {
+            pick.find(needle)
+                .unwrap_or_else(|| panic!("`pick_and_wear` 里没有 `{needle}` ⇒ 那条次序被拆了"))
+        };
+        assert!(
+            at("plan_pick_wear(") < at("self.picked = i"),
+            "先写 `picked` 再判定 ⇒ `AlreadyWorn` 恒真，换一件那次点击会被静默吞掉"
+        );
+        assert!(
+            at("self.take_worn()") < at("self.picked = i"),
+            "释放排在写 `picked` 之后 ⇒ 判定读到的已经不是用户点之前的世界"
+        );
+        assert!(
+            at("self.picked = i") < at("self.wear(i)"),
+            "装载排在写 `picked` 之前 ⇒ `wear` 装的是上一件，而屏上下标已经换"
         );
     }
 
@@ -4749,6 +5165,9 @@ mod tests {
         // 真抽十连：让「已获得」有名字行、「还缺」有缺项、「最近」装满五行、「复核」有链头。
         g.pull(10, true, Lang::Zh, 1.5).expect("十连该成功");
         let mut screens = 0usize;
+        // 收藏册逐件那本的页数**由生产者算**（不是写死一个算式）：条目一多，写死的算式就变成
+        // 猜硬币，而这条门禁的意义恰恰是"没人能悄悄少量一屏"。
+        let mut album_screens = 0usize;
         // ⚠️ `scale` 在**外层**：产行的那一刻读它（`missing_lines` 按宽度折名字），画的那一刻读
         // 同一个数。把这两层拆开选就等于"用 1× 折出来的行去判 1.5× 的预算"，那是两个口径。
         for scale in [1.0f32, 1.5] {
@@ -4762,10 +5181,64 @@ mod tests {
                         .tab_lines(tab, lang, scale)
                         .expect("收藏册三屏都该读得出来");
                     sets.push((
-                        PanelKind::Collection { tab },
+                        PanelKind::Collection { tab, page: 0 },
                         panel::collection_rows(lang, &lines),
                     ));
                 }
+                // 「已获得」那一本的**逐件 + 分页**：每一页都是一屏，都得量。
+                //
+                // 可点性按**最坏情况**给 —— `ids` 交全部 catalog 配件名、`visible` 交全部下标
+                // ⇒ 配件行全是 `Wear`，走的是那条**更窄**的预算（[`panel::ROW_LABEL_W`] 209 而不是
+                // 只读行的 216）。量宽的那档而屏上画窄的那档，就是这条门禁最没用的形状。
+                //
+                // ⚠️ 上面那条 `tab_lines(Owned)` 那一屏**留着**：它现在不再是一整屏（Owned 走
+                // 分页那条路），但它的五行汇总**就是**下面 `entries` 尾部那五行 ⇒ 留它是把
+                // "报表那五行"单独钉住，而分页那一段钉的是"逐件那几张行 + 页码控件"。
+                let ids: Vec<String> = g.catalog.accessories().map(|i| i.id.clone()).collect();
+                let visible: Vec<usize> = (0..ids.len()).collect();
+                let owned = g.store.owned().expect("刚抽完十连的内存库该读得出库存");
+                let entries = g
+                    .album_entries(&owned, &ids, &visible)
+                    .expect("逐件收藏册的行该读得出来");
+                let mut content = album_rows(&entries, scale);
+                content.extend(
+                    g.collection_lines(lang)
+                        .expect("汇总那五行该读得出来")
+                        .into_iter()
+                        .map(|text| panel::PanelRow {
+                            item: panel::PanelItem::Info,
+                            text,
+                        }),
+                );
+                let first = panel::album_page(lang, &content, 0);
+                album_screens += first.pages;
+                let mut shown = 0usize;
+                for p in 0..first.pages {
+                    let screen = panel::album_page(lang, &content, p);
+                    shown += screen
+                        .rows
+                        .iter()
+                        .filter(|r| {
+                            r.item != panel::PanelItem::More && r.item != panel::PanelItem::Close
+                        })
+                        .count();
+                    sets.push((
+                        PanelKind::Collection {
+                            tab: CollectionTab::Owned,
+                            page: screen.page,
+                        },
+                        screen.rows,
+                    ));
+                }
+                // **覆盖**也要点名：分页分错了会把同一件画两遍而把另一件永远藏起来，
+                // 那种 bug 在"每屏都 ≤ 六行、每行都画得出来"里长得完全正确。
+                assert_eq!(
+                    shown,
+                    content.len(),
+                    "{lang:?} 在 {scale}× 下翻了 {} 页只画到 {shown} 条，而逐件收藏册有 {} 条 ⇒ 有件永远见不到",
+                    first.pages,
+                    content.len()
+                );
                 // 「概率」/「复核」把设置面**借走**的那两屏：`kind` 仍是 `Settings` ⇒ 标题带
                 // 还是「设置」，而行是别的内容。这两屏是这一批新出现的形状，没人量过。
                 let rates = published_rates_lines(lang).expect("公示读得出来");
@@ -4814,11 +5287,385 @@ mod tests {
             }
         }
         // 屏数要点名：少一个生产者这条照样绿（"没量到"和"量过了且对"在两行断言里长得一样）。
+        // ⚠️ 这里**不写死**收藏册那一本的页数（`album_screens` 是逐轮累加的真实页数）⇒
+        // 加一件能穿的配件、抽到新的一档，页数会变而这条跟着变；写死就是一个"内容一多就
+        // 变成猜硬币"的门禁。
+        let combos = 2 * Lang::ALL.len();
         assert_eq!(
             screens,
-            2 * Lang::ALL.len() * (panel::CollectionTab::ALL.len() + 3),
-            "应当量满 两档缩放 × 四 locale × (收藏册三屏 + 设置默认 + 概率 + 复核)"
+            combos * (panel::CollectionTab::ALL.len() + 3) + album_screens,
+            "应当量满 两档缩放 × 四 locale × (收藏册三屏 + 设置默认 + 概率 + 复核) 再叠加逐件册的每一页（每轮 {} 页）",
+            album_screens / combos
         );
+        assert_eq!(
+            album_screens % combos,
+            0,
+            "每轮 (缩放 × locale) 的页数应当一致（不一致 = 分页读了语言或缩放，而它不该读）"
+        );
+    }
+
+    // ==================== P4 收藏册点名 ====================
+    //
+    // 这四条共同钉住本轮唯一的新形状：**一行 = 一件，格子里的下标 = 换装页 cycle 的那套下标**。
+    // 之所以全是纯函数级的断言：`App` 在没有 compositor 的机器上构造不起来（P2/P3 同一理由，
+    // 方法论也是同一套 —— 见 [`DressView::select`] 与 [`plan_pick_wear`] 的注释）。
+
+    /// P4 的 fixture：**一份把稀有度序打乱的合成目录**。
+    ///
+    /// ⚠️ 目录里的数组顺序**故意**不是"同档相邻"（`hood_night` 那件 R 夹在 N 前面）：
+    /// [`Gacha::album_entries`] 按 `Rarity::ALL` × 档内序遍历 ⇒ 条目顺序由**档**决定，而
+    /// 行上的载荷 `Wear(i)` 里的 `i` 必须是 `candidates` 的下标。fixture 里**每一件**的
+    /// "目录枚举序号"与"`ids` 下标"都不同 ⇒ 谁把那句 `ids.iter().position(..)` 顺手写成
+    /// 枚举计数器，下面第一条断言会当场点名是哪一件（而"两个序号恰好相等"的 fixture 永远
+    /// 看不出来 —— 那是本项目反复抓的"测试测的是一个常量"的形状）。
+    fn album_fixture() -> Gacha {
+        let real = Catalog::default_v1().expect("默认目录该读得动");
+        let pick = |id: &str| {
+            real.items
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap_or_else(|| panic!("fixture 要的 {id} 不在默认目录里"))
+                .clone()
+        };
+        let mut g = Gacha::connect(None).expect("内存库该建得起来");
+        g.catalog = Catalog {
+            format: real.format,
+            id: real.id.clone(),
+            banner_id: real.banner_id.clone(),
+            items: vec![
+                pick("hood_night"), // R · 夜兜
+                pick("bell_gold"),  // N · 金铃
+                pick("cat_shiro"),  // N · 小白（宠物：有下标也永远不给点）
+                pick("cap_blue"),   // N · 蓝帽
+                pick("hat_straw"),  // SSR · 草帽（"抽到了而磁盘没产物"那一件）
+            ],
+        };
+        g
+    }
+
+    fn owned_of(ids: &[&str]) -> Owned {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `candidates`（= 磁盘上真有产物、且匹配本体的那几件）的下标表，顺序与目录遍历序无关。
+    fn album_ids() -> Vec<String> {
+        ["cap_blue", "hood_night", "cat_shiro", "bell_gold"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// **载荷下标 = 换装页那套下标**（这条是 P4 唯一"点错件"级别的事故）。
+    ///
+    /// 抄 [`unowned_accessory_never_appears_while_the_owned_one_does`] 那批 `hat_*` fixture
+    /// 的写法：`visible` 不是手填的常量，而是**换装页自己那个纯函数**（[`DressView::select`]）
+    /// 跑出来的 ⇒ 两边共用同一个下标空间这件事由构造说话。反查用 catalog 的 `name`，因为
+    /// [`AlbumEntry`] 刻意不带 id（"catalog 不认的 id 也要能进这张表"那一条）。
+    #[test]
+    fn the_row_payload_is_the_same_index_the_dress_page_cycles() {
+        let g = album_fixture();
+        let ids = album_ids();
+        let owned = owned_of(&["bell_gold", "cat_shiro", "cap_blue", "hood_night"]);
+        let visible = DressView::select(false, Some(&owned), &ids).visible;
+        let entries = g
+            .album_entries(&owned, &ids, &visible)
+            .expect("逐件条目该读得出来");
+
+        // 条目序 = 档序（N 三件按档内序 → R），而 `hat_straw` 不在 `owned` 里 ⇒ 根本不出现。
+        let want = [
+            ("金铃", Some(3usize)),
+            ("小白", None),
+            ("蓝帽", Some(0)),
+            ("夜兜", Some(1)),
+        ];
+        assert_eq!(entries.len(), want.len(), "条目数不等于 catalog ∩ owned");
+        for (e, (name, w)) in entries.iter().zip(want) {
+            assert_eq!(e.name, name, "条目顺序漂了");
+            assert_eq!(e.wear, w, "{name} 的载荷下标不对");
+        }
+        assert!(
+            entries.iter().all(|e| e.name != "草帽"),
+            "未拥有的件不该进逐件册（它出现在汇总那一行就够了）"
+        );
+
+        // **真正的那条**：每个载荷都能拿它去 `ids` 里反查出这一件自己的 id。
+        // 写成"等于目录里的枚举序号"的话，这行永远验不出任何东西。
+        for e in &entries {
+            let Some(i) = e.wear else { continue };
+            let id = g
+                .catalog
+                .items
+                .iter()
+                .find(|it| it.name == e.name)
+                .map(|it| it.id.clone())
+                .unwrap_or_else(|| panic!("{} 不在 fixture 目录里", e.name));
+            assert_eq!(
+                ids[i], id,
+                "Wear({i}) 说的不是 {id} 在 candidates 里的位置 ⇒ 点这行会穿错件"
+            );
+            // 载荷必然在闸门放行集里（`pick_and_wear` 的那道 `visible.contains` 恒真，
+            // 而它**必须**仍然查一遍 —— 屏上挂着的行可能已经比这一轮的记忆旧一次）。
+            assert!(
+                visible.contains(&i),
+                "给了下标却没让它过闸 = 屏上给了一个必然被拒的按钮"
+            );
+        }
+        // 反面对照：闸门放行了下标 2（那只猫）而条目**不给**载荷 ⇒ "看得见但不给点"这一格
+        // 是本轮唯一的非配件形状，它必须是 visible 里唯一没被任何行认领的一格。
+        let inert: Vec<usize> = visible
+            .iter()
+            .copied()
+            .filter(|i| !entries.iter().any(|e| e.wear == Some(*i)))
+            .collect();
+        assert_eq!(
+            inert,
+            vec![2],
+            "宠物之外还有格子被放行了却没行认领 ⇒ 那件点不到"
+        );
+    }
+
+    /// [`plan_pick_wear`] 的**全划分**：8 格真值表每一格都落进三档之一，三档各被至少一格打到，
+    /// 而"先比后写"那条次序就住在这张表里。
+    ///
+    /// 抄 [`exemption_needs_the_flag_and_a_real_store`] 那种"四格真值表逐格点名"的写法。
+    /// 两条最容易写反的格子单独钉：② `worn=false` 时下标相等**不是**"已经穿着它"（那是"没穿
+    /// 任何东西而选中格恰好指着它"⇒ 必须真装）；④ 如果 [`App::pick_and_wear`] 先写 `picked`
+    /// 再比，这一格（最常见的那一次"换一件别的"）就变成 `AlreadyWorn` ⇒ 静默不动 + 一句谎话。
+    #[test]
+    fn plan_pick_wear_partitions_the_three_outcomes() {
+        let mut refused = 0;
+        let mut already = 0;
+        let mut wear = 0;
+        for gate in [false, true] {
+            for worn in [false, true] {
+                for (picked, want) in [(3usize, 3usize), (3, 4)] {
+                    match plan_pick_wear(gate, worn, picked, want) {
+                        PickWear::Refused => refused += 1,
+                        PickWear::AlreadyWorn => already += 1,
+                        PickWear::SelectAndWear => wear += 1,
+                    }
+                }
+            }
+        }
+        assert_eq!(refused + already + wear, 8, "八格真值表有格子没落进三档");
+        assert_eq!(
+            (refused, already, wear),
+            (4, 1, 3),
+            "三档的分布变了 ⇒ 有人动了判定次序或把某档合并了"
+        );
+
+        // ① 闸门没过 ⇒ 无论身上有什么、下标等不等，一律不动。这是"失败关闭"那一侧。
+        for worn in [false, true] {
+            for (picked, want) in [(3usize, 3usize), (3, 4)] {
+                assert_eq!(
+                    plan_pick_wear(false, worn, picked, want),
+                    PickWear::Refused,
+                    "库存没过还去装载 = 换装页那道闸在这里被绕过"
+                );
+            }
+        }
+        // ② 身上没东西 ⇒ 哪怕选中的就是它，也得真装一次（否则"第一次点收藏册"什么都不发生）。
+        assert_eq!(
+            plan_pick_wear(true, false, 3, 3),
+            PickWear::SelectAndWear,
+            "未装备态点同一格被读成'已经穿着它'"
+        );
+        // ③ 穿着的就是它 ⇒ 不解像素、不重投帧，但必须说话。
+        assert_eq!(plan_pick_wear(true, true, 3, 3), PickWear::AlreadyWorn);
+        // ④ 穿着别的那件 ⇒ 换。
+        assert_eq!(plan_pick_wear(true, true, 3, 4), PickWear::SelectAndWear);
+    }
+
+    /// 三种"点不了"的形状都**留在屏上**，只是没有强调条；唯一被点的那一件才有载荷。
+    ///
+    /// 抄 [`an_info_row_is_hit_but_never_activates_while_the_row_below_does`]（`panel.rs`）
+    /// 那条"逐格列举可点性"的写法，但这一条量的是**生产者侧**：`Wear`/`Info` 这一格是
+    /// [`Gacha::album_entries`] 定的，而 `panel::press` 只是照它办事。合在一起才是
+    /// "抽到 ≠ 能穿"这件事第一次在屏上读得出来（§9.2 第 20 条那一族的最后一块）。
+    #[test]
+    fn an_unowned_or_undiskable_entry_stays_inert() {
+        let g = album_fixture();
+        // 磁盘只有两件有产物（裸开发树 30 件只有 1 件 ⇒ **这才是常态**），而库存里躺着四件。
+        let ids: Vec<String> = ["cap_blue", "hood_night"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let owned = owned_of(&["cap_blue", "hood_night", "hat_straw", "cat_shiro"]);
+        let visible = DressView::select(false, Some(&owned), &ids).visible;
+        let entries = g
+            .album_entries(&owned, &ids, &visible)
+            .expect("逐件条目该读得出来");
+        assert_eq!(
+            entries.len(),
+            4,
+            "列表读的是 catalog ∩ owned ⇒ 四件都该在，哪怕磁盘上只有两件"
+        );
+
+        let rows = album_rows(&entries, 1.0);
+        assert_eq!(rows.len(), entries.len(), "一行一件这条断了");
+        let row_of = |name: &str| {
+            rows.iter()
+                .find(|r| r.text.contains(name))
+                .unwrap_or_else(|| panic!("屏上没有{name}那一行"))
+        };
+        // ✅ 有产物 + 过闸 ⇒ 可点，且载荷就是它在 `ids` 里的位置。
+        assert_eq!(row_of("蓝帽").item, panel::PanelItem::Wear(0));
+        assert_eq!(row_of("夜兜").item, panel::PanelItem::Wear(1));
+        // ⚠️ 抽到了而磁盘没产物 ⇒ **只读行**，而名字照说（"消失了"和"不能穿"是两件事）。
+        let straw = row_of("草帽");
+        assert_eq!(straw.item, panel::PanelItem::Info);
+        assert_eq!(
+            straw.text,
+            format!(
+                "{} {} {}",
+                Rarity::SSR.as_str(),
+                Slot::Head.as_str(),
+                "草帽"
+            ),
+            "无产物的那一件把档名/挂点/名字丢了 ⇒ 这行读不出自己是什么"
+        );
+        // ⚠️ 宠物 ⇒ 只读 + 行尾 ASCII `pet` 标（FLOW §6③ 那句"明写而不是灰掉不显示"）。
+        let pet = row_of("小白");
+        assert_eq!(pet.item, panel::PanelItem::Info);
+        assert!(
+            pet.text.ends_with(ItemKind::Pet.as_str()),
+            "宠物那一行没打 `pet` 标：{:?}",
+            pet.text
+        );
+        assert_eq!(
+            pet.text,
+            format!("N {} {}", "小白", ItemKind::Pet.as_str()),
+            "挂点为 `None` 的那一格该整个消失，而不是留一个空格"
+        );
+
+        // **可点格子数必须正好等于"磁盘有产物又过闸"那两件**：多一个就是假按钮（D14 判死过的
+        // 形状），少一个就是那一件永远点不到。
+        assert_eq!(
+            rows.iter().filter(|r| r.item.actionable()).count(),
+            2,
+            "可点行与 `ids ∩ visible` 不对账"
+        );
+    }
+
+    /// 逐件那一行的**宽度纪律**：能放的词一个不丢，放不下的按 `dup` → `slot` 的顺序丢，
+    /// 而**永远不许**留下一个 `…`（除了"名字本身就超预算"那一格，那一格明确交给排版）。
+    ///
+    /// 抄 [`every_panel_row_is_sayable_and_never_truncated`] 那套"预算与排版逐字同构"的量法
+    /// （可点行问 [`menu::label_rect`]、只读行问 [`menu::row_text`]），但条目是**合成的**：
+    /// 真 catalog 的名字最短 2 个字，量不到这一族的下界。三档缩放 = `card.rs` 那三条
+    /// （`[1.0, 1.5, 2.0]`），四 locale 走的是**分页之后**那一屏（`More` 那一行才是本地化的）。
+    #[test]
+    fn album_rows_say_every_entry_without_truncation() {
+        // ① 两档预算必须是**两个不同的数**：把它们"顺手统一"成 216，下面那条合成阶梯会
+        //    少一档而真机屏上多一个 `…`（这条断言就是防止那句"反正差 7 px"）。
+        for scale in [1.0f32, 1.5, 2.0] {
+            assert!(
+                menu::budget_for(panel::ROW_LABEL_W, scale)
+                    < menu::budget_for(panel::ROW_TEXT_W, scale),
+                "{scale}× 下可点行的预算不比只读行窄 ⇒ 强调条没人让位"
+            );
+        }
+
+        // ② 合成阶梯：名字长度四档，正好各打中"丢 dup / 丢 slot / 无词可丢"里的一档。
+        //    期望值由本条自己按 `render` 的同一条顺序算（参照物，不是重新实现控制流）。
+        let rar = Rarity::N;
+        let neck = Slot::Neck;
+        let slot = Some(neck);
+        for scale in [1.0f32, 1.5, 2.0] {
+            let mut branch = [0usize; 4];
+            for name in [
+                "蓝帽".to_string(),
+                "蓝帽".repeat(6),
+                "蓝帽".repeat(12),
+                "蓝帽".repeat(40),
+            ] {
+                let e = AlbumEntry {
+                    wear: Some(0),
+                    name: name.clone(),
+                    rarity: rar,
+                    slot,
+                    kind_pet: false,
+                    dup: 3,
+                };
+                let row = &album_rows(&[e], scale)[0];
+                let budget = menu::budget_for(panel::ROW_LABEL_W, scale);
+                let fits = |s: &str| menu::fit_to(s, budget, scale) == s;
+                let say = |with_slot: bool, with_dup: bool| {
+                    let mut s = rar.as_str().to_string();
+                    if with_slot {
+                        s.push(' ');
+                        s.push_str(neck.as_str());
+                    }
+                    s.push(' ');
+                    s.push_str(&name);
+                    if with_dup {
+                        s.push_str(" x3");
+                    }
+                    s
+                };
+                let (all, no_dup, bare) = (say(true, true), say(true, false), say(false, false));
+                if fits(&all) {
+                    assert_eq!(row.text, all, "{scale}× 全量放得下却丢了词");
+                    branch[0] += 1;
+                } else if fits(&no_dup) {
+                    assert_eq!(row.text, no_dup, "{scale}× 该丢 dup 而不是丢挂点");
+                    branch[1] += 1;
+                } else if fits(&bare) {
+                    assert_eq!(row.text, bare, "{scale}× dup 与挂点都该丢");
+                    branch[2] += 1;
+                } else {
+                    assert_eq!(row.text, bare, "{scale}× 无词可丢时只剩档名 + 名字");
+                    branch[3] += 1;
+                }
+                assert_sayable(&row.text, Lang::Zh, "逐件行");
+            }
+            assert!(
+                branch[0] > 0 && branch[2] + branch[3] > 0,
+                "{scale}× 的阶梯只走了一档 ⇒ 这几条名字长度没覆盖到下界：{branch:?}"
+            );
+        }
+
+        // ③ **分页之后**整屏量一遍（`More` 那一行是本地化的 ⇒ 四 locale 各有不同的宽度）：
+        //    每一行都问排版自己的账，且没有一行被截。条目取"最坏情况"= 全部可点（窄预算）。
+        let entries: Vec<AlbumEntry> = (0..14)
+            .map(|i| AlbumEntry {
+                wear: Some(i),
+                name: "蓝帽".repeat(1 + i % 4),
+                rarity: Rarity::ALL[i % 4],
+                slot: Slot::ALL.get(i % 5).copied(),
+                kind_pet: i % 7 == 3,
+                dup: i as u64,
+            })
+            .collect();
+        for scale in [1.0f32, 1.5, 2.0] {
+            let content = album_rows(&entries, scale);
+            for lang in Lang::ALL {
+                let pages = panel::album_page(lang, &content, 0).pages;
+                for p in 0..pages {
+                    let screen = panel::album_page(lang, &content, p);
+                    assert!(
+                        screen.rows.len() <= panel::MAX_ROWS,
+                        "{lang:?} {scale}× 第 {p} 页有 {} 行",
+                        screen.rows.len()
+                    );
+                    for (r, row) in panel::layout(&screen.rows).iter().zip(&screen.rows) {
+                        let label = if r.item.actionable() {
+                            menu::label_rect(r.as_rect())
+                        } else {
+                            menu::row_text(r.as_rect())
+                        };
+                        assert_sayable(&row.text, lang, "逐件行/页码行");
+                        assert_eq!(
+                            menu::fit_to(&row.text, menu::budget_for(label.w, scale), scale),
+                            row.text,
+                            "{lang:?} {scale}× 第 {p} 页 {:?}「{}」被排版截 ⇒ 生产者算错了预算",
+                            r.item,
+                            row.text
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

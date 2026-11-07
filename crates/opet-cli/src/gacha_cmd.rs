@@ -35,7 +35,9 @@ M3 可用（headless，不碰显示服务器）：
       从引擎生成概率公示（含逐件概率）。不写 --out 就打 stdout。
       公示是推导产物，不许手改：改了参数没重跑，gacha-sim 与单测两头都会红
   opet catalog validate [--catalog FILE] [--strict-assets] [--inv] [--assets-root DIR]
-      结构校验目录；--strict-assets 要求每个 manifest_path 指向的文件真的存在（旧口径：查那串路径）
+      结构校验目录。两个开关**量的不是同一件事**，别混用：
+      --strict-assets = 开发树口径：逐条查 catalog 里那串 `manifest_path` 字符串指向的文件
+      （它指向仓库/临时目录，**不对玩家负责**；配件名还是旧的 `item.json` 那一族）
       --inv = INV 门禁（FLOW §3）：池内每一件都要在**加载器真的会读的源**上解析得出
       （清单可解析 + 清单声明的 sheet 在）。缺的逐件点名 id 与要装的包名。
       ⚠ **一台从没装过包的机器上这条必然大面积红 —— 那是它在正常工作，别去'修绿'它**；
@@ -512,6 +514,12 @@ fn catalog_validate(args: &[String]) -> Cmd {
         );
     }
     if f.strict_assets {
+        // §9.2 第 22 条（用户 2026-11-07 拍板 = B）：**口径边界写在清单前面**，因为这一串
+        // `MISSING` 长得和 `--inv` 的红一模一样，而它回答的是另一个问题。
+        println!(
+            "  ⚠ 以下逐条查的是 catalog 里那串 `manifest_path` **字符串**（开发树口径：\
+             它指向仓库/临时目录，不对玩家负责）⇒ \"这件能不能加载\"请看 `--inv`"
+        );
         let mut missing = 0usize;
         for item in &catalog.items {
             match &item.manifest_path {
@@ -527,7 +535,10 @@ fn catalog_validate(args: &[String]) -> Cmd {
             }
         }
         if missing > 0 {
-            return Err(fail(&format!("{missing} 件物品缺可用资产")));
+            return Err(fail(&format!(
+                "{missing} 件物品缺可用资产（这条判的是开发树里的路径；装到玩家机器上之后\
+                 那一轮该问 `opet catalog validate --inv`）"
+            )));
         }
     }
     // ⚠ 这条与上面 `--strict-assets` **量的不是同一件事**：strict 查的是 catalog 里那串
