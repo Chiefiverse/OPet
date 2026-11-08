@@ -6279,7 +6279,7 @@ mod tests {
             items: vec![
                 pick("hood_night"), // R · 夜兜
                 pick("bell_gold"),  // N · 金铃
-                pick("cat_shiro"),  // N · 小白（宠物：下标在**本体那一张表**里，不在配件表里）
+                pick("spacecat"),   // N · 太空猫（宠物：下标在**本体那一张表**里，不在配件表里）
                 pick("cap_blue"),   // N · 蓝帽
                 pick("hat_straw"),  // SSR · 草帽（"抽到了而磁盘没产物"那一件）
             ],
@@ -6293,7 +6293,7 @@ mod tests {
 
     /// `candidates`（= 磁盘上真有产物、且匹配本体的那几件）的下标表，顺序与目录遍历序无关。
     fn album_ids() -> Vec<String> {
-        ["cap_blue", "hood_night", "cat_shiro", "bell_gold"]
+        ["cap_blue", "hood_night", "spacecat", "bell_gold"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -6307,19 +6307,19 @@ mod tests {
     /// [`AlbumEntry`] 刻意不带 id（"catalog 不认的 id 也要能进这张表"那一条）。
     ///
     /// ⚠️ **P5 让这一条变成两问而不是一问**：本体走 `Body` 那套下标（`bodies`），配件走
-    /// `Wear` 那套（`candidates`），而 fixture 里 `cat_shiro` **同时**在两张表里 ⇒ 同一个数字
+    /// `Wear` 那套（`candidates`），而 fixture 里 `spacecat` **同时**在两张表里 ⇒ 同一个数字
     /// `1` 在这两块面上指的是两件不同的东西。所以这里两条反查分开写，一条不许替另一条说话
     /// （"两套下标互不冒充"那条独立门禁 = [`the_album_routes_pets_to_the_body_index_space`]）。
     #[test]
     fn the_row_payload_is_the_same_index_the_dress_page_cycles() {
         let g = album_fixture();
         let ids = album_ids();
-        let owned = owned_of(&["bell_gold", "cat_shiro", "cap_blue", "hood_night"]);
+        let owned = owned_of(&["bell_gold", "spacecat", "cap_blue", "hood_night"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
-        // 本体表刻意与配件表**错位**：`cat_shiro` 在配件表是下标 2，在本体表是下标 1，
-        // 而 `penguin_bolt` 没抽到 ⇒ 它被同一道闸门挡在外面（于是 `pet_visible` 只有 `[1]`，
+        // 本体表刻意与配件表**错位**：`spacecat` 在配件表是下标 2，在本体表是下标 1，
+        // 而 `dinosaur` 没抽到 ⇒ 它被同一道闸门挡在外面（于是 `pet_visible` 只有 `[1]`，
         // 拿它当 `[0..len]` 的那点侥幸也一并被测掉）。
-        let pet_ids: Vec<String> = ["penguin_bolt", "cat_shiro"]
+        let pet_ids: Vec<String> = ["dinosaur", "spacecat"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -6329,11 +6329,11 @@ mod tests {
             .expect("逐件条目该读得出来");
 
         // 条目序 = 档序（N 三件按档内序 → R），而 `hat_straw` 不在 `owned` 里 ⇒ 根本不出现。
-        // 那只猫这一轮**给下标了**，但那是 `Body` 那套下标里的 1（= `pet_ids` 里的 `cat_shiro`）。
+        // 那只猫这一轮**给下标了**，但那是 `Body` 那套下标里的 1（= `pet_ids` 里的 `spacecat`）。
         use AlbumTarget::{Accessory, Body, None as Inert};
         let want = [
             ("金铃", Accessory(3)),
-            ("小白", Body(1)),
+            ("太空猫", Body(1)),
             ("蓝帽", Accessory(0)),
             ("夜兜", Accessory(1)),
         ];
@@ -6553,11 +6553,11 @@ mod tests {
     fn the_album_routes_pets_to_the_body_index_space() {
         let g = album_fixture();
         let ids = album_ids();
-        let owned = owned_of(&["bell_gold", "cat_shiro", "cap_blue", "hood_night"]);
+        let owned = owned_of(&["bell_gold", "spacecat", "cap_blue", "hood_night"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
-        // `penguin_bolt` 没抽到 ⇒ 被同一道闸挡在 `pet_visible` 外面，于是 `cat_shiro` 在本体
+        // `dinosaur` 没抽到 ⇒ 被同一道闸挡在 `pet_visible` 外面，于是 `spacecat` 在本体
         // 那一张表里落在**下标 1** —— 而 1 在配件那张表里是 `hood_night`（夜兜）。
-        let pet_ids: Vec<String> = ["penguin_bolt", "cat_shiro"]
+        let pet_ids: Vec<String> = ["dinosaur", "spacecat"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -6582,20 +6582,20 @@ mod tests {
         let body = rows
             .iter()
             .find(|r| r.item == panel::PanelItem::Body(1))
-            .expect("小白该是 Body(1)");
+            .expect("太空猫该是 Body(1)");
         assert!(
             wear.text.contains("夜兜"),
             "Wear(1) 那行没写夜兜：{:?}",
             wear.text
         );
         assert!(
-            body.text.contains("小白"),
-            "Body(1) 那行没写小白：{:?}",
+            body.text.contains("太空猫"),
+            "Body(1) 那行没写太空猫：{:?}",
             body.text
         );
         // 这两条 `NOT` 才是这条门禁的名字：**拿错表**的两种写法各打一条。
         assert!(
-            !wear.text.contains("小白"),
+            !wear.text.contains("太空猫"),
             "Wear(1) 那行读到了本体那张表的东西 ⇒ 两套下标混用了（配件那臂去查了 pet_ids）"
         );
         assert!(
@@ -6617,7 +6617,7 @@ mod tests {
         // `an_unowned_or_undiskable_entry_stays_inert` 正面钉住，这里只留一句名。
         assert!(
             rows.iter().all(|r| r.item != panel::PanelItem::Body(0)),
-            "`penguin_bolt` 没抽到却有一行指着本体第 0 格 ⇒ 库存那道在本体侧空转"
+            "`dinosaur` 没抽到却有一行指着本体第 0 格 ⇒ 库存那道在本体侧空转"
         );
     }
 
@@ -6634,11 +6634,11 @@ mod tests {
     ///   就在身上），给它打一行点名就是把"什么都没变"说成"我替你换了一只"，与 ① 同族。
     #[test]
     fn plan_body_override_wins_only_when_the_row_names_a_discovered_pet() {
-        let pet_ids: Vec<String> = ["cat_shiro", "cat_ui", "penguin_bolt"]
+        let pet_ids: Vec<String> = ["spacecat", "tiger", "dinosaur"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let start = "cat_shiro";
+        let start = "spacecat";
 
         // ① 没有那一行 ⇒ 不覆盖，而且**没有理由**（那是常态，不是事故）。
         match plan_body_override(None, &pet_ids, start) {
@@ -6649,11 +6649,11 @@ mod tests {
         // ② 那一行指的就是表里的第 1 格 ⇒ 覆盖，而且**赢**（`--manifest` 那一只让位）。
         //    下标必须能反查回同一个 id ⇒ 与 `the_album_routes_pets_to_the_body_index_space`
         //    同一条"载荷下标 = 那张表自己的位置"的纪律。
-        match plan_body_override(Some("cat_ui"), &pet_ids, start) {
+        match plan_body_override(Some("tiger"), &pet_ids, start) {
             BodyChoice::Override(i) => {
                 assert_eq!(
-                    pet_ids[i], "cat_ui",
-                    "Override({i}) 说的不是 cat_ui 在发现表里的位置 ⇒ 起点本体换成另一只"
+                    pet_ids[i], "tiger",
+                    "Override({i}) 说的不是 tiger 在发现表里的位置 ⇒ 起点本体换成另一只"
                 );
             }
             other => panic!("库里那一行点的是发现表里有的本体却给出 {other:?} ⇒ 拍板③ 没生效"),
@@ -6664,7 +6664,7 @@ mod tests {
         //    就是把"什么都没变"说成"我替你换了一只"（`--manifest` 那一只本来就是它）。
         //    ⚠️ 这一格的存在意味着 `id == start_id` 的判据**必须**在 `position()` 之前问：
         //    它指的是表里有的东西，走 ④ 那一支会得到一句假话。
-        match plan_body_override(Some("cat_shiro"), &pet_ids, start) {
+        match plan_body_override(Some("spacecat"), &pet_ids, start) {
             BodyChoice::Keep(None) => {}
             other => panic!("库里那一行就是起点那只却给出 {other:?} ⇒ 启动凭空多一行点名"),
         }
@@ -6673,7 +6673,7 @@ mod tests {
         //    且必须点出为什么。这三族合并成一句是选过的：它们在启动这一刻**没有可区分的动作**
         //    （都不覆盖、都照旧用 `--manifest`），而真正区分它们的那一行在 [`check_body`] /
         //    [`discover_pets`] 的 skip-and-log 里，那里才是点名的地方。
-        for ghost in ["dragon_pip", ""] {
+        for ghost in ["monkey", ""] {
             match plan_body_override(Some(ghost), &pet_ids, start) {
                 BodyChoice::Keep(Some(why)) => assert!(
                     why.contains("不在启动扫盘"),
@@ -6685,14 +6685,14 @@ mod tests {
         // ⑤ 表为空（没有本体库 / `--test-rect`）⇒ 任何一行都不许覆盖 —— 这一格单独钉，因为
         //    `position()` 在空表上恒 `None`，写成 `bodies.first()` 之类的"顺手"就恒真了。
         assert!(matches!(
-            plan_body_override(Some("cat_ui"), &[], start),
+            plan_body_override(Some("tiger"), &[], start),
             BodyChoice::Keep(Some(_))
         ));
         // ⑤ 的另一面：表为空而那一行**恰好就是起点那只**（`--manifest` 与库里记的是同一只，
         //    而产物没烘出来 ⇒ 起点照旧是它）⇒ 无理由。少了这一格，`id == start_id` 那一支放
         //    在 `position()` 之后就会在"没有本体库"的机器上打一行假点名。
         assert!(matches!(
-            plan_body_override(Some("cat_shiro"), &[], start),
+            plan_body_override(Some("spacecat"), &[], start),
             BodyChoice::Keep(None)
         ));
     }
@@ -6710,7 +6710,7 @@ mod tests {
     #[test]
     fn a_body_row_is_not_an_accessory_note() {
         let rows = vec![
-            ("body".to_string(), "cat_ui".to_string()),
+            ("body".to_string(), "tiger".to_string()),
             ("head".to_string(), "cap_blue".to_string()),
         ];
         let ids: Vec<String> = ["cap_blue"].iter().map(|s| s.to_string()).collect();
@@ -6719,7 +6719,7 @@ mod tests {
 
         // 剥壳本身：`(本体 id, 只剩配件的行)`，两条都不许丢。
         let (body, accessories) = split_body_row(&rows);
-        assert_eq!(body.as_deref(), Some("cat_ui"), "body 那一行没被认出来");
+        assert_eq!(body.as_deref(), Some("tiger"), "body 那一行没被认出来");
         assert_eq!(
             accessories,
             vec![("head".to_string(), "cap_blue".to_string())],
@@ -6746,15 +6746,15 @@ mod tests {
         assert!(
             bad.notes
                 .iter()
-                .any(|n| n.contains("磁盘上找不到这一件") && n.contains("cat_ui")),
+                .any(|n| n.contains("磁盘上找不到这一件") && n.contains("tiger")),
             "不剥却没有那句假话：{:?}",
             bad.notes
         );
 
         // 只有 body 行（上次只换了本体、没戴帽子）⇒ 配件侧**一行说明都不许有**。
-        let only_body = vec![("body".to_string(), "cat_ui".to_string())];
+        let only_body = vec![("body".to_string(), "tiger".to_string())];
         let (b, acc) = split_body_row(&only_body);
-        assert_eq!(b.as_deref(), Some("cat_ui"));
+        assert_eq!(b.as_deref(), Some("tiger"));
         let plan = plan_restore(&acc, &ids, &slots, &visible);
         assert_eq!(plan.wear, None, "只剩本体行却还要穿一件");
         assert!(
@@ -6778,7 +6778,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let owned = owned_of(&["cap_blue", "hood_night", "hat_straw", "cat_shiro"]);
+        let owned = owned_of(&["cap_blue", "hood_night", "hat_straw", "spacecat"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
         // ⚠️ 本体表**交空** = 这一轮磁盘上没有一只本体（裸开发树的真实读数：`$OPET_PETS` 没指、
         // `$XDG_DATA_HOME/opet/pets` 不存在 ⇒ [`discover_pets`] 返空）。所以那只猫在这里是
@@ -6820,7 +6820,7 @@ mod tests {
             "无产物的那一件把档名/挂点/名字丢了 ⇒ 这行读不出自己是什么"
         );
         // ⚠️ 宠物（本体表为空）⇒ 只读 + 行尾 ASCII `pet` 标（FLOW §6③ 那句"明写而不是灰掉不显示"）。
-        let pet = row_of("小白");
+        let pet = row_of("太空猫");
         assert_eq!(pet.item, panel::PanelItem::Info);
         assert!(
             pet.text.ends_with(ItemKind::Pet.as_str()),
@@ -6829,7 +6829,7 @@ mod tests {
         );
         assert_eq!(
             pet.text,
-            format!("N {} {}", "小白", ItemKind::Pet.as_str()),
+            format!("N {} {}", "太空猫", ItemKind::Pet.as_str()),
             "挂点为 `None` 的那一格该整个消失，而不是留一个空格"
         );
 

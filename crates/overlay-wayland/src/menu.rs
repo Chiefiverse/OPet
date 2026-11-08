@@ -2473,14 +2473,14 @@ mod tests {
     #[test]
     fn report_lines_are_one_per_line_in_the_puller_language() {
         let items = vec![
-            ("小白".to_string(), Rarity::N, false),
+            ("太空猫".to_string(), Rarity::N, false),
             ("铃帽".to_string(), Rarity::SR, true),
         ];
         let lines = report_lines(&[1, 0, 1, 0], &items, 8, Lang::Zh, 1.0);
         assert_eq!(lines[0], "2 抽 最高 SR");
         assert_eq!(lines[1], "SR1 N1", "档位计数行从高到低、只列非零档");
         assert_eq!(lines[2], "SR 铃帽 重复", "明细先列最高档");
-        assert_eq!(lines[3], "N 小白 新");
+        assert_eq!(lines[3], "N 太空猫 新");
         assert_eq!(lines[4], "碎片 +8");
         assert!(!lines.iter().any(|l| l.contains("演示")), "演示标不在这");
         for l in &lines {
@@ -2500,7 +2500,7 @@ mod tests {
     /// 这条不是"懒得重翻译"的托词，是有测试的语义：当前显示的卡永远与生成它时的语言一致。
     #[test]
     fn baked_lines_keep_the_language_they_were_pulled_in() {
-        let items = vec![("小白".to_string(), Rarity::N, false)];
+        let items = vec![("太空猫".to_string(), Rarity::N, false)];
         let zh = report_lines(&[1, 0, 0, 0], &items, 4, Lang::Zh, 1.0);
         let anim = MenuAnim::Reveal {
             elapsed: 0,

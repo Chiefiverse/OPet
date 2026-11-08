@@ -425,7 +425,7 @@ mod tests {
 
         // 改中间一条的任意字段 ⇒ 下一条的 prev 失配。
         let mut tampered = chain.to_vec();
-        tampered[1].item_id = "dragon_pip".into();
+        tampered[1].item_id = "dinosaur".into();
         assert!(matches!(
             verify_chain(&tampered),
             Err(AuditError::BrokenLink { at: 3, .. })
@@ -529,7 +529,7 @@ mod tests {
         // 不证明"骰子没被改过"。只靠哈希链的审计是可以被这样伪造掉的。
         let (p, c, mut recs) = real_chain(11, 30);
         recs[4].rarity = Rarity::SSR;
-        recs[4].item_id = "dragon_pip".into();
+        recs[4].item_id = "dinosaur".into();
         relink(&mut recs);
         assert!(
             verify_chain(&recs).is_ok(),

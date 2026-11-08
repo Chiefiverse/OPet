@@ -8,7 +8,7 @@
 //! 默认 `#[ignore]`：`assets/` 是烘焙产物、不进仓库。本机跑（先 pack 一份配件）：
 //! ```sh
 //! OPET_ACCESSORY=assets/accessories/cap_test/accessory.json \
-//! OPET_BODY=assets/pets/tiger_192/pet.json \
+//! OPET_BODY=assets/pets/tiger/pet.json \
 //!   cargo test -p overlay-wayland --test accessory_product -- --ignored --nocapture
 //! ```
 //! **缺产物 = 失败，不是 SKIP。** 这条测试带 `#[ignore]` ⇒ `cargo test --workspace` 永远不会跑到

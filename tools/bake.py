@@ -22,6 +22,8 @@ import argparse
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 
 import bpy
@@ -79,6 +81,13 @@ def parse_args():
     p.add_argument("--force", action="store_true", help="重烘已存在的帧")
     p.add_argument(
         "--skip-facing-check", action="store_true", help="跳过朝向断言（调试用）"
+    )
+    p.add_argument(
+        "--facing-confirmed",
+        metavar="判词",
+        help="人眼过 2×2 出图后对朝向环的判词（例如 'col0=侧身鼻尖右 col2=正脸 col4=侧身鼻尖左 "
+        "col6=背面'）。烘宠物本体时**必填**：朝向环的相位没有任何自动判据（两条实测都被否证，"
+        "见 check_facing_render），这一句会进 meta.json 随产物一起留档。",
     )
     p.add_argument(
         "--skip-framing-check", action="store_true", help="跳过构图/可见性断言（调试用）"
@@ -2096,6 +2105,203 @@ def check_facing(cam):
     return problems
 
 
+FACING_PROBE_PX = 192
+FACING_PROBE_SAMPLES = 16
+# 探针档从 96/4 提到 192/16：96 档会把 dinosaur 正确档的 fb 余量压到 +0.0117（192 档 +0.0268），
+# 而这两条读数现在都只是线索、不判生死 ⇒ 没有理由省这四张图的钱。
+
+
+def _probe_image_metrics(path):
+    """一张透明底渲染图里的候选朝向测量（全部纯像素，不猜鼻尖）。
+
+    包围盒中心做原点、半宽归一 ⇒ 与宠物在格子里摆在哪无关。
+      `asym`  = 剪影左右不对称度（实测**不能**当判据：镜像对称性是环旋转的不变量）
+      `wide`  = 剪影宽 / 高
+      `headc` = 头部带（剪影上沿 35%）色度方差加权质心的横向偏移，±1 = 贴左右边
+      `headv` = 头部带的色度标准差（脸有眼/鼻/嘴 ⇒ 应当比后脑勺花）
+      `edge`  = 头部带的亮度梯度能量均值（格外的邻居按 0 算 ⇒ 剪影边界也算进去）
+      `allv`  = 全图色度标准差
+    """
+    img = bpy.data.images.load(path, check_existing=False)
+    try:
+        w, h = img.size[0], img.size[1]
+        px = img.pixels[:]
+    finally:
+        bpy.data.images.remove(img)
+    alpha = [px[i * 4 + 3] for i in range(w * h)]
+    xs = [i % w for i, a in enumerate(alpha) if a > 0.5]
+    ys = [i // w for i, a in enumerate(alpha) if a > 0.5]
+    if not xs:
+        return None
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    span = x1 - x0
+    half = max(span / 2.0, 1.0)
+    head_from = y1 - int(round(0.35 * (y1 - y0)))
+    covered = 0
+    asym = 0.0
+    head_wsum = 0.0
+    head_xsum = 0.0
+    head_n = 0
+    hs = [0.0, 0.0, 0.0]
+    hq = [0.0, 0.0, 0.0]
+    hlum = {}
+    a_s = [0.0, 0.0, 0.0]
+    a_q = [0.0, 0.0, 0.0]
+    for y in range(y0, y1 + 1):
+        base = y * w
+        in_head = y >= head_from
+        for x in range(x0, x1 + 1):
+            i = base + x
+            a = alpha[i]
+            if a <= 0.5:
+                continue
+            covered += 1
+            asym += abs(a - alpha[base + x0 + span - x])
+            k = i * 4
+            rgb = (px[k], px[k + 1], px[k + 2])
+            for c in range(3):
+                a_s[c] += rgb[c]
+                a_q[c] += rgb[c] * rgb[c]
+            if in_head:
+                head_n += 1
+                v = 0.0
+                for c in range(3):
+                    hs[c] += rgb[c]
+                    hq[c] += rgb[c] * rgb[c]
+                v = sum(rgb) / 3.0
+                head_wsum += v * (x - x0 - half)
+                head_xsum += v
+                hlum[(x, y)] = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+    if covered == 0 or head_n == 0 or head_xsum <= 0.0:
+        return None
+    var = 0.0
+    hvar = 0.0
+    for c in range(3):
+        m = a_s[c] / covered
+        var += max(a_q[c] / covered - m * m, 0.0)
+        hm = hs[c] / head_n
+        hvar += max(hq[c] / head_n - hm * hm, 0.0)
+    edge = 0.0
+    for (x, y), l in hlum.items():
+        d = 0.0
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            d += abs(l - hlum.get((nx, ny), 0.0))
+        edge += d
+    edge /= len(hlum)
+    return {
+        "asym": asym / covered,
+        "wide": (span + 1) / float(y1 - y0 + 1),
+        "headc": head_wsum / head_xsum / half,
+        "headv": hvar**0.5,
+        "edge": edge,
+        "allv": var**0.5,
+    }
+
+
+def check_facing_render(cam, scene, pose, states, spec, cell, out_dir):
+    """朝向环的**像素测量**：渲四张正交小图，打印线索，出那张必须眼过的 2×2。
+
+    上面那条几何自检沿 +X 取极值、再断言这些极值在 col 0 落在屏幕右 —— 那是拿结论当前提，
+    对"脸其实朝 ±Y"的模型永远读不出来（实测放走了 2026-11-08 那八支，整圈差 90°，而两道
+    自检 + 14 项 validate + 十份指纹 + 546 条测试全绿）。
+
+    本函数**不再是判据**，这是同日第二批实测出来的结论，四条候选全被否证：
+      · 剪影左右不对称度 —— 镜像对称性是环旋转的不变量 ⇒ 原理上就钉不死。
+      · 头部带色度方差 —— 护甲/背包/鬃毛比脸更花，五个模型里三到五个反号。
+      · swing = headc 之差（亮度加权质心）—— 深色脸 / 亮后脑壳的模型符号整个反：spacecat
+        −0.2386、robot@+90 −0.1155 都是**正确产物**，而它给 robot@−90（整圈差 180°）判了
+        +0.0578 = 放行。
+      · fb = 头部带梯度能量 col2/col6 之差 —— 四档相位判决矩阵 8 档判错 3 档：tiger
+        −0.0083 与 horse −0.0005 把已签收的正确产物判红，dino@rot180（差 270°）+0.0086
+        判绿。⇒ 它也不配当判据。
+    ⇒ 朝向环的相位在本管线里**没有自动判据**，闸门改成人判词：`--facing-confirmed`（见
+    main() 里那道"渲染之前先要判词"），它进 meta.json 随产物留档。这里只负责把四张图渲出来、
+    把两条线索和那张 2×2 打到 out_dir。
+    """
+    probe = min(cell, FACING_PROBE_PX)
+    keep = (scene.render.resolution_x, scene.render.resolution_y, scene.render.filepath)
+    eevee = getattr(scene, "eevee", None)
+    keep_samples = getattr(eevee, "taa_render_samples", None) if eevee is not None else None
+    if eevee is not None and hasattr(eevee, "taa_render_samples"):
+        eevee.taa_render_samples = FACING_PROBE_SAMPLES
+    scene.render.resolution_x = probe
+    scene.render.resolution_y = probe
+    tmp = os.path.join("/tmp", "opet_facing_probe_%d" % os.getpid())
+    os.makedirs(tmp, exist_ok=True)
+    state = "idle" if "idle" in states else states[0]
+    track = spec["states"][state]
+    frames = len(track["rows"])
+    pose(state, 0, frames, track.get("loop", True))
+    bpy.context.view_layer.update()
+    got = {}
+    pngs = {}
+    for index in (0, 2, 4, 6):
+        place_camera(cam, index)
+        path = os.path.join(tmp, "probe_%d.png" % index)
+        scene.render.filepath = path
+        bpy.ops.render.render(write_still=True)
+        pngs[index] = path
+        got[index] = _probe_image_metrics(path)
+    scene.render.resolution_x, scene.render.resolution_y, scene.render.filepath = keep
+    if eevee is not None and keep_samples is not None:
+        eevee.taa_render_samples = keep_samples
+
+    problems = []
+    if any(v is None for v in got.values()):
+        missing = [str(i) for i, v in got.items() if v is None]
+        problems.append("朝向像素自检：col %s 的探针图全透明 ⇒ 判不了" % ",".join(missing))
+        shutil.rmtree(tmp, ignore_errors=True)
+        return problems, got
+    for key in ("headc", "asym", "wide", "edge"):
+        print(
+            "BAKE   探针 %-5s = " % key
+            + " ".join("col%d:%+.4f" % (i, got[i][key]) for i in (0, 2, 4, 6))
+        )
+    # 两条自动读数都只打印、都不判生死。它们各自被实测否证过：
+    #   swing（headc 之差，按亮度加权）—— spacecat −0.2386、robot@+90 −0.1155 ⇒ 深色脸 /
+    #     亮后脑壳的模型符号整个反号，它既假绿（robot@−90 +0.0578 放行过一次整圈差 180° 的产物）
+    #     又假红（正确的 spacecat）。
+    #   fb（头部带梯度能量 col2/col6 之差）—— 四档相位判决矩阵 8 档里判错 3 档：
+    #     tiger −0.0083 与 horse −0.0005 是**已签收的正确产物**被判红，
+    #     dino@rot180（= 差 270°）+0.0086 被判绿。
+    # ⇒ 本管线里没有任何自动判据能定朝向环，2026-11-08 之前那句"fb 四档全对"是错的。
+    # 真正的闸门 = 下面那张 2×2 出图 + `--facing-confirmed` 那句人判词（它进 meta）。
+    fb = (got[2]["edge"] - got[6]["edge"]) / max(got[2]["edge"] + got[6]["edge"], 1e-9)
+    swing = got[0]["headc"] - got[4]["headc"]
+    print(
+        "BAKE 朝向线索：fb(梯度能量 col2/col6) = %+.4f · swing(headc col0/col4) = %+.4f"
+        " ⇒ 两条都只是线索，放行靠 --facing-confirmed" % (fb, swing)
+    )
+    got["fb"] = fb
+    got["swing"] = swing
+
+    # 这张是给人看的，不是装饰：四档相位没有任何一条自动判据抓得住（上面四条候选都被实测
+    # 否证），而这四张探针图本来就已经渲了 ⇒ 拼一张 2×2 留在产物旁边，眼过它 + 一句
+    # --facing-confirmed 判词 = 当前唯一的闸门。
+    sheet = os.path.join(out_dir, "facing_probe_2x2.png")
+    rc = -1
+    if shutil.which("magick"):
+        os.makedirs(out_dir, exist_ok=True)
+        rc = subprocess.call(
+            ["magick", "montage"]
+            + [pngs[i] for i in (0, 2, 4, 6)]
+            + ["-tile", "2x2", "-geometry", "+2+2", "-background", "#14161a", sheet]
+        )
+    shutil.rmtree(tmp, ignore_errors=True)
+    if rc == 0:
+        print(
+            "BAKE 朝向 2×2 出图（col 0/2/4/6）= %s ⇒ 必须眼过：col 2 那张要正好是**脸正对镜头**"
+            % sheet
+        )
+    else:
+        print(
+            "BAKE 朝向 2×2 出图生成失败（rc=%s，magick 不在 PATH？）⇒ 眼过不了 ⇒ 判词也无从给出" % rc
+        )
+    got["sheet"] = sheet if rc == 0 else None
+    return problems, got
+
+
 def part_samples(parts):
     """占位小白的采样：每个图元物体的 bound_box 角点。"""
 
@@ -2204,6 +2410,7 @@ def main():
     roles = {}
     height = 0.0
     cam_note = None
+    nose_src = rear_src = "内置默认点（占位小白）"
     if args.model:
         meshes = load_model(args.model)
         armature = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
@@ -2391,10 +2598,54 @@ def main():
             )
         check_outfit_framing(cam, cell, columns, spec, states, pose, outfit_ctx)
     if not args.skip_facing_check:
-        problems = check_facing(cam)
+        geo = check_facing(cam)
+        auto_points = not nose_src.startswith("显式") or not rear_src.startswith("显式")
+        if geo and not auto_points:
+            sys.exit("朝向几何自检失败：\n  " + "\n  ".join(geo))
+        if geo:
+            # 点是自动取的 ⇒ 这条测量本身是循环的（沿 +X 取极值再断言 +X 方向的屏幕偏移），
+            # 实测它既假绿八支、又假红 dinosaur 的正确档 ⇒ 降级成线索，判红交给下面的像素自检。
+            print("BAKE 朝向几何自检（自动取点 ⇒ 仅线索，不判红）：" + " / ".join(geo))
+        else:
+            print(
+                "BAKE 朝向几何自检通过（点来源 %s/%s ⇒ %s）"
+                % (
+                    nose_src,
+                    rear_src,
+                    "显式给点 ⇒ 对前进轴有效"
+                    if not auto_points
+                    else "自动取点 ⇒ 对前进轴无效，以像素自检为准",
+                )
+            )
+        problems, probe = check_facing_render(cam, scene, pose, states, spec, cell, args.out)
+        if problems and args.outfit_only:
+            # 配件图集那一档渲出来的**只有帽**，没有脸可当 landmark ⇒ 这条测量对它没有定义。
+            # 不是"豁免就算过"：那一档的前进轴仍由显式 --nose/--rear 那条几何自检负责钉。
+            print("BAKE 朝向像素自检跳过（--outfit-only 的探针图里没有脸，headc 无定义）：" + " / ".join(problems))
+            problems = []
         if problems:
-            sys.exit("朝向自检失败：\n  " + "\n  ".join(problems))
-        print("BAKE 朝向自检通过（8 列的鼻尖屏幕侧与 Facing::index 一致）")
+            sys.exit("朝向像素自检失败：\n  " + "\n  ".join(problems))
+        if (
+            not args.check_only
+            and not args.outfit_only
+            and not args.facing_confirmed
+        ):
+            # 这一步故意放在渲染 320 格**之前**：它不要钱，而它拦下的是"整批产物朝向错"这种
+            # 六道门禁全看不见、只有眼睛能看见的事故（2026-11-08 那八支就是这么上池的）。
+            sys.exit(
+                "朝向环的相位**没有任何自动判据**（swing 在 spacecat/robot 上反号、fb 在四档相位"
+                "矩阵上 8 档判错 3 档 ⇒ 两条现在都只是线索）。\n"
+                "  眼过这张 2×2（col 0/2/4/6 应当 = 侧身鼻尖右 / 正脸 / 侧身鼻尖左 / 背面）：\n"
+                "    %s\n"
+                "  再带 --facing-confirmed '你的判词' 重跑；本轮线索：fb=%+.4f swing=%+.4f"
+                % (
+                    probe.get("sheet") or "<2×2 未生成（magick 不在 PATH？）>",
+                    probe.get("fb", float("nan")),
+                    probe.get("swing", float("nan")),
+                )
+            )
+        if args.facing_confirmed and not args.outfit_only:
+            print("BAKE 朝向人判词（进 meta）：%s" % args.facing_confirmed)
 
     if not args.skip_framing_check:
         problems, tiny, tight = check_framing(cam, cell, spec, states, columns, pose, samples)
@@ -2462,6 +2713,8 @@ def main():
         "blender_version": bpy.app.version_string,
         "model": args.model or "procedural:cat_shiro",
         "face_rot_z": args.face_rot_z,
+        # 朝向环的相位没有自动判据 ⇒ 这批像素的朝向由这句人判词负责，它必须随产物留档
+        "facing_verdict": args.facing_confirmed,
         "action_map": parse_map(args.action_map, "--action-map") if args.action_map else {},
         "bones": (parse_map(args.bones, "--bones") if args.bones else {}),
         "bone_gain": args.bone_gain,

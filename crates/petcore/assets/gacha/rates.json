@@ -46,7 +46,7 @@
   },
   "items": [
     {
-      "id": "cat_shiro",
+      "id": "rabbit",
       "kind": "pet",
       "rarity": "N",
       "weight": 1000,
@@ -54,7 +54,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "cat_mochi",
+      "id": "bear",
       "kind": "pet",
       "rarity": "N",
       "weight": 1000,
@@ -62,7 +62,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "slime_mint",
+      "id": "spacecat",
       "kind": "pet",
       "rarity": "N",
       "weight": 1000,
@@ -134,7 +134,7 @@
       "percent": "5.1835"
     },
     {
-      "id": "cat_ui",
+      "id": "tiger",
       "kind": "pet",
       "rarity": "R",
       "weight": 600,
@@ -142,7 +142,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "capy_barley",
+      "id": "bull",
       "kind": "pet",
       "rarity": "R",
       "weight": 600,
@@ -150,7 +150,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "owl_nori",
+      "id": "horse",
       "kind": "pet",
       "rarity": "R",
       "weight": 600,
@@ -158,7 +158,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "slime_slate",
+      "id": "monkey",
       "kind": "pet",
       "rarity": "R",
       "weight": 600,
@@ -214,7 +214,7 @@
       "percent": "2.7246"
     },
     {
-      "id": "penguin_bolt",
+      "id": "panda",
       "kind": "pet",
       "rarity": "SR",
       "weight": 200,
@@ -222,7 +222,7 @@
       "percent": "2.0555"
     },
     {
-      "id": "fox_ember",
+      "id": "robot",
       "kind": "pet",
       "rarity": "SR",
       "weight": 200,
@@ -262,7 +262,7 @@
       "percent": "2.0552"
     },
     {
-      "id": "dragon_pip",
+      "id": "dinosaur",
       "kind": "pet",
       "rarity": "SSR",
       "weight": 50,

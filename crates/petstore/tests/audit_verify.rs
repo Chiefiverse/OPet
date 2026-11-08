@@ -201,7 +201,7 @@ fn a_relinked_item_id_forgery_still_fails_replay() {
     s.pull(&p, &cat, BANNER, 10).unwrap();
     let mut records = s.records(PROFILE, BANNER).unwrap();
     let real = records[2].item_id.clone();
-    records[2].item_id = "dragon_pip".into(); // 把第 3 抽改成"看起来更值钱"的那只
+    records[2].item_id = "dinosaur".into(); // 把第 3 抽改成"看起来更值钱"的那只
     relink(&s, &records);
 
     s.verify_chain_only(PROFILE, BANNER)

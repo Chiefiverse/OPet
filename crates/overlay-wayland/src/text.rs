@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             FONT_BYTES.len(),
-            54_404,
+            54_516,
             "入库产物的大小变了 ⇒ 连同 tests/font_assets.rs 的摘要一起改了吗"
         );
     }
