@@ -198,6 +198,12 @@ def parse_args():
         "按有无材质筛在这里不行：帽子的背景板也带材质",
     )
     p.add_argument(
+        "--outfit-color",
+        default="",
+        help="把配件的材质换成一块平涂漫反（0–255 的 R,G,B，例：232,214,170 = 米黄）；留空 = 原样保留源材质。"
+        "存在的理由 = 深色配件（一顶近黑的礼帽）在屏幕上看不见，而这不是缩放能解决的事",
+    )
+    p.add_argument(
         "--outfit-scale",
         type=float,
         default=0.0,
@@ -216,6 +222,16 @@ def parse_args():
         help="配件绕**自己的局部 Y 轴**倾多少度（在链里于 --outfit-rot-z 之前作用于帽子自身坐标，"
         "所以倒的是「整顶帽子」而不是「世界的一半」）：正数把最高点朝 +X 那侧拉。"
         "唯一用途是把最高点从格子顶边拉回来（jump 背面列实测被平切），默认 0 = 一字不变。",
+    )
+    p.add_argument(
+        "--outfit-lean",
+        type=float,
+        default=0.0,
+        help="配件整体绕**载体的左右轴**俯仰多少度：正数 = 顶端朝**背离载体**那一侧仰出去"
+        "（背挂件的「往外仰」就是这个数，而它与 --outfit-tilt 是两根不同的轴：tilt 转的是配件自己的"
+        "坐标系、盘面相对背是斜的；lean 转的是「已经摆好的那一整件」相对载体，盘面仍正对背）。"
+        "轴按载体骨架与鼻尖向量现量（与 --outfit-offset 同一套水平坐标系，**不是世界轴** ⇒ 本体带 "
+        "--face-rot-z 90 时不会把前后读成左右）。默认 0 = 一字不变。",
     )
     p.add_argument(
         "--outfit-anchor",
@@ -308,6 +324,16 @@ def parse_args():
         "插座、`CompositorNodeComposite` 已删、`Image.layers` 没了而 `Image.channels` 变成 int、"
         "`OPEN_EXR_MULTILAYER` 不在枚举里、引擎表只有 BLENDER_EEVEE ⇒ 连『物体纯色渲遮罩』的 Workbench 都没有）。"
         "代价 = 每格多一趟渲染；本体那批不重渲（它本来就是另一批产物）",
+    )
+    p.add_argument(
+        "--outfit-occ-samples",
+        type=int,
+        default=1,
+        help="遮罩那一趟的 TAA 采样数（默认 1 = 旧行为逐字节不变）。**1 采样对薄网格是有代价的**："
+        "配件里那些只占一两个像素宽的边缘（羽毛、披风边）在遮罩图里落成'半覆盖'像素，"
+        "`occ_front` 读到的既不是纯品红也不是纯载体，判据按非品红处理 ⇒ 成品里那些边缘像素被抹掉，"
+        "看上去就是配件自己在丢像素。把它提到 4 左右让遮罩图的边缘收敛，代价只有那一趟变慢"
+        "（成品那一趟仍用 `--samples`），不影响两趟的相机/姿态/尺寸一致性",
     )
     return p.parse_args(argv)
 
@@ -442,7 +468,10 @@ def load_outfit(path, names):
     if ext not in (".blend", ".glb", ".gltf"):
         sys.exit("--outfit 只认 .blend/.glb/.gltf：%s" % path)
     abspath = os.path.abspath(path)
-    wanted = set(names)
+    # ⚠️ 白名单按**基名**比，与 :506 那处保持同一口径：在 Blender 界面里看到的往往是带重名后缀的
+    # `mesh_uv.obj.001`（同场景已有同名网格时它就是这么显示/导出的），照抄进 --outfit-objects
+    # 原本会一个都不匹配 ⇒ 全部丢弃 ⇒ 报"没装齐"。重数由下面 need/got 那一对把守，不会因此漏判。
+    wanted = {_base_name(n) for n in names}
     before = {ob.as_pointer() for ob in bpy.data.objects}
     if ext == ".blend":
         directory = os.path.join(abspath, "Object") + "/"
@@ -498,6 +527,10 @@ def load_outfit(path, names):
     keep, drop = [], []
     for ob in fresh:
         (keep if ob.type == "MESH" and _base_name(ob.name) in wanted else drop).append(ob)
+    # 报错要用的名字必须在**删之前**取：下面 drop 循环一 remove，`fresh` 里那些 StructRNA 立即失效，
+    # 那句"这次实际装进来的是…"就会炸成 ReferenceError 而把真正的点名信息吃掉（:486 那条注释
+    # 讲的是同一族事故，这一支当时没顾上）。
+    arrived = sorted(ob.name for ob in fresh)
     for ob in drop:
         print("BAKE 配件丢掉 %s（type=%s，不在 --outfit-objects 白名单里）" % (ob.name, ob.type))
         bpy.data.objects.remove(ob, do_unlink=True)
@@ -521,7 +554,7 @@ def load_outfit(path, names):
                 path,
                 ",".join(lack),
                 "/".join("%d/%d" % (need[b], got.get(b, 0)) for b in lack),
-                " ".join(sorted(ob.name for ob in fresh)) or "（什么都没装进来）",
+                " ".join(arrived) or "（什么都没装进来）",
                 path,
             )
         )
@@ -1328,28 +1361,41 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
     tall_world = (z1 - z0) * scale * args.outfit_scale_z * math.cos(math.radians(CAM_ELEV_DEG))
     seat = Vector((region["center"].x, region["center"].y, region["pinch_z"] + args.outfit_seat * region["height"]))
     offset = Vector((0.0, 0.0, 0.0))
-    if args.outfit_offset:
+    lean_axis = None
+    if args.outfit_offset or args.outfit_lean:
         # 位移写在**载体自己的水平坐标系**里，不是世界轴：本体普遍带 --face-rot-z 90 烘，
         # 那时"前后"落在世界 Y 上、"左右"落在世界 X 上 ⇒ 拿世界轴写这个数会把前后当左右（脚区那一维
         # 首轮已经栽过一次，同一个坐标系错误不该在第二个旋钮上重犯）。
-        ox, oy, oz = parse_vec(args.outfit_offset)
         la = armature.matrix_world.to_3x3() @ Vector((1.0, 0.0, 0.0))
         la.z = 0.0
         if la.length < 1e-6:
-            sys.exit("--outfit-offset 要用载体的左右轴，而这份骨架的局部 X 投到水平面是零向量（它指着正上/正下）")
+            sys.exit("--outfit-offset / --outfit-lean 要用载体的左右轴，而这份骨架的局部 X 投到水平面是零向量（它指着正上/正下）")
         la.normalize()
         fw = Vector((NOSE[0] - REAR[0], NOSE[1] - REAR[1], 0.0))
         if fw.length < 1e-6:
-            sys.exit("--outfit-offset 要用鼻尖向量当'前后'，而这份载体的鼻尖在正上/正下")
+            sys.exit("--outfit-offset / --outfit-lean 要用鼻尖向量当'前后'，而这份载体的鼻尖在正上/正下")
         fw.normalize()
-        # 左右那一项按"这一件在哪一侧"对齐成**向外**：attach-role 落在 -la 那一侧时，同一个 +oy
-        # 必须读成"更右"而不是"更左"，否则换一根骨当 attach-role 就把这个旋钮的含义整个翻反。
-        # 镜像件不在这里管：镜面法向就是左右轴，反射自己会把 la 分量翻号 ⇒ 写一次 0,+0.12,0 是两只都朝外。
-        side = 1.0 if bone_world.dot(la) >= 0.0 else -1.0
-        offset = fw * ox + la * (oy * side) + Vector((0.0, 0.0, oz))
-        seat = seat + offset
+        if args.outfit_offset:
+            ox, oy, oz = parse_vec(args.outfit_offset)
+            # 左右那一项按"这一件在哪一侧"对齐成**向外**：attach-role 落在 -la 那一侧时，同一个 +oy
+            # 必须读成"更右"而不是"更左"，否则换一根骨当 attach-role 就把这个旋钮的含义整个翻反。
+            # 镜像件不在这里管：镜面法向就是左右轴，反射自己会把 la 分量翻号 ⇒ 写一次 0,+0.12,0 是两只都朝外。
+            side = 1.0 if bone_world.dot(la) >= 0.0 else -1.0
+            offset = fw * ox + la * (oy * side) + Vector((0.0, 0.0, oz))
+        if args.outfit_lean:
+            # 正数要读成"顶端朝外仰"，所以轴的符号由鼻尖向量现量决定而不是照抄 la：
+            # 挂在 +Z 的那一点在绕 u 转时的瞬时速度 ∝ u × ẑ，要它指向 −fw（背离身体）⇒ 挑那个点积为正的符号。
+            lean_axis = la if la.cross(Vector((0.0, 0.0, 1.0))).dot(-fw) > 0.0 else -la
+    seat = seat + offset
     xform = (
         Matrix.Translation(seat)
+        # 俯仰写在 yaw 的**左边** = 它转的是"已经被 rot_z/tilt 摆好的那一整件"，且绕的是载体的左右轴
+        # 而不是配件自己的轴 ⇒ 这正是 tilt 给不出的那个自由度（背挂的盾：tilt 管盘面斜不斜，lean 管整件仰不仰）。
+        @ (
+            Matrix.Rotation(math.radians(args.outfit_lean), 4, lean_axis)
+            if lean_axis is not None
+            else Matrix.Identity(4)
+        )
         @ Matrix.Rotation(math.radians(args.outfit_rot_z), 4, "Z")
         # 倾角绕帽子**自身**的 Y 轴（链里写在 yaw 的右边 ⇒ 对点而言"先倾后转"）：
         # 放 yaw 左边就变成绕世界前后轴倒，那时 rot_z≠0 的帽子朝一个固定的世界方向倒，
@@ -1411,6 +1457,7 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
         "scale_z": args.outfit_scale_z,
         "rot_z": args.outfit_rot_z,
         "tilt": args.outfit_tilt,
+        "lean": args.outfit_lean,
         "seat": args.outfit_seat,
         "offset": args.outfit_offset,
         "anchor_world0": seat.copy(),
@@ -1510,6 +1557,14 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
             " ".join("%s=%.3f" % (n, w) for n, w in sorted(object_widths.items())),
         )
     )
+    if args.outfit_lean:
+        # 单独一行而不是补进上面那行：那行的字节是"帽子那一支没被新开关碰到"的免费证据，
+        # 而这一维只有背挂件才用得到。打的是**轴向量**，因为"正号到底朝哪倒"是这个符号选择的结果，
+        # 换一份脸不朝 +X 的载体就得重新量，不能靠读 help 记住。
+        print(
+            "BAKE 配件整体俯仰：绕载体左右轴 %+.3f°，轴 = (%+.3f,%+.3f,0) ⇒ 正号 = 顶端朝背离载体那一侧仰"
+            % (args.outfit_lean, lean_axis.x, lean_axis.y)
+        )
     if args.outfit_offset:
         # 上面那行世界坐标读不出"这一件往哪边挪了多少"：位移写在载体坐标里，而镜像件的左右分量
         # 由镜面自己翻号 ⇒ "筒中心对没对上腿中心"这个数必须由这一行给出出处，不能靠人反推世界坐标。
@@ -1981,7 +2036,7 @@ def wipe_occ_paint(saved):
             me.materials.append(m)
 
 
-def apply_outfit_occlusion(path, mask_path, hat, meshes, totals):
+def apply_outfit_occlusion(path, mask_path, hat, meshes, totals, spp):
     """把这一格配件里**被载体挡在身后**的像素抹掉（就地改写 `path` 那张 PNG 的 alpha）。
 
     只在 `--outfit-only` 下调用：那时载体是被 `hide_render` 藏着的，这一趟临时把它放回来、渲完再藏回去。
@@ -1995,8 +2050,11 @@ def apply_outfit_occlusion(path, mask_path, hat, meshes, totals):
     eevee = getattr(scene, "eevee", None)
     keep_spp = getattr(eevee, "taa_render_samples", None) if eevee is not None else None
     if eevee is not None and hasattr(eevee, "taa_render_samples"):
-        # 遮罩要的是边界清楚，不是画面好看：1 采样既省掉一半以上的时间，也不给判据留半透明的边
-        eevee.taa_render_samples = 1
+        # 遮罩要的是边界清楚，不是画面好看：默认 1 采样既省掉一半以上的时间，也不给判据留半透明的边。
+        # ⚠️ 但"不给判据留半透明的边"这一句对**薄网格不成立**：一根一两个像素宽的羽毛，它在遮罩图里
+        # 本来就是半覆盖的，1 采样把这种像素判成"不是品红"⇒ 成品里那根羽毛被抹掉。`--outfit-occ-samples`
+        # 就是给这一族留的口子（默认 1 ⇒ 旧行为逐字节不变）。
+        eevee.taa_render_samples = max(1, spp)
     keep_path = scene.render.filepath
     scene.render.filepath = mask_path
     try:
@@ -2121,6 +2179,7 @@ OUTFIT_RESTORE_DEFAULTS = {
     "outfit_scale": 0.0,
     "outfit_rot_z": 180.0,
     "outfit_tilt": 0.0,
+    "outfit_lean": 0.0,
     "outfit_seat": OUTFIT_SEAT,
     "outfit_subsurf": -1,
     # 这三条是"靴子那一支"新加的开关，而它们直接决定像素：绑到 foot_l 还是 head、烘不烘第二件、
@@ -2907,6 +2966,37 @@ def flat_material(name, rgb):
     return mat
 
 
+def paint_outfit_flat(hat, spec):
+    """`--outfit-color` 那一档：整组配件网格换成一块平涂漫反（含镜像件，它与原件共用 mesh 数据）。
+
+    换材质而不是调亮度：深色礼帽的源材质是近黑漫反 + 贴图，逐像素提亮会把贴图细节糊成一片，
+    而"在屏幕上看不见"这件事的根因是反照率，不是曝光。返回建出来的那块材质（挡住渲染循环里
+    `paint_occ_mask` 的存/取，它按网格存原材质表 ⇒ 还原时会还原回这一块）。
+    """
+    if not spec:
+        return None
+    parts = [x.strip() for x in spec.split(",") if x.strip()]
+    if len(parts) != 3:
+        sys.exit("--outfit-color 要三段 0–255 的 R,G,B（例：232,214,170）；给了 %r" % spec)
+    try:
+        rgb = [int(x) for x in parts]
+    except ValueError:
+        sys.exit("--outfit-color 三段必须是 0–255 的整数，收到 %r" % (parts,))
+    if any(not 0 <= v <= 255 for v in rgb):
+        sys.exit("--outfit-color 三段必须在 0–255 内，收到 %r" % (rgb,))
+    mat = flat_material("outfit_flat", tuple(v / 255.0 for v in rgb))
+    done = set()
+    for ob in hat:
+        me = ob.data
+        if me.name in done:
+            continue
+        me.materials.clear()
+        me.materials.append(mat)
+        done.add(me.name)
+    print("BAKE --outfit-color = %s ⇒ 配件 %d 块网格换成平涂（源材质与贴图不再参与渲染）" % (rgb, len(done)))
+    return mat
+
+
 def add_part(name, kind, loc, scale, mat, parent, rot=(0.0, 0.0, 0.0)):
     ops = {
         "sphere": lambda: bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, segments=24, ring_count=16),
@@ -3666,6 +3756,7 @@ def main():
         # 必须在附着之前：attach / measure / render 三条路径读的是同一份几何，而细分档改的就是那份几何
         set_outfit_subsurf(hat, args.outfit_subsurf)
         outfit_ctx = attach_outfit(armature, roles, hat, meshes, args, base)
+        paint_outfit_flat(hat, args.outfit_color)
         check_attach(armature, roles, outfit_ctx, base, cam, cell, spec, pose, meshes)
         check_mirror_residual(armature, outfit_ctx, base)  # 没给 --outfit-mirror-to 时它自己早退
         # check_attach 里跑过 idle 若干帧 ⇒ 贴地锁定把 armature.location.z 留在了最后一帧的补偿量上。
@@ -3796,7 +3887,7 @@ def main():
                     else:
                         check_hat_in_pixels(path, cam, cell, outfit_ctx, meshes)
                 if args.outfit_occlusion:
-                    apply_outfit_occlusion(path, occ_mask_path, [bpy.data.objects[n] for n in outfit_ctx["objects"]], meshes, occ_totals)
+                    apply_outfit_occlusion(path, occ_mask_path, [bpy.data.objects[n] for n in outfit_ctx["objects"]], meshes, occ_totals, args.outfit_occ_samples)
 
     if args.outfit_occlusion:
         if skipped:
@@ -3873,7 +3964,7 @@ def main():
         # 这四个都直接改像素，而`--outfit-scale`之外那三个原先没人记 ⇒ 一批"@192 带帽、倾 25°"的图
         # 在 meta.json 里读起来和"不倾"的那批一模一样。outfit.json 只有测量轮才写，像素批次
         # 的出处只有这一份 ⇒ 补在这里。
-        for k in ("rot_z", "tilt", "seat"):
+        for k in ("rot_z", "tilt", "lean", "seat"):
             meta["outfit_" + k] = outfit_ctx[k]
         # 这三条决定"这批像素上配件绑在哪根骨、有几件、按什么定标"，而 `--outfit-only` 的产物
         # 只有这一份出处（outfit.json 仅测量轮写）⇒ 不记就等于以后没法解释"两只靴子从哪来"。

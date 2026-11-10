@@ -197,10 +197,13 @@ fn packed_accessory_equips_against_its_body() {
         let mut opaque = 0usize;
         for y in 0..ch {
             let start = (*row as usize * ch + y) * stride + *col as usize * cw * 4;
+            // ⚠️ 取**每像素的第 4 个字节**（alpha）。原先写成 `iter().step_by(4)` 从 `start`
+            // 起步，那踩到的是每像素的 R ⇒ 浅色配件恒过、深色配件恒不过：2026-11-10 的
+            // `formal_hat`（一顶近黑的礼帽，R 全表 ≤8）在产物本身完全健康的情况下红了 320 格，
+            // 而它 alpha>8 的像素有 666,525 个、每格最少 2,137 个。
             opaque += px[start..start + cw * 4]
-                .iter()
-                .step_by(4)
-                .filter(|&&a| u32::from(a) > declared_threshold)
+                .chunks_exact(4)
+                .filter(|p| u32::from(p[3]) > declared_threshold)
                 .count();
         }
         let rects = acc_regions
