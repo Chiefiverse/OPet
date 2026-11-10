@@ -62,6 +62,38 @@ NECK_SLOT_SEAT = 0.50  # neck 这个 slot 没有配件几何可量，取 Neck �
 # vs 肩更宽、老虎 0.79 头 vs 肩甲 2.313，两支都量得开）。
 NECK_WIDEN = 1.15
 
+# 脚上那一档（--outfit-scale-ref foot_box）的参照：靴子的**整组水平足迹** = 该倍数 × 该侧腿在
+# [鞋底, 踝] 这段里量出来的水平尺寸（脚趾→脚跟通常就是这段里最长的一维）。1.15 = "包住脚但不
+# 多出一截"的一个初值，和 OUTFIT_SIZE_RATIO 一样**只能由眼验定档**，不是算出来的。
+OUTFIT_FOOT_SIZE_RATIO = 1.15
+# 鞋底带的厚度占配件自身 z 跨度的比例：自动挂点取这一段顶点的中心 ⇒ 拿到的是"鞋底中心"，
+# 而不是整只靴子的包围盒中心（后者在靴筒中段，拿它当挂点会把整只靴子抬到踝以上）。
+OUTFIT_SOLE_BAND = 0.15
+# 手上那一档（--outfit-scale-ref bone，旗子 / 拳套）的参照物 = 以 attach-role 那根**手的骨根为球心**、
+# 半径 OUTFIT_HAND_REGION × 载体高 的那块载体网格。
+# ⚠️ 半径为什么挂在**载体高**上而不是骨长上（2026-11-09 现量，`scratch/boot_probe/hand_probe.log`）：
+# bear 的 LeftHand 骨长 0.0207 而 RightHand 0.0992 —— 同一份 rig 的两只手骨差 4.8×，按"3×骨长"取半径
+# 时左手那一档读到 **0 个点**（右手同档 1805 点）⇒ 半径随骨长漂 = 参照物在骨短的那一侧直接消失。
+# 0.06 × 载体高在两支都落在手上：bear 0.109 ⇒ 218 点 / 水平跨 0.172；robot 0.111 ⇒ 615 点 / 0.212。
+OUTFIT_HAND_REGION = 0.06
+# 与 OUTFIT_FOOT_SIZE_RATIO 同族：一个"包住这只手但不多出一截"的初值，**只能由眼验定档**，不是算出来的。
+OUTFIT_HAND_SIZE_RATIO = 1.15
+# 附着自检第②条（"骨缩放有没有漏进配件"）的容差，单位是**相对量**不是 px（2026-11-09 定）。
+# 两端都有现量：病 = 胸腔呼吸那档 ±3.75%；纯转动的噪声 = 外接半径逐帧 2×10⁻⁴%。
+# 0.5% 落在中间（比病松 7.5 倍、比噪声紧 2.5 万倍），不是"先写一个数再找理由"。
+OUTFIT_SCALE_LEAK_TOL = 0.005
+# 镜像面的两条实测门禁：两根踝骨骨长之差 / 连线与载体左右轴之差。后者放宽到 35° 是因为
+# **rig 的静止姿态本来就不是逐位对称的**（bear 实测两踝 x = +0.2816 / −0.2830 而 z 差 0.021），
+# 拿"对称"当输入要求会让所有真实外部模型都过不了；这条判的是"这两根骨是不是一对左右脚"。
+MIRROR_BONE_LEN_TOL = 0.02
+# 骨长那条门禁的**绝对地板** = 该倍数 × 载体高（2026-11-09 被 robot 逼出来的）：它两手骨长
+# 0.0382 / 0.0352 差 7.9%，可这两根骨只有 3.5 世界厘米 —— 差值 0.0030 = 载体高的 0.16%，@192
+# 不到 1 px。原比例档是为踝骨（0.261 长）定的，照它判一根 0.035 的骨会把一份画面完全对称的用例
+# 当场拒掉。地板只放宽"差的绝对量"，不放宽这条门禁的本意（"这对骨是不是左右一对"的真错形状是
+# leg/foot、arm/hand 那种 3–5× 的差，任何一档都拦得住）。
+MIRROR_BONE_LEN_FLOOR = 0.005
+MIRROR_AXIS_DEG_MAX = 35.0
+
 # Facing::index() 顺时针：E=0 SE=1 S=2 SW=3 W=4 NW=5 N=6 NE=7
 # 列 → 鼻尖应落在屏幕哪一侧（S/N 是正对与背对，左右本来就该接近 0）
 FACE_SCREEN_SIDE = {0: 1, 1: 1, 2: 0, 3: -1, 4: -1, 5: -1, 6: 0, 7: 1}
@@ -195,7 +227,8 @@ def parse_args():
         "--outfit-seat",
         type=float,
         default=OUTFIT_SEAT,
-        help="帽檐落在看得见的头的哪一段：0 = 颈收缩处、1 = 颅顶（区间由 head_region 量）；默认 %g" % OUTFIT_SEAT,
+        help="配件落座在参照物区间的哪一段：0 = 区间下缘（帽子=颈收缩处、靴子=鞋底、手=手区下缘）、"
+        "1 = 上缘（颅顶 / 踝 / 手区上缘）；默认 %g" % OUTFIT_SEAT,
     )
     p.add_argument(
         "--outfit-subsurf",
@@ -205,6 +238,50 @@ def parse_args():
         "配件的细分档是每格烘焙成本的最大单项（这份 3 档 = 56.9 s/格 vs 不戴帽 0.895）；"
         "但**顶点数不能按正比换算成秒**（实测四档双对数斜率 ≈0.35、档 0 仍有 ≈10 s/格地板）"
         "⇒ 换一份配件文件先看这两行打印，要 s/格 只能实测",
+    )
+    p.add_argument(
+        "--outfit-attach-role",
+        default="head",
+        help="配件刚性附着到哪个**语义骨角色**（默认 head = 帽子）。脚上的配件写 foot_l，手上的写 hand_l。"
+        "角色没对上当场点名退出，**不静默退回头部** ⇒ 那是'绑了个摆设'的同族",
+    )
+    p.add_argument(
+        "--outfit-mirror-to",
+        default="",
+        help="第二个骨角色（如 foot_r / hand_r）：给了就把配件**再复制一份、镜像烘进网格数据**并绑到那根骨上，"
+        "于是一份源网格穿在左右两只脚（或两只手）上。默认不给 = 单实例（帽子那一支逐字节不变）。"
+        "镜像必须烘进数据而不是留在矩阵上：`bind_child_of` 的约束显式不吃缩放，而负缩放留在 "
+        "matrix_world 会让后续每一条包围盒/投影读数读反（法向与绕序随后统一重算）",
+    )
+    p.add_argument(
+        "--outfit-scale-ref",
+        default="head_width",
+        choices=["head_width", "foot_box", "hand_bone"],
+        help="定标与落座的参照物：head_width = 看得见的头（head_region，帽子那一支的原路）；"
+        "foot_box = 该侧腿在 [鞋底, 踝] 这一段自己的网格包围盒（头宽对靴子无意义）；"
+        "hand_bone = 以那根手骨的骨根为球心、0.06 × 载体高 为半径的那块载体网格（旗杆、拳筒都落在这上面）。"
+        "后两档同时把配件挂点的自动规则从'整组最矮那件的包围盒中心'换成'最低带中心'（鞋底中心 / 旗杆底、拳口）",
+    )
+    p.add_argument(
+        "--outfit-offset",
+        default="",
+        metavar="前后,左右,上下",
+        help="在载体自己的水平坐标系里把配件再平移这么多个**世界单位**（左右 = 骨架局部 X，"
+        "不是世界 X —— 本体普遍带 --face-rot-z 90 烘）。上下沿世界 Z。"
+        "给了镜像时这一位移只加在第一件的挂点上，镜像面会把左右分量自己翻号 ⇒ 写 0,+0.12,0 "
+        "就是两只都朝**外**挪，不是两只朝同一个方向挪。"
+        "默认不给 = 帽子那一支逐字节不变",
+    )
+    p.add_argument(
+        "--outfit-scale-z",
+        type=float,
+        default=1.0,
+        help="在 --outfit-scale 之外**只**沿配件自己的 Z 再乘这一倍（压靴筒用）。"
+        "1.0 = 各向同性 = 帽子那一支逐字节不变。"
+        "为什么要单独一个轴：靴子这份源文件筒高≈筒宽（1.77 vs 1.79），而载体是小腿粗、踝以下短的腿，"
+        "'要矮'和'要细'在 --outfit-scale 上是同一个数 ⇒ 只用它压高度必然同时把筒径压到套不住腿"
+        "（boot 首轮的 0.22/0.168 两支正是这样把'没包住'换成了'太高'的反面）。"
+        "它写在 rot_z/tilt 之前作用于配件自身坐标 ⇒ 压的是'这只靴子自己的竖直方向'，不随 yaw 漂",
     )
     p.add_argument(
         "--outfit-measure-only",
@@ -219,6 +296,18 @@ def parse_args():
         "（D16 路线 B：客户端逐格把这张叠在本体那张上）。相机、姿态、格子、列约定与本体那批"
         "**完全同一套** ⇒ 同一 (row, col) 就是屏幕上同一块矩形，这是路线 B 的地基。"
         "配套的清单生产者 = `tools/pack.py --accessory`",
+    )
+    p.add_argument(
+        "--outfit-occlusion",
+        action="store_true",
+        default=False,
+        help="每格多渲一趟『载体 + 品红自发光配件』，把被载体挡在身后的配件像素 alpha 抹掉 ⇒ 配件图集"
+        "自己就带遮挡（远侧那只手套不再浮在身体前面）。默认关 = 逐字节沿用旧行为。\n"
+        "为什么是『颜色当身份』而不是渲染通道：本机 Blender 5.2.1 上 pass 在 Python 侧**没有读出口**"
+        "（实测 `scene.render.use_pass_object_index` 不存在、合成器 RenderLayers 节点只剩 Image/Alpha 两个"
+        "插座、`CompositorNodeComposite` 已删、`Image.layers` 没了而 `Image.channels` 变成 int、"
+        "`OPEN_EXR_MULTILAYER` 不在枚举里、引擎表只有 BLENDER_EEVEE ⇒ 连『物体纯色渲遮罩』的 Workbench 都没有）。"
+        "代价 = 每格多一趟渲染；本体那批不重渲（它本来就是另一批产物）",
     )
     return p.parse_args(argv)
 
@@ -270,6 +359,17 @@ def evaluated_points(ob, limit=4000):
     pts = [ev.matrix_world @ me.vertices[i].co for i in range(0, len(me.vertices), step)]
     ev.to_mesh_clear()
     return pts
+
+
+def evaluated_z_span(meshes, limit=3000):
+    """载体网格评估后的世界 z 跨度 = "载体高"。
+
+    不能用 `mesh_box`：那份读的是基网格 × matrix_world = **bind space**（head_region 的
+    docstring 记了老虎 A-pose 摊腿把 X 撑到 2.313 的那件事），而这里要的绝对尺度要跟着
+    画面上的身体走。手区半径与镜像骨长地板都读它，两处必须同一个来源。
+    """
+    zs = [p.z for ob in meshes for p in evaluated_points(ob, limit=limit)]
+    return max(zs) - min(zs)
 
 
 def rigid_points(ob, limit=3000):
@@ -356,6 +456,45 @@ def load_outfit(path, names):
     else:
         bpy.ops.import_scene.gltf(filepath=abspath)  # 不带 factory reset：宠物得留着
     fresh = [ob for ob in bpy.data.objects if ob.as_pointer() not in before]
+    # ⚠️ `wm.append` 把**父级**当依赖一起搬。白名单同时点名父与子（牛仔帽 `Cube,Cube.001`）时，
+    # 追加子级那一步会把父级**再复制一份**（实测 2026-11-09：`Cube` + `Cube.001` + `Cube.002`，
+    # 其中 `Cube.002` 与 `Cube` 网格基名相同、矩阵逐位相同、mesh.users=1 ⇒ 是副本不是链接）。
+    # 像素看不出来（同材质同位置 ⇒ 重叠面渲成同一个面），但**每件重合件都把每格成本抬一档**
+    # （帽檐 subsurf3+solidify 求值 9,794 顶点）而装载那行报的件数从此是假的 ⇒ 当场按
+    # (网格基名, matrix_basis, dimensions) 去重，只留创建顺序里的第一件。
+    # 判据用"逐位相同"而不是"看着差不多"：不重合的两件（例如同一网格的两个不同挂点）必须留下，
+    # 那正是 `Torus`/`Torus.001` 这种写法要表达的东西。
+    dupes, first_of = [], {}
+    for ob in fresh:
+        key = (
+            _base_name(ob.data.name) if ob.type == "MESH" else "type:%s" % ob.type,
+            tuple(round(v, 6) for row in ob.matrix_basis for v in row),
+            tuple(round(d, 6) for d in ob.dimensions),
+        )
+        if key in first_of:
+            dupes.append((ob, first_of[key]))
+        else:
+            first_of[key] = ob
+    doomed = {ob.as_pointer(): src for ob, src in dupes}
+    if doomed:
+        # ⚠️ 顺序是硬要求：**先把要留的算出来，再删**。删掉之后那个 StructRNA 立即失效，
+        # 之后任何一次对它求值（连 `ob not in doomed` 这种比较都算）都会炸 ReferenceError，
+        # 而 Blender 会把脚本里未捕获的异常吞成退出码 0（见 `run()` 的文档）⇒ 一声不响地什么都不烘。
+        keep_fresh = [ob for ob in fresh if ob.as_pointer() not in doomed]
+        for ob in fresh:
+            # 隐式父级正是子级此刻的 parent ⇒ 删之前先把子级的世界矩阵钉住，否则 parent 一变 None，
+            # 子级会按自己的 local 矩阵跳位（而那正是"绑了但位置不对"的形状）。
+            if ob.parent is not None and ob.parent.as_pointer() in doomed:
+                mw = ob.matrix_world.copy()
+                ob.parent = None
+                ob.matrix_world = mw
+        for ob, src in dupes:
+            print(
+                "BAKE 配件去重：删掉 %s（与 %s 的网格基名、matrix_basis、尺寸逐位相同 ⇒ append 子级时"
+                "连带搬进来的父级副本，不是第二件配件）" % (ob.name, src.name)
+            )
+            bpy.data.objects.remove(ob, do_unlink=True)
+        fresh = keep_fresh
     keep, drop = [], []
     for ob in fresh:
         (keep if ob.type == "MESH" and _base_name(ob.name) in wanted else drop).append(ob)
@@ -613,6 +752,388 @@ def head_region(meshes, bone=None, bins=48):
     return region
 
 
+def foot_region(meshes, ankle, side, axis, plane_pt):
+    """脚上那一档的参照物 = **该侧腿自己的网格**，键名与 `head_region` 逐一对齐。
+
+    为什么不能沿用头区：头宽对靴子毫无意义（bull 的头宽 1.317 里含两根角），而靴子要包的是
+    那只脚。这里的"头宽"换成 [鞋底, 踝] 这段里该侧点的水平最大尺寸（脚趾→脚跟通常就是它），
+    "颈收缩 z"换成鞋底 z，"颅顶"换成踝 z ⇒ `attach_outfit` 里那条
+    `seat = pinch_z + outfit_seat × height` 一个字不用改，seat=0 落在鞋底、1 落在踝。
+    ⚠️ 分侧靠**量的**正中面（`plane_pt` + 法向 `axis`），不是假设的 x=0：真实 rig 的静止姿态
+    不是逐位对称的，把"左右对称"当输入要求会让每一份外部模型都过不了门禁。
+    ⚠️ `axis` 必须是**载体的左右轴**而不是世界 X：本体烘出来普遍带 `--face-rot-z 90`，那时两踝
+    只差在世界 Y 上、x 几乎相同 ⇒ 拿世界 x 分侧会把"左右"切成"前后"，量到的 0.889 是两只脚
+    合起来的前后深度而不是单只脚的尺寸（bear 首轮实测就是这么错的）。水平尺寸同理要在
+    (axis, axis×Z) 这套**随载体转**的坐标里取范围，世界 x/y 的包围盒在转过的载体上系统性偏大。
+    """
+    pts = [p for p in (q for ob in meshes for q in evaluated_points(ob, limit=6000))]
+    sel = [p for p in pts if (p - plane_pt).dot(axis) * side > 0.0 and p.z <= ankle.z + 1e-6]
+    if len(sel) < 50:
+        sys.exit(
+            "foot_region：过点 (%+.3f,%+.3f,%+.3f)、法向 (%+.3f,%+.3f,%+.3f) 那个正中面的 %s 侧、"
+            "z ≤ 踝 %.4f 这段里只量到 %d 个顶点 ⇒ 这只脚在网格上没有自己的体积（分侧判据失效），"
+            "定标参照不能要"
+            % (*plane_pt, *axis, "左" if side > 0 else "右", ankle.z, len(sel))
+        )
+    fwd = axis.cross(Vector((0.0, 0.0, 1.0)))
+    u = [(p - plane_pt).dot(axis) for p in sel]
+    v = [(p - plane_pt).dot(fwd) for p in sel]
+    zs = [p.z for p in sel]
+    width = max(max(u) - min(u), max(v) - min(v))
+    height = ankle.z - min(zs)
+    if width <= 0 or height <= 0:
+        sys.exit("foot_region：该侧脚的水平尺寸 %.3f 或鞋底→踝高度 %.3f 非正，量不出靴子该多大" % (width, height))
+    region = {
+        "crown_z": ankle.z,
+        "pinch_z": min(zs),
+        "width": width,
+        "height": height,
+        "center": Vector((sum(p.x for p in sel) / len(sel), sum(p.y for p in sel) / len(sel), min(zs))),
+        "band_points": len(sel),
+        "extent": (min(u), max(u), min(v), max(v), min(zs), max(zs)),
+    }
+    print(
+        "BAKE 脚区（网格几何，载体左右轴 (%+.3f,%+.3f,%+.3f) 的 %s 侧）："
+        "鞋底 z=%.3f 踝 z=%.3f 脚高 %.3f 脚尺寸 %.3f 中心 (%+.3f,%+.3f) 用了 %d 个顶点"
+        % (
+            *axis,
+            "左" if side > 0 else "右",
+            region["pinch_z"],
+            region["crown_z"],
+            region["height"],
+            region["width"],
+            region["center"].x,
+            region["center"].y,
+            region["band_points"],
+        )
+    )
+    return region
+
+
+def hand_region(meshes, center, radius, axis):
+    """手上那一档（旗子 / 拳套）的参照物 = **以手的骨根为球心那块载体网格**，键名与 `head_region` 逐一对齐。
+
+    为什么不沿用头区或脚区：头宽对手上挂件无意义，而脚区那条"z ≤ 踝"的带在手上是空的 —— 手在
+    身体侧面而不是底下。这里的"颈收缩 z"换成**球区最低 z**、"颅顶"换成球区最高 z ⇒
+    `attach_outfit` 里那条 `seat = pinch_z + outfit_seat × height` 一个字不用改，seat=0 落在手的
+    下缘、1 落在上缘。水平尺寸在 (axis, axis×Z) 这套**随载体转**的坐标里取，理由同 `foot_region`。
+    ⚠️ 半径按**载体高**算而不是按骨长（`OUTFIT_HAND_REGION` 那里记了 bear 两只手骨差 4.8× 的实测）：
+    骨长一档，短的那侧会读到 0 个点，参照物直接消失。
+    """
+    r2 = radius * radius
+    sel = []
+    for ob in meshes:
+        for p in evaluated_points(ob, limit=6000):
+            if (p - center).length_squared <= r2:
+                sel.append(p)
+    if len(sel) < 50:
+        sys.exit(
+            "hand_region：以 (%+.3f,%+.3f,%+.3f) 为球心、半径 %.4f（= %.0f%% × 载体高）那个球里只量到 "
+            "%d 个顶点 ⇒ 这只手在网格上没有自己的体积（多半是载体不是四足/双足 rigs，或半径档不对），"
+            "定标参照不能要" % (*center, radius, 100 * OUTFIT_HAND_REGION, len(sel))
+        )
+    fwd = axis.cross(Vector((0.0, 0.0, 1.0)))
+    u = [(p - center).dot(axis) for p in sel]
+    v = [(p - center).dot(fwd) for p in sel]
+    zs = [p.z for p in sel]
+    width = max(max(u) - min(u), max(v) - min(v))
+    height = max(zs) - min(zs)
+    if width <= 0 or height <= 0:
+        sys.exit("hand_region：该手区水平尺寸 %.3f 或竖直跨度 %.3f 非正，量不出手上配件该多大" % (width, height))
+    region = {
+        "crown_z": max(zs),
+        "pinch_z": min(zs),
+        "width": width,
+        "height": height,
+        "center": Vector((sum(p.x for p in sel) / len(sel), sum(p.y for p in sel) / len(sel), min(zs))),
+        "band_points": len(sel),
+        "radius": radius,
+        "extent": (min(u), max(u), min(v), max(v), min(zs), max(zs)),
+    }
+    print(
+        "BAKE 手区（网格几何，球心 (%+.3f,%+.3f,%+.3f) 半径 %.4f，载体左右轴 (%+.3f,%+.3f,%+.3f)）："
+        "下缘 z=%.3f 上缘 z=%.3f 手区高 %.3f 手区尺寸 %.3f 中心 (%+.3f,%+.3f) 用了 %d 个顶点"
+        % (
+            *center,
+            radius,
+            *axis,
+            region["pinch_z"],
+            region["crown_z"],
+            region["height"],
+            region["width"],
+            region["center"].x,
+            region["center"].y,
+            region["band_points"],
+        )
+    )
+    return region
+
+
+def outfit_sole_point(hat, override, band_label="鞋底带"):
+    """靴子的挂点取**鞋底带中心**，不是整只靴子的包围盒中心。
+
+    `outfit_anchor_point` 那条自动规则（整组最矮那件的包围盒中心）对帽子是对的 —— 帽圈本来就
+    是帽子的最低件、它的中心就是要落座的那一圈。靴子只有一件，同一条规则会落在靴筒中段 ⇒
+    seat=0 把靴筒中段按在鞋底上，整只靴子飞起来。取最低 OUTFIT_SOLE_BAND 这段顶点的中心，
+    拿到的就是"鞋底中心"。认几何不认名字，和帽圈那条同一族。
+
+    ⚠️ 同一条规则在手上那一档读出来的是**握点**，而且这是量出来的不是借用的（2026-11-09 现量）：
+    flag.glb 的 z 跨 0..1.081，最低 15% 那段（z ≤ 0.162）里只有旗杆的 7,603 个点、旗面一个都没有
+    ⇒ 中心 = 旗杆底 = 该握的地方；boxing.glb 的 z 跨 −0.9..0.9，最低那段是拳口（X 跨 0.770，
+    往上到拳部 1.241）⇒ 中心 = 口 = 手该套进去的地方。两档都落在正确的点上，所以不再加第三个
+    挂点旋钮。`band_label` 只改措辞不改算法：那条打印是"这批像素的挂点从哪块几何来"的唯一出处。
+    """
+    if override:
+        return parse_vec(override), None
+    lowest = min(hat, key=lambda ob: mesh_box([ob])[4])
+    x0, x1, y0, y1, z0, z1 = mesh_box([lowest])
+    top = z0 + OUTFIT_SOLE_BAND * (z1 - z0)
+    band = [p for p in rigid_points(lowest, limit=6000) if p.z <= top]
+    if not band:
+        sys.exit("outfit_sole_point：%s 在最低 %.1f%% 那段（z ≤ %.4f）里一个顶点都没有" % (lowest.name, 100 * OUTFIT_SOLE_BAND, top))
+    point = Vector(
+        (
+            sum(p.x for p in band) / len(band),
+            sum(p.y for p in band) / len(band),
+            sum(p.z for p in band) / len(band),
+        )
+    )
+    print(
+        "BAKE 配件挂点自动取 %s 的**%s**中心 (%+.3f,%+.3f,%+.3f)（带 = z ≤ %.4f，即最低 %.0f%% 那 %d 点；"
+        "整件 z %.4f..%.4f）"
+        % (lowest.name, band_label, point.x, point.y, point.z, top, 100 * OUTFIT_SOLE_BAND, len(band), z0, z1)
+    )
+    return point, lowest.name
+
+
+def mirror_frame(armature, roles, a_role, b_role, height):
+    """量出"把 a 骨根映到 b 骨根"的那个镜面，返回 (4x4 反射矩阵, 中点, 法向)。
+
+    两点定一个镜面是**恒成立的**（法向 = 连线方向，过中点），所以这里没有"猜平面"的余地；
+    真正要验的是**这两根骨是不是一对左右骨**，三条实测：
+      ① 骨长相等（差过门禁 ⇒ 那不是左右对称的两根骨，镜像出来必然一边大一边小）。门禁是
+         `max(比例档, MIRROR_BONE_LEN_FLOOR × 载体高)`：纯比例档是为踝骨（0.261 长）定的，照它
+         判 robot 那对手骨（0.0382 / 0.0352，差 7.9% 但绝对差只有载体高的 0.16% = @192 不到 1 px）
+         会把一份画面完全对称的用例当场拒掉。地板只放宽绝对量，拦不住的真错形状仍是
+         leg/foot、arm/hand 那种 3–5× 的差。
+      ② 连线与载体的左右轴夹角（**折到 0–90°**：镜面法向是无向线）< MIRROR_AXIS_DEG_MAX（连线要是接近竖直，说明这两根骨是上下串
+         的，比如 leg 和 foot，把它们当左右一对镜像 = 一只配件贴在腿中间）；
+      ③ 两骨都存在（缺哪个就点名哪个，不许退回头部那一支）。
+    ⚠️ **镜面取载体的矢状面（过两踝中点、法向 = 左右轴在水平面上的投影），不取两踝连线的垂直平分面**
+    （horse 首轮实测暴露的那件事）：垂直平分面的法向**继承 rig 自己的不对称**。马那份两踝 z 差 0.0407、
+    连线与左右轴夹 10.89° ⇒ 那样定出来的镜面从竖直歪 9.0°，镜像那只靴子跟着歪：靴口相对腿偏到 −0.212、
+    鞋底沉进地面下 0.123。歪掉的不是"对称"而是"竖"——而靴子的内侧面在真实载体上本来就应当竖直。
+    矢状面把 rig 的不对称**只当读数**（下面那行照打两踝的 前后 / z 差），不参与定平面 ⇒ 两只靴子等高、
+    都竖直；代价是"镜像后的骨根"与真实那根骨差开 rig 自己的那点不对称，那是美术改源 rig 的事，不是这里
+    悄悄把镜面斜过去迁就它的事（与上面①②两条门禁同一个理由）。
+    """
+    for role in (a_role, b_role):
+        if role not in roles:
+            sys.exit(
+                "--outfit-mirror-to 要 %s 和 %s 两个骨角色，模型里解出来的是：%s ⇒ 用 --bones 指认"
+                % (a_role, b_role, " ".join(sorted(roles)) or "（一个都没有）")
+            )
+    pa = armature.pose.bones[roles[a_role]]
+    pb = armature.pose.bones[roles[b_role]]
+    la = (pa.tail - pa.head).length
+    lb = (pb.tail - pb.head).length
+    tol_len = max(MIRROR_BONE_LEN_TOL * max(la, lb), MIRROR_BONE_LEN_FLOOR * height)
+    if la <= 0 or lb <= 0 or abs(la - lb) > tol_len:
+        sys.exit(
+            "%s 骨长 %.5f 与 %s 骨长 %.5f 差过 %.5f（= max(%.0f%% × 骨长, %.1f%% × 载体高 %.3f)）⇒ 这不是一对"
+            "左右对称的骨，镜像出来的两只必然一只大一只小，不能要"
+            % (
+                roles[a_role],
+                la,
+                roles[b_role],
+                lb,
+                tol_len,
+                100 * MIRROR_BONE_LEN_TOL,
+                100 * MIRROR_BONE_LEN_FLOOR,
+                height,
+            )
+        )
+    a = armature.matrix_world @ pa.head
+    b = armature.matrix_world @ pb.head
+    ln = b - a
+    if ln.length < 1e-6:
+        sys.exit("%s 与 %s 的骨根重合（%s）⇒ 定不出镜面，两只脚是同一根骨？" % (roles[a_role], roles[b_role], tuple(a)))
+    ln = ln.normalized()
+    # 载体的左右轴 = 骨架世界矩阵的第一列（局部 X），**不是**世界 X：本体普遍带 --face-rot-z 90 烘，
+    # 那时左右脚在世界上差 Y 而 x 几乎相同。bear 首轮实测：连线与局部 X 折后夹角 **2.22°**（过），
+    # 而那份的镜面法向读出来是 (+0.012,−0.999,−0.037) ≈ 世界 −Y —— 两个数同时成立才叫对上。
+    # 折叠是必须的：镜面是**无向**的（法向反号是同一个镜面），不折就会把这条能力唯一的目标用例
+    # （bear，探针里读到的原值是 177.78°）当场拒掉。
+    axis_x = armature.matrix_world.to_3x3() @ Vector((1, 0, 0))
+    if axis_x.length < 1e-6:
+        sys.exit("载体骨架的局部 X 是零向量 ⇒ 定不出它的左右轴，也就定不出镜面")
+    axis_x.normalize()
+    deg = math.degrees(ln.angle(axis_x, math.pi))
+    # `abs` 不是多余的保险：`Vector.angle` 的第二个参数是**反平行时的 fallback**，传 π 就会得到
+    # 180.0000…，`min(180+ε, 180-(180+ε))` 于是给一个**负的**读数（打印出来像"夹角 -0.00°"）。
+    deg = min(deg, abs(180.0 - deg))
+    if deg > MIRROR_AXIS_DEG_MAX:
+        sys.exit(
+            "两骨根连线 (%+.4f,%+.4f,%+.4f) 与载体左右轴夹角 %.1f° > %.1f° ⇒ 这两根骨不是左右一对"
+            "（接近竖直 = 上下串的两根，比如 leg/foot），镜像会把一只靴子贴进腿中间"
+            % (*ln, deg, MIRROR_AXIS_DEG_MAX)
+        )
+    mid = (a + b) / 2
+    # 镜面 = 矢状面：法向 = 左右轴**投到水平面**再归一（去掉它自己的 z 分量，也去掉连线的 z 分量），
+    # 符号取向让 `refl @ a` 落在 b 那一侧（反射是无向的，但下面那条镜像残差门禁要一个确定方向）。
+    n = Vector((axis_x.x, axis_x.y, 0.0))
+    if n.length < 1e-6:
+        sys.exit(
+            "载体左右轴 (%+.4f,%+.4f,%+.4f) 指着正上/正下 ⇒ 这份 rig 没有水平意义上的左右，"
+            "矢状面定不出来；换一对真正左右对称的骨角色（--outfit-attach-role / --outfit-mirror-to）"
+            % tuple(axis_x)
+        )
+    n.normalize()
+    if n.dot(ln) < 0.0:
+        n = -n
+    r3 = Matrix.Identity(3)
+    for i in range(3):
+        for j in range(3):
+            r3[i][j] -= 2.0 * n[i] * n[j]
+    refl = Matrix.Translation(mid) @ r3.to_4x4() @ Matrix.Translation(-mid)
+    # rig 自身不对称的三项读数：沿左右轴的差（对称面这一维）、前后差、上下差。后两项**不进镜面**，
+    # 只打印，因为"两只靴子一高一低"如果显眼是源 rig 的事。
+    fw = Vector((NOSE[0] - REAR[0], NOSE[1] - REAR[1], 0.0))
+    d = b - a
+    print(
+        "BAKE 镜像面（实测）：矢状面法向 (%+.5f,%+.5f,%+.5f) 过中点 (%+.4f,%+.4f,%+.4f)，"
+        "与水平面夹角 %.4f°（按构造恒 0）；两骨骨长均为 %.5f、连线与左右轴夹角 %.2f°（门禁 ≤%.0f°）；"
+        "rig 自身不对称 左右=%.5f 前后=%.5f 上下=%.5f ⇒ %s"
+        % (
+            *n,
+            *mid,
+            math.degrees(n.angle(Vector((0, 0, 1)))) - 90.0,
+            la,
+            deg,
+            MIRROR_AXIS_DEG_MAX,
+            abs(d.dot(n)),
+            abs(d.dot(fw.normalized())) if fw.length > 1e-6 else 0.0,
+            abs(a.z - b.z),
+            "照它烘，只登记不判红"
+            if max(abs(d.dot(n)), abs(a.z - b.z)) > 1e-4
+            else "两踝在矢状面两侧等高",
+        )
+    )
+    return refl, mid, n
+
+
+def mirror_objects(hat, placed, refl, suffix=".mirror"):
+    """复制一份配件网格，把**反射烘进顶点数据**（不是留在物体矩阵上）。
+
+    为什么必须烘进数据：`bind_child_of` 的约束显式 `use_scale_*=False`，带不动负缩放；而把
+    det=-1 留在 matrix_world 上，之后每一条 `mesh_box` / `rigid_points` / `world_to_camera_view`
+    读数读的都是反的（构图与像素门禁会一起变成摆设）。
+    数据侧的变换 = `M⁻¹ @ refl @ M`（M 是该件摆放后的世界矩阵），这样"物体矩阵不变、顶点动"
+    之后世界位置正好等于 refl 作用在原顶点上。
+    反射是负定向 ⇒ 顶点搬完之后**绕序推出的法向正好是外法向的反**：`(A x)×(A y) = det(A)·A⁻ᵀ(x×y)`，
+    而反射的 det(A) = −1。所以处置是**无条件 `reverse_faces`**（它同时改绕序和法向），再由下面那条
+    逐面门禁对着**解析镜像值**验 —— 期望值在数据空间算，理由见下面那段注释。
+    ⚠️ 这里原来写的是"先 `recalc_face_normals` 再按多数投票决定翻不翻"，**已被 boot.glb 实测否证**：
+    那份 500,000 面的网格 recalc 后只有 2336/4000 面与解析值同号（不是一张可定向的封闭壳，逐岛各挑
+    朝向），"多数符号"本身就不可选；而它翻完仍然逐面 180° 红，因为比较用错了空间（世界 vs 数据）。
+    """
+    import bmesh
+
+    dupes = []
+    for ob in hat:
+        me = ob.data.copy()
+        me.name = ob.data.name + suffix
+        dup = bpy.data.objects.new(ob.name + suffix, me)
+        dup.matrix_world = ob.matrix_world.copy()
+        dup.visible_camera = ob.visible_camera
+        # 修改器挂在**物体**上而不是网格上 ⇒ 只 copy data 会让镜像件丢掉 SUBSURF/SOLIDIFY，
+        # 渲出来一只光滑一只带帽檐细分（boot 那份没修改器所以看不见这个坑，帽子那份一旦镜像就会中）
+        for md in ob.modifiers:
+            dup.modifiers.append(md.copy())
+        for col in ob.users_collection:
+            col.objects.link(dup)
+        m = ob.matrix_world
+        a = m.inverted() @ refl @ m
+        # 顶点：直接按索引搬（复制件与原件顶点序逐位相同 ⇒ 残差门禁能一一对应）
+        for v in me.vertices:
+            v.co = a @ v.co
+        # ⚠️ 期望法向必须在**数据空间**里算：me.polygons[i].normal 读的是 dup 的**局部**法向，而
+        # refl 是**世界**反射 ⇒ 正确的对照是共轭过的那一个。直接拿 refl.to_3x3() 乘局部法向 =
+        # 拿世界的方向比局部的方向：bear 首轮（物体带 --outfit-rot-z 180）实测整体差 176–180°，
+        # 看上去像"绕序没翻对"，其实是这里比错了空间 —— 一条会把自己那条修复判成失败的假红。
+        # ⚠️ 但**法向和顶点不是同一个矩阵**：共轭一个对合反射仍是对合（a⁻¹ = a），而法向按逆转置走，
+        # 所以法向用的是 aᵀ = (a⁻¹)ᵀ。各向同性缩放时 a 正交 ⇒ aᵀ = a⁻¹ = a，两者逐位相同（帽子那一支、
+        # boot 首轮 scale_z=1 都在这格上，所以旧代码是对的）；一旦 --outfit-scale-z≠1，a 不再正交，
+        # 用 a 会让这条门禁自己红：boot@sz0.72 实测最大夹角 2.930°（门禁 2°）而渲出来其实没里外翻。
+        lin = a.to_3x3().transposed()
+        want_normals = [(lin @ p.normal).normalized() for p in ob.data.polygons]
+        if me.has_custom_normals:
+            # 有拆面法向（custom split normals）时 polygon.normal 不跟绕序走 ⇒ 翻绕序等于什么都没改，
+            # 而下面的门禁照样会绿。boot.glb 实测无 NORMAL 属性，所以这一支现在是"能红"而不是"要修"。
+            sys.exit(
+                "镜像件 %s 带拆面法向 ⇒ 绕序改了而法向不会跟着改，这条能力在这里会静默失效。"
+                "先烘掉 custom normals（或在源文件里去掉法向）再来" % dup.name
+            )
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        faces = bm.faces[:]
+        if len(faces) != len(want_normals):
+            sys.exit(
+                "镜像件 %s 的面数 %d ≠ 原件 %d ⇒ 复制不是逐面搬的，法向门禁失去对应关系"
+                % (dup.name, len(faces), len(want_normals))
+            )
+        # 下面逐面对应关系靠"bmesh 读回来的面序 == 网格多边形序" ⇒ 先量它，不假设它
+        stride = max(1, len(faces) // 4000)
+        sample = list(range(0, len(faces), stride))
+        for i in sample:
+            if {v.index for v in faces[i].verts} != set(ob.data.polygons[i].vertices):
+                sys.exit(
+                    "镜像件 %s 第 %d 面的顶点与原件对不上（%s vs %s）⇒ 面序对应关系不成立，"
+                    "法向门禁读的不是同一批面"
+                    % (dup.name, i, sorted(v.index for v in faces[i].verts), ob.data.polygons[i].vertices)
+                )
+        # **无条件**翻绕序，不投票：反射 det=−1 ⇒ 同一索引序从外面看由逆时针变成顺时针，
+        # 而 `polygon.normal` 就是从绕序导出的 ⇒ 翻一次正好补回来。
+        # 原先这里先 `recalc_face_normals` 再按多数投票决定翻不翻，实测被 boot 否证：那份网格
+        # recalc 后只有 2336/4000 面与解析值同号（它不是一张可定向的封闭壳，逐岛各挑朝向），
+        # 于是"多数符号"这个开关本身就不可靠，而它放行后逐面门禁仍然 180° 红。
+        bmesh.ops.reverse_faces(bm, faces=faces)
+        bm.to_mesh(me)
+        bm.free()
+        me.update()
+        # polygon.normal 是从绕序**惰性导出**的量 ⇒ 不点名更新一次就会读到 to_mesh 之前的旧值，
+        # 而下面那条门禁读旧值时照样能给出一个"看起来很稳"的数（0° 或 180° 都可能是缓存）。
+        bpy.context.view_layer.update()
+        worst = max(
+            (me.polygons[i].normal.angle(want_normals[i], math.pi) for i in range(len(me.polygons))),
+            default=0.0,
+        )
+        print(
+            "BAKE 镜像法向：翻绕序后与解析镜像法向的最大夹角 %.3f°（面数 %d）⇒ %s"
+            % (
+                math.degrees(worst),
+                len(me.polygons),
+                "绕序/法向烘对了"
+                if worst < math.radians(2.0)
+                else "**法向没翻对**（这一份渲出来是里外翻的）",
+            )
+        )
+        if worst >= math.radians(2.0):
+            sys.exit(
+                "镜像件 %s 的法向与解析镜像值差 %.3f°（门禁 2°）⇒ 这一份渲出来是里外翻的，"
+                "不许上屏" % (dup.name, math.degrees(worst))
+            )
+        # ⚠️ 镜像件的**世界矩阵不是镜像过的矩阵**，而是和原件同一个矩阵：反射被烘进顶点数据了，
+        # `dup.matrix_world` 从头到尾没动过 ⇒ `refl @ placed[ob]` 是一个"物体矩阵镜像、数据也镜像"
+        # = 镜像两次的矩阵，bind_child_of 按它去反解 inverse 必然对不上（boot 首轮实测残差 0.584，
+        # 而容差 0.0005 ⇒ 两种 inverse 配方都红）。真正镜像的是**挂点**（下面 instances[1] 的
+        # anchor_local 用 `refl @ seat`），而"同一个矩阵 × 镜像的数据"给出的世界顶点正好 = refl 作用
+        # 在原顶点上 —— 那才是这条能力的定义。
+        placed[dup.name] = placed[ob.name].copy()
+        dupes.append(dup)
+    return dupes
+
+
 def reset_bones(armature, base):
     for pb in armature.pose.bones:
         pb.matrix_basis = base[pb.name]
@@ -689,6 +1210,20 @@ def bind_child_of(armature, bone, hat, placed, tol):
     )
 
 
+def slot_labels(scale_ref):
+    """三档参照各自的一族措辞，**只在这一处**分叉。
+
+    为什么值得一个函数：这几行标签原先是 5 个 `head_width ? : foot_box` 的二元三目，加第三档
+    时它们会**静默把"手"读成"脚"**（"脚尺寸/鞋底 z/靴筒"出现在一张旗子的日志里，而日志是
+    "这批像素怎么定出来的"唯一出处）。加一档就改一处的形状，才不会被下一个人漏掉。
+    """
+    if scale_ref == "foot_box":
+        return "脚尺寸", "鞋底 z", "鞋底", "脚高", "网格脚区", "别把它读成靴筒高度倍数"
+    if scale_ref == "hand_bone":
+        return "手区尺寸", "手区下缘 z", "握持", "手区高", "网格手区", "别把它读成旗面高度倍数"
+    return "头宽", "颈收缩 z", "帽圈", "头高", "网格头区", "别把它读成帽檐倍数"
+
+
 def attach_outfit(armature, roles, hat, meshes, args, base):
     """把配件定标、刚性对齐到**看得见的头**、上 CHILD_OF 约束。返回挂点读数需要的上下文。
 
@@ -698,12 +1233,76 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
     `use_scale_*=False`：帽不许随胸腔呼吸涨缩 —— 这是 inherit_scale=FULL 那条坑的第三次现身。
     inverse_matrix 一律由 bind_child_of 实测反解，然后**读评估后的矩阵**验一次摆放没被约束改动。
     """
-    head = roles["head"]
+    role = args.outfit_attach_role
+    if role not in roles:
+        sys.exit(
+            "--outfit-attach-role %r 在这份模型里没解出来 ⇒ 可用角色：%s。"
+            "**不许退回头部那一支**：那会把靴子戴在头上，而六道门禁都会绿"
+            % (role, " ".join(sorted(roles)) or "（一个都没有）")
+        )
+    mirror_role = args.outfit_mirror_to
+    if mirror_role and mirror_role == role:
+        sys.exit("--outfit-mirror-to 不能和 --outfit-attach-role 是同一个角色 %r ⇒ 镜像出来的第二件"
+                 "绑回同一根骨，两只脚会穿同一只靴子（正是这条能力要防的形状）" % role)
+    if mirror_role and mirror_role not in roles:
+        sys.exit(
+            "--outfit-mirror-to %r 在这份模型里没解出来 ⇒ 可用角色：%s"
+            % (mirror_role, " ".join(sorted(roles)))
+        )
+    head = roles[role]
     reset_bones(armature, base)  # 定标与摆放必须在 rest 上做，否则跟着呼吸那一档一起偏
     pb = armature.pose.bones[head]
     bone_len = (pb.tail - pb.head).length
-    region = head_region(meshes, (bone_len, (armature.matrix_world @ pb.head).z, (armature.matrix_world @ pb.tail).z))
-    anchor0, anchor_from = outfit_anchor_point(hat, args.outfit_anchor)
+    bone_world = armature.matrix_world @ pb.head
+    ref_side = ref_axis = ref_plane = ref_center = None
+    # 载体左右轴 = 骨架世界矩阵的第一列（局部 X）：本体普遍带 --face-rot-z 90 烘，
+    # 那时"左右"落在世界 Y 上，拿世界 x 分侧会把左右切成前后（bear 首轮实测的错法）。
+    left_axis = armature.matrix_world.to_3x3() @ Vector((1.0, 0.0, 0.0))
+    if left_axis.length < 1e-6:
+        sys.exit("载体骨架的局部 X 是零向量 ⇒ 定不出它的左右轴")
+    left_axis.normalize()
+    hand_radius = None
+    if args.outfit_scale_ref == "foot_box":
+        # 参照物换成该侧腿自己的网格；正中面由**两根踝骨**量出，法向是载体的左右轴而不是世界 X
+        if mirror_role:
+            # 正中面由**两根踝骨**量出：过其中点、法向 = 两踝连线（那条无向线就是左右轴）
+            other = armature.matrix_world @ armature.pose.bones[roles[mirror_role]].head
+            plane_pt = (bone_world + other) / 2.0
+            line = other - bone_world
+            if line.length < 1e-6:
+                sys.exit("--outfit-mirror-to %s：两根踝骨重合（连线长 %.3e）⇒ 量不出左右轴，"
+                         "分侧与镜像面都不能要" % (mirror_role, line.length))
+            axis = line.normalized()
+            # 定个符号：让 axis 指向载体局部 +X 那侧，于是下面打印的"左"= 局部 X 侧，
+            # 不会因"--outfit-attach-role 给的是哪只脚"而翻转含义（mirror_frame 那条门禁
+            # 已经验过这根轴与两踝连线是同一根无向线）
+            if axis.dot(left_axis) < 0.0:
+                axis = -axis
+        else:
+            plane_pt = armature.matrix_world @ Vector((0.0, 0.0, 0.0))
+            axis = left_axis
+        side = 1.0 if (bone_world - plane_pt).dot(axis) >= 0.0 else -1.0
+        ref_side, ref_axis, ref_plane = side, axis, plane_pt
+        region = foot_region(meshes, bone_world, side, axis, plane_pt)
+    elif args.outfit_scale_ref == "hand_bone":
+        # 参照物 = 手上那圈载体网格（球心 = attach-role 那根手的骨根）。这里**不**按正中面分侧：
+        # 球半径只有载体高的 6%，两只手离得比它远得多（bear 实测 0.109 半径 / 218 点，另一只手
+        # 一个点都不落进来）⇒ 分侧只会多一个会失败的判据，换不到任何东西。
+        body_h = evaluated_z_span(meshes)
+        hand_radius = OUTFIT_HAND_REGION * body_h
+        region = hand_region(meshes, bone_world, hand_radius, left_axis)
+        ref_axis = left_axis
+        ref_center = bone_world
+    else:
+        region = head_region(
+            meshes,
+            (bone_len, (armature.matrix_world @ pb.head).z, (armature.matrix_world @ pb.tail).z),
+        )
+    anchor0, anchor_from = (
+        outfit_sole_point(hat, args.outfit_anchor, band_label=slot_labels(args.outfit_scale_ref)[2] + "带")
+        if args.outfit_scale_ref in ("foot_box", "hand_bone")
+        else outfit_anchor_point(hat, args.outfit_anchor)
+    )
     x0, x1, y0, y1, z0, z1 = mesh_box(hat)
     width = max(x1 - x0, y1 - y0)  # **整组**水平足迹（含歪出去的绒球），不是帽圈直径
     # 帽圈 = 整组最矮那件的直径。定标公式量的不是它，但"挂件看起来多大"读的是它，所以两个都要有出处。
@@ -715,8 +1314,40 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
         object_widths[ob.name] = round(max(ox1 - ox0, oy1 - oy0), 5)
         if ring_z is None or oz0 < ring_z:
             ring_name, ring_width, ring_z = ob.name, object_widths[ob.name], oz0
-    scale = args.outfit_scale if args.outfit_scale > 0 else round(OUTFIT_SIZE_RATIO * region["width"] / width, 4)
+    # 三个参照各有自己的比例常数：头宽对靴子无意义，小腿宽对手上挂件同样无意义 ⇒ 不是一条公式两个系数。
+    size_ratio = {
+        "foot_box": OUTFIT_FOOT_SIZE_RATIO,
+        "hand_bone": OUTFIT_HAND_SIZE_RATIO,
+    }.get(args.outfit_scale_ref, OUTFIT_SIZE_RATIO)
+    scale = args.outfit_scale if args.outfit_scale > 0 else round(size_ratio * region["width"] / width, 4)
+    # 量级门禁 ③ 的期望必须跟着"sizes 取的是投影 x/y 的较大者"这句话走：**细长**配件（旗杆、靴筒）
+    # 占优的那一维是自身高度而不是水平足迹。相机俯 CAM_ELEV_DEG=15° ⇒ 屏幕 y 轴与世界 Z 夹 15°，
+    # 一根竖直杆在屏幕上的长度 = 杆长 × cos15°（flag × bear 实测：杆 0.361 世界 × 0.9659 = 0.3487
+    # ÷ ortho 2.640 × 192 = 25.3px，与那一行的读数逐位对上）。
+    # 帽子那一支足迹 ≥ 身高 ⇒ max 取的是足迹 ⇒ 期望与旧值**逐字节相同**：这条修正只对细长形状生效。
+    tall_world = (z1 - z0) * scale * args.outfit_scale_z * math.cos(math.radians(CAM_ELEV_DEG))
     seat = Vector((region["center"].x, region["center"].y, region["pinch_z"] + args.outfit_seat * region["height"]))
+    offset = Vector((0.0, 0.0, 0.0))
+    if args.outfit_offset:
+        # 位移写在**载体自己的水平坐标系**里，不是世界轴：本体普遍带 --face-rot-z 90 烘，
+        # 那时"前后"落在世界 Y 上、"左右"落在世界 X 上 ⇒ 拿世界轴写这个数会把前后当左右（脚区那一维
+        # 首轮已经栽过一次，同一个坐标系错误不该在第二个旋钮上重犯）。
+        ox, oy, oz = parse_vec(args.outfit_offset)
+        la = armature.matrix_world.to_3x3() @ Vector((1.0, 0.0, 0.0))
+        la.z = 0.0
+        if la.length < 1e-6:
+            sys.exit("--outfit-offset 要用载体的左右轴，而这份骨架的局部 X 投到水平面是零向量（它指着正上/正下）")
+        la.normalize()
+        fw = Vector((NOSE[0] - REAR[0], NOSE[1] - REAR[1], 0.0))
+        if fw.length < 1e-6:
+            sys.exit("--outfit-offset 要用鼻尖向量当'前后'，而这份载体的鼻尖在正上/正下")
+        fw.normalize()
+        # 左右那一项按"这一件在哪一侧"对齐成**向外**：attach-role 落在 -la 那一侧时，同一个 +oy
+        # 必须读成"更右"而不是"更左"，否则换一根骨当 attach-role 就把这个旋钮的含义整个翻反。
+        # 镜像件不在这里管：镜面法向就是左右轴，反射自己会把 la 分量翻号 ⇒ 写一次 0,+0.12,0 是两只都朝外。
+        side = 1.0 if bone_world.dot(la) >= 0.0 else -1.0
+        offset = fw * ox + la * (oy * side) + Vector((0.0, 0.0, oz))
+        seat = seat + offset
     xform = (
         Matrix.Translation(seat)
         @ Matrix.Rotation(math.radians(args.outfit_rot_z), 4, "Z")
@@ -724,7 +1355,7 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
         # 放 yaw 左边就变成绕世界前后轴倒，那时 rot_z≠0 的帽子朝一个固定的世界方向倒，
         # 换一个 rot_z / 换一份配件文件就是另一种形状，读数不再有出处。
         @ Matrix.Rotation(math.radians(args.outfit_tilt), 4, "Y")
-        @ Matrix.Diagonal((scale, scale, scale, 1.0))
+        @ Matrix.Diagonal((scale, scale, scale * args.outfit_scale_z, 1.0))
         @ Matrix.Translation(-anchor0)
     )
     for ob in hat:
@@ -733,20 +1364,65 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
     placed = {ob.name: world_of(ob).copy() for ob in hat}
     # 一条容差，两处用（绑定验收 + 附着漂移）：绝对量随缩放漂 ⇒ 一律按**定标后的整组足迹**归一。
     tol = 1e-3 * max(width * scale, 1e-9)
+    dupes = []
+    refl = None
+    if mirror_role:
+        # 镜像必须在**摆放之后、绑定之前**烘：refl 是由两根骨的 rest 位置量出来的，而摆放把
+        # 原件放到了这一侧的脚上 —— 先烘再摆会让"镜像面"作用在未摆放的局部数据上。
+        refl, mirror_mid, mirror_n = mirror_frame(armature, roles, role, mirror_role, evaluated_z_span(meshes))
+        dupes = mirror_objects(hat, placed, refl)
     bind_child_of(armature, head, hat, placed, tol)
+    if dupes:
+        # 第二份绑到**另一根**骨上：这条调用就是"两只脚不是同一只靴子贴两遍"的全部实现，
+        # 而它能不能被证伪由下面那条逐实例门禁负责（扰动单根骨，另一只必须不动）。
+        bind_child_of(armature, roles[mirror_role], dupes, placed, tol)
+    instances = [
+        {
+            "bone": head,
+            "role": role,
+            "objects": [ob.name for ob in hat],
+            "ref": hat[0].name,
+            # 变换后挂点正好落在 seat 上 ⇒ 存进 ref 的局部空间，之后每帧读它的世界位置
+            "anchor_local": placed[hat[0].name].inverted() @ seat,
+            "expect": seat.copy(),
+        }
+    ]
+    if dupes:
+        # 镜像件的挂点由 refl 作用在第一件的挂点上得到（同一份局部量在两具骨上不再同值）
+        instances.append(
+            {
+                "bone": roles[mirror_role],
+                "role": mirror_role,
+                "objects": [d.name for d in dupes],
+                "ref": dupes[0].name,
+                "anchor_local": placed[dupes[0].name].inverted() @ (refl @ seat),
+                "expect": (refl @ seat).copy(),
+            }
+        )
 
     ctx = {
         "bone": head,
-        "ref": hat[0],
-        # 变换后挂点正好落在 seat 上 ⇒ 存进 ref 的局部空间，之后每帧读它的世界位置
-        "anchor_local": placed[hat[0].name].inverted() @ seat,
+        "instances": instances,
+        "attach_role": role,
+        "mirror_role": mirror_role,
+        "scale_ref": args.outfit_scale_ref,
+        "size_ratio": size_ratio,
         "scale": scale,
+        "scale_z": args.outfit_scale_z,
         "rot_z": args.outfit_rot_z,
         "tilt": args.outfit_tilt,
         "seat": args.outfit_seat,
+        "offset": args.outfit_offset,
         "anchor_world0": seat.copy(),
         "bone_len": bone_len,
         "head_region": {k: (list(v) if isinstance(v, Vector) else v) for k, v in region.items()},
+        # 脚区那一支的分侧判据要能被 check_attach 复用（"这根骨驱动的可见网格动没动"得按同一侧量）
+        "ref_side": ref_side,
+        "ref_axis": tuple(ref_axis) if ref_axis is not None else None,
+        "ref_plane": tuple(ref_plane) if ref_plane is not None else None,
+        # 手区那一支的参照物是一个**球**，region_top 要按同一个球复算 ⇒ 球心与半径都得进 ctx
+        "ref_center": tuple(ref_center) if ref_center is not None else None,
+        "ref_radius": hand_radius,
         "group_width": width,
         "object_widths": object_widths,
         "anchor_object": anchor_from,
@@ -754,8 +1430,13 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
         "ring_width": round(ring_width, 5),
         # 定标后的**整组**世界足迹 = 投影尺寸那条**量级**门禁的期望值（关系检查看不见量级错，见 check_attach）
         "size_ref_world": width * scale,
+        # 定标后的**世界身高**（已按俯角投影到屏幕 y）：旗杆这类"高 ≫ 宽"的配件，屏幕上量的那一维是它，
+        # 拿足迹去期望它 = 一条只会假红的门禁（flag 首轮实测 25.3px vs 14.0px = 1.81×）。
+        "tall_ref_world": tall_world,
         "ring_world": ring_width * scale,
-        "objects": [ob.name for ob in hat],
+        "objects": [ob.name for ob in hat] + [d.name for d in dupes],
+        # 镜像门禁要拿 refl 逐顶点比，而它在 attach 之后没人再认识 ⇒ 跟着 ctx 走
+        "mirror_refl": None if refl is None else [list(r) for r in refl],
         # 读数要能被别人复算 ⇒ 把"这次烘的是哪份模型、转了多少度、配件是哪份文件"一起带上
         "model": args.model,
         "hat_model": args.outfit,
@@ -767,26 +1448,44 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
     # 老虎自动档（足迹更大）9.1e-7 **撞在 1e-6 上翻红** ⇒ 写死绝对值 = 一条换个载体就随机红的门禁。
     # "配方真的错了"的形状是漂一截（足迹量级 ≈1.3 世界单位），比噪声高 **6 个数量级** ⇒
     # 1e-3 × 足迹 仍在真错下面三个数量级，而浮点噪声再也撞不到它。两个数每轮都打，不做静默边界。
-    drift = (outfit_point(ctx) - seat)
     drift_tol = tol  # 与上面 bind_child_of 验收同一条带、同一个出处（别在这里再写一遍算式）
-    print("BAKE 附着漂移：残差 %.9f（容差 %.9f = 1e-3 × 定标后整组足迹 %.3f）⇒ %s"
-          % (drift.length, drift_tol, ctx["size_ref_world"], "过" if drift.length <= drift_tol else "**不过**"))
-    if drift.length > drift_tol:
-        sys.exit(
-            "上完 CHILD_OF 后挂点漂了 %.6f 世界单位（容差 %.6f）⇒ inverse_matrix 那条配方不对（读的是评估后的矩阵，和渲染器同一份）"
-            % (drift.length, drift_tol)
-        )
+    for i, inst in enumerate(instances):
+        drift = outfit_point(ctx, i) - inst["expect"]
+        # 每一件各自验一次：只验第一件的话，"镜像件绑回同一根骨 / inverse 解错"这类形状会全绿过去，
+        # 而那正是这条能力唯一要防的事。
+        if drift.length > drift_tol:
+            sys.exit(
+                "上完 CHILD_OF 后 %s 骨那一件（%s）的挂点漂了 %.6f 世界单位（容差 %.6f）"
+                "⇒ 那一份的 inverse_matrix 配方不对（读的是评估后的矩阵，和渲染器同一份）"
+                % (inst["bone"], "+".join(inst["objects"]), drift.length, drift_tol)
+            )
+        if i == 0:
+            print("BAKE 附着漂移：残差 %.9f（容差 %.9f = 1e-3 × 定标后整组足迹 %.3f）⇒ 过"
+                  % (drift.length, drift_tol, ctx["size_ref_world"]))
+        else:
+            print("BAKE 镜像件附着漂移：残差 %.9f（同一容差 %.9f）⇒ 过" % (drift.length, drift_tol))
+    # 措辞跟着参照物走：这条打印是"这批像素怎么定出来的"的唯一出处，靴子那一支要是照打
+    # "头宽/颈收缩/帽圈"，读的人就会拿 0.446 去查 bull 的头宽（bear 首轮实测正是这样错的）
+    ref_label, pinch_label, ring_label, height_label, region_label, ratio_note = slot_labels(
+        args.outfit_scale_ref
+    )
+    # 帽子那一支（scale_z=1）连这行打印都逐字节不变：日志比对是"新开关没碰到旧那支"的免费证据
+    zs = "" if args.outfit_scale_z == 1.0 else "、自身 Z 另压 %.2f" % args.outfit_scale_z
     print(
-        "BAKE 配件附着：bone=%s(len %.3f，但**定标/落座用的是网格头区**) 头宽 %.3f 颈收缩 z=%.3f 头高 %.3f ⇒ "
-        "挂到 %.0f%% 段 → 世界 (%+.3f,%+.3f,%+.3f)，缩放 %.4f（整组足迹 %.3f → %.3f），绕 Z 转 %g°、绕自身 Y 倾 %g°\n"
-        "  定标参考是**整组水平足迹**（%s），不是帽圈：帽圈 %s 实测 %.3f → 定标后 %.3f = **%.2f × 头宽**"
-        "（公式那个 %g 只管整组足迹 ⇒ 别把它读成帽檐倍数）\n"
+        "BAKE 配件附着：bone=%s(len %.3f，但**定标/落座用的是%s**) %s %.3f %s=%.3f %s %.3f ⇒ "
+        "挂到 %.0f%% 段 → 世界 (%+.3f,%+.3f,%+.3f)，缩放 %.4f（整组足迹 %.3f → %.3f）%s，绕 Z 转 %g°、绕自身 Y 倾 %g°\n"
+        "  定标参考是**整组水平足迹**（%s），不是%s：%s %s 实测 %.3f → 定标后 %.3f = **%.2f × %s**"
+        "（公式那个 %g 只管整组足迹 ⇒ %s）\n"
         "  整组各件宽度：%s"
         % (
             head,
             bone_len,
+            region_label,
+            ref_label,
             region["width"],
+            pinch_label,
             region["pinch_z"],
+            height_label,
             region["height"],
             100 * args.outfit_seat,
             seat.x,
@@ -795,111 +1494,295 @@ def attach_outfit(armature, roles, hat, meshes, args, base):
             scale,
             width,
             width * scale,
+            zs,
             args.outfit_rot_z,
             args.outfit_tilt,
             max(object_widths, key=lambda n: object_widths[n]),
+            ring_label,
+            ring_label,
             ring_name,
             ring_width,
             ring_width * scale,
             (ring_width * scale) / region["width"],
-            OUTFIT_SIZE_RATIO,
+            ref_label,
+            size_ratio,
+            ratio_note,
             " ".join("%s=%.3f" % (n, w) for n, w in sorted(object_widths.items())),
         )
     )
+    if args.outfit_offset:
+        # 上面那行世界坐标读不出"这一件往哪边挪了多少"：位移写在载体坐标里，而镜像件的左右分量
+        # 由镜面自己翻号 ⇒ "筒中心对没对上腿中心"这个数必须由这一行给出出处，不能靠人反推世界坐标。
+        print(
+            "BAKE 配件平移：载体坐标 前后=%+.3f 左右=%+.3f（attach-role 这一侧向外）上下=%+.3f "
+            "⇒ 世界 (%+.3f,%+.3f,%+.3f)" % (ox, oy, oz, offset.x, offset.y, offset.z)
+        )
     return ctx
 
 
-def outfit_point(ctx):
-    """这一帧挂点的世界坐标 —— 读的是被约束算完的物体矩阵，和渲染器画的是同一份。"""
-    return world_of(ctx["ref"]) @ ctx["anchor_local"]
+def outfit_point(ctx, index=0):
+    """这一帧挂点的世界坐标 —— 读的是被约束算完的物体矩阵，和渲染器画的是同一份。
+
+    `index=0` = `--outfit-attach-role` 那一件；给了 `--outfit-mirror-to` 时第二件在 `index=1`。
+    逐实例读，不合并成一个"整组质心" —— 合并会把"两件绑在同一根骨上"读成正常。
+    """
+    inst = ctx["instances"][index]
+    return world_of(bpy.data.objects[inst["ref"]]) @ inst["anchor_local"]
 
 
 def check_attach(armature, roles, ctx, base, cam, cell, spec, pose, meshes):
     """本轮最重要的一条自检："我 parent 了"不等于"它跟着动"，而"跟着动"也不等于"大小对"。
 
-    ① 把头骨在**世界**里平移 +0.05，帽的挂点必须跟着平移同样的量；
-    ② idle 全帧内帽的投影尺寸必须恒定 —— 那是 use_scale_*=False 真的生效的证据；
-    ③ **量级**门禁：那个恒定尺寸必须落在"帽檐 = 1.25 × 头宽"推算出来的像素附近。
+    ① 逐实例：把**这一件自己那根骨**在世界里平移 +0.05 ⇒ 这一件必须跟着走同样的量，而**其余每一件
+       必须几乎不动**。镜像那一支的整条能力就立在这一条上：扰动左踝而两只靴子一起动 = 两件绑在
+       同一根骨上 = "看起来对称、其实是一只靴子贴两遍"，而这正是这条门禁唯一抓得住的形状。
+    ② idle 全帧内每一件配件的**外接半径**必须恒定 —— 那是 use_scale_*=False 真的生效的证据。
+       ⚠️ 这里刻意不量投影 px：投影随缩放**和朝向**两者变，量它等于假设附着骨不转（帽子碰巧成，
+       手骨在 idle 里摆 2.3° 就把一条完全健康的旗子判成"骨缩放漏进配件"，2026-11-09 现量判别见
+       `scratch/gate2_cause_2026-11-09.py`）。外接半径只随缩放变，正是这条门禁想读的那一件事。
+    ③ **量级**门禁：那个恒定尺寸必须落在"定标公式 × 参照宽"推算出来的像素附近（**逐件**比，
+       两件并在一起的跨度是"两只靴子之间的距离"，跟任何一份定标公式都无关 ⇒ 拿它比必然假红）。
 
-    ③ 是这一轮新加的，因为 ①② 都被实测证伪过其充分性：inverse_matrix 把缩放平方成
+    ③ 是那一轮加进来的，因为 ①② 都被实测证伪过其充分性：inverse_matrix 把缩放平方成
     0.00026（要 0.0162，62× 太小）时，① 的位移仍然精确等于 0.050、② 的峰峰仍然 0.000
     —— **关系检查对"标定错了"天然盲**，只有拿一个绝对期望值去比才抓得住。
     """
-    pb = armature.pose.bones[ctx["bone"]]
-    before = outfit_point(ctx)
-    # 顺带记一份"看得见的头"在骨动之前的高度，用于下面那条 rig 事实（头顶顶点归谁管）
-    crown_before = crown_top(meshes, ctx["head_region"]["pinch_z"])
     shift = armature.matrix_world.inverted() @ Matrix.Translation((0.0, 0.0, 0.05)) @ armature.matrix_world
-    pb.matrix = shift @ pb.matrix
-    update_depsgraph()
-    after = outfit_point(ctx)
-    crown_after = crown_top(meshes, ctx["head_region"]["pinch_z"])
-    reset_bones(armature, base)
-    delta = after - before
-    if delta.length < 0.04 or abs(delta.z - 0.05) > 1e-3:
-        sys.exit(
-            "配件没跟着 head 骨走：期望位移 (0,0,0.050)，实测 (%+.4f,%+.4f,%+.4f)（|d|=%.4f）\n"
-            "  ⇒ CHILD_OF 的 target/subtarget/inverse_matrix 有一条是摆设，挂点读数全部不可信"
-            % (*delta, delta.length)
-        )
-    print(
-        "BAKE 附着自检：头骨平移 +0.050 ⇒ 配件挂点位移 (%+.4f,%+.4f,%+.4f) ⇒ 真的接上了；"
-        "而颅顶网格只动 %.4f ⇒ %s"
-        % (
-            *delta,
-            abs(crown_after - crown_before),
-            "骨驱动的是可见的头"
-            if abs(crown_after - crown_before) > 0.04
-            else "这根骨**不驱动可见的头**（蒙皮权重在别处），所以它的位置/长度都不能当定标参照 ⇒ 参照必须是网格几何",
-        )
-    )
+    for k, inst in enumerate(ctx["instances"]):
+        before = [outfit_point(ctx, i) for i in range(len(ctx["instances"]))]
+        # 顺带记一份"看得见的头"在骨动之前的高度，用于下面那条 rig 事实（头顶顶点归谁管）
+        crown_before = region_top(meshes, ctx)
+        armature.pose.bones[inst["bone"]].matrix = shift @ armature.pose.bones[inst["bone"]].matrix
+        update_depsgraph()
+        after = [outfit_point(ctx, i) for i in range(len(ctx["instances"]))]
+        crown_after = region_top(meshes, ctx)
+        reset_bones(armature, base)
+        for i, (b0, a0) in enumerate(zip(before, after)):
+            delta = a0 - b0
+            want = 0.05 if i == k else 0.0
+            # "别的实例纹丝不动"这一档**必须自己红**：原先那条只看"被扰动的那件动不动"，
+            # 于是两件绑同一根骨（都动 0.05）在旧口径下是满分通过。
+            bad = (delta.length < 0.04 or abs(delta.z - 0.05) > 1e-3) if i == k else (delta.length > 1e-4)
+            if bad:
+                why = (
+                    "该动的没动 ⇒ CHILD_OF 的 target/subtarget/inverse_matrix 有一条是摆设，或绑错了骨"
+                    if i == k
+                    else "**不该动的动了 ⇒ 两件绑在同一根骨上，镜像那件事根本没发生**"
+                )
+                sys.exit(
+                    "扰动 %s 骨（+0.050 世界 Z）⇒ 第 %d 件（绑在 %s）实测位移 (%+.4f,%+.4f,%+.4f)，"
+                    "期望 %.3f ⇒ %s"
+                    % (inst["bone"], i, ctx["instances"][i]["bone"], *delta, delta.length, want, why)
+                )
+            if i == k:
+                print(
+                    "BAKE 附着自检：扰动 %s 骨 +0.050 ⇒ 该件挂点位移 (%+.4f,%+.4f,%+.4f) ⇒ 真的接上了；"
+                    "而参照网格只动 %.4f ⇒ %s"
+                    % (
+                        inst["bone"],
+                        *delta,
+                        abs(crown_after - crown_before),
+                        region_drive_note(ctx, abs(crown_after - crown_before)),
+                    )
+                )
+            else:
+                print(
+                    "BAKE 镜像逐实例自检：扰动 %s 骨时，另一件（%s）位移 %.6f ⇒ 没跟着动，两件各绑一根骨"
+                    % (inst["bone"], ctx["instances"][i]["bone"], delta.length)
+                )
 
-    # ② 尺寸恒定：正交相机下刚体的投影尺寸只随缩放变，所以这一条量的就是"有没有漏进骨缩放"
+    # ② 尺寸恒定：这条要抓的**只有**"骨缩放漏进配件"（胸腔一呼吸就把帽子吹大 ±3.75%）。
+    # ⚠️ 判据量的是**外接半径**而不是投影 px：投影同时随缩放**和朝向**变，拿它当判据等于隐含
+    # "配件朝向恒定"这个前提 —— 头骨在 idle 里几乎不转，帽子那一支实测峰峰 0.000px，前提是**碰巧**成立；
+    # 手骨在 idle 里摆 2.3°，flag × bear 三档 --outfit-scale 的 峰峰/尺寸 恒为 2.02%（0.511/25.29、
+    # 0.918/45.46、1.377/68.19），而那个比值**缩放漏和转动都造得出** ⇒ 只能现量判别
+    # （`scratch/gate2_cause_2026-11-09.py`）：matrix 缩放逐帧 0.900000、外接半径逐帧 0.706137，
+    # 而杆（glTF 导入后是局部 Y）离铅垂 0.000°/2.183°/0.000°/2.328° ⇒ 那 2% 是转动，门禁当时在报假红。
+    # 外接半径 = 点到质心的最大距离，刚体下只随缩放变、与朝向完全无关 ⇒ 换成它，病照样抓得住而噪声少四个量级。
+    # ⚠️ 仍要**逐实例量，不能拿两件并在一起的跨度**：并起来读的是"两只靴子之间的距离"，
+    # 它随两条腿的摆动而变 ⇒ 一份完全健康的镜像会被这条判成"骨缩放漏进配件"。
     frames = len(spec["states"]["idle"]["rows"])
     loop = spec["states"]["idle"].get("loop", True)
     place_camera(cam, 0)
-    sizes = []
-    hat = [bpy.data.objects[n] for n in ctx["objects"]]
-    for frame in range(frames):
-        pose("idle", frame, frames, loop)
-        update_depsgraph()
-        co = [world_to_camera_view(bpy.context.scene, cam, p) for ob in hat for p in rigid_points(ob, limit=800)]
-        sizes.append(max((max(c.x for c in co) - min(c.x for c in co)) * cell, (max(c.y for c in co) - min(c.y for c in co)) * cell))
-    spread = max(sizes) - min(sizes)
     limit = 0.5 * cell / 96.0
-    print("BAKE 配件投影尺寸 idle 全帧 %s ⇒ 峰峰 %.3fpx（门禁 ≤%.1fpx，这条量的是骨缩放有没有漏进帽子）" % (" ".join("%.2f" % s for s in sizes), spread, limit))
-    if spread > limit:
-        sys.exit(
-            "配件投影尺寸随 idle 帧变化 %.3fpx —— use_scale_*=False 没生效（胸腔围长 ±3.75%% 传染给帽子）"
-            % spread
+    # 期望值取**水平足迹与投影身高的较大者**，不是只取足迹：`sizes` 量的本来就是投影 x/y 跨度的
+    # 较大那一维，而旗杆这类"高 ≫ 宽"的配件屏幕上占优的是高 ⇒ 只按足迹期望必然假红
+    # （flag × bear 首轮实测 25.3px vs 14.0px，比值正是身高 0.361 × cos15° / 足迹 0.193）。
+    # 帽子与靴子那两支足迹 ≥ 身高，取大者之后与旧值**逐字节相同**，这条改动的形状只对"细长"生效。
+    expect_world = max(ctx["size_ref_world"], ctx["tall_ref_world"])
+    expect = expect_world / cam.data.ortho_scale * cell
+    ref_label, _, ring_label, _, _, _ = slot_labels(ctx["scale_ref"])
+    for k, inst in enumerate(ctx["instances"]):
+        hat = [bpy.data.objects[n] for n in inst["objects"]]
+        sizes = []
+        radius = []
+        for frame in range(frames):
+            pose("idle", frame, frames, loop)
+            update_depsgraph()
+            pts = [p for ob in hat for p in rigid_points(ob, limit=800)]
+            co = [world_to_camera_view(bpy.context.scene, cam, p) for p in pts]
+            sizes.append(max((max(c.x for c in co) - min(c.x for c in co)) * cell, (max(c.y for c in co) - min(c.y for c in co)) * cell))
+            mid = sum(pts, Vector()) / len(pts)
+            radius.append(max((p - mid).length for p in pts))
+        spread = max(sizes) - min(sizes)
+        r_mean = sum(radius) / len(radius)
+        rel = (max(radius) - min(radius)) / r_mean
+        tag = "" if k == 0 else "（镜像件）"
+        print(
+            "BAKE 配件外接半径%s idle 全帧 %s ⇒ 相对峰峰 %.4f%%（门禁 ≤%.2f%%，这条量的才是骨缩放有没有漏进配件）"
+            % (tag, " ".join("%.6f" % r for r in radius), 100 * rel, 100 * OUTFIT_SCALE_LEAK_TOL)
         )
+        print(
+            "BAKE 配件投影尺寸%s idle 全帧 %s ⇒ 峰峰 %.3fpx（≤%.1fpx 这一档**只打印不判红**：投影随缩放和朝向两者变，"
+            "附着骨一转它必然非零）" % (tag, " ".join("%.2f" % s for s in sizes), spread, limit)
+        )
+        if rel > OUTFIT_SCALE_LEAK_TOL:
+            sys.exit(
+                "配件（%s 骨那一件）外接半径随 idle 帧变化 %.4f%%（门禁 ≤%.2f%%）—— use_scale_*=False 没生效"
+                "（胸腔围长 ±3.75%% 传染给配件）；外接半径与朝向无关，所以这一条不再是假红"
+                % (inst["bone"], 100 * rel, 100 * OUTFIT_SCALE_LEAK_TOL)
+            )
 
-    # ③ 量级：正交相机下世界尺寸 → px 就是 (extent / ortho_scale) × cell，期望值由定标公式直接给出
-    # ⚠️ 这条比的是**整组足迹**（sizes 取的是全组投影 x/y 跨度的较大者，期望用的也是整组世界宽度）
-    # ⇒ 它只证明"定标公式接上了"，不证明"帽檐有 1.25 倍头宽"；后者由下面那行打印交人眼判。
-    expect = ctx["size_ref_world"] / cam.data.ortho_scale * cell
-    got = sum(sizes) / len(sizes)
-    if not (0.6 * expect <= got <= 1.6 * expect):
-        sys.exit(
-            "配件投影尺寸 %.1fpx 落在期望 %.1fpx 的 ±60%% 带外（整组世界足迹 %.4f、ortho_scale %.3f、cell %d）\n"
-            "  ⇒ 定标或 CHILD_OF 的缩放档错了；①② 那两条关系检查看不见这种错（62× 太小也照样绿）"
-            % (got, expect, ctx["size_ref_world"], cam.data.ortho_scale, cell)
+        # ③ 量级：正交相机下世界尺寸 → px 就是 (extent / ortho_scale) × cell，期望值由定标公式直接给出
+        # ⚠️ 这条比的是**整组足迹**（sizes 取的是全组投影 x/y 跨度的较大者，期望用的也是整组世界宽度）
+        # ⇒ 它只证明"定标公式接上了"，不证明"帽檐有 1.25 倍头宽"；后者由下面那行打印交人眼判。
+        got = sum(sizes) / len(sizes)
+        if not (0.6 * expect <= got <= 1.6 * expect):
+            sys.exit(
+                "配件（%s 骨那一件）投影尺寸 %.1fpx 落在期望 %.1fpx 的 ±60%% 带外（期望用的那一维 = %.4f 世界单位、"
+                "足迹 %.4f / 投影身高 %.4f、ortho_scale %.3f、cell %d）\n"
+                "  ⇒ 定标或 CHILD_OF 的缩放档错了；①② 那两条关系检查看不见这种错（62× 太小也照样绿）"
+                % (
+                    inst["bone"],
+                    got,
+                    expect,
+                    expect_world,
+                    ctx["size_ref_world"],
+                    ctx["tall_ref_world"],
+                    cam.data.ortho_scale,
+                    cell,
+                )
+            )
+        print(
+            "BAKE 配件尺寸量级%s：实测 %.1fpx vs 期望 %.1fpx（= %.2f 世界单位【%s】 / ortho %.3f × %d）⇒ 在带内；"
+            "其中%s %.1fpx = %.2f × %s %.1fpx"
+            % (
+                tag,
+                got,
+                expect,
+                expect_world,
+                "投影身高" if ctx["tall_ref_world"] > ctx["size_ref_world"] else "整组足迹",
+                cam.data.ortho_scale,
+                cell,
+                ring_label,
+                ctx["ring_world"] / cam.data.ortho_scale * cell,
+                ctx["ring_world"] / ctx["head_region"]["width"],
+                ref_label,
+                ctx["head_region"]["width"] / cam.data.ortho_scale * cell,
+            )
         )
+    reset_bones(armature, base)
+
+
+def check_mirror_residual(armature, ctx, base):
+    """镜像残差门禁：把左件逐顶点按镜面搬过去，和右件的世界位置比，取最大偏差。
+
+    这条量的是**"整只靴子对称"而不只是"挂点对"**：`attach_outfit` 末尾那条漂移自检只看一个点，
+    而 CHILD_OF 的 inverse 是逐物体的矩阵 —— 一件的 inverse 带着一点旋转，挂点照样落在 seat 上、
+    靴筒却歪了。逐顶点比才看得见。取点走 `rigid_points` 那条同一口径（基网格 × **评估后的**世界矩阵，
+    不 `to_mesh()`：靴子那份 28.7 万顶点，重建修改器栈是白烧）。
+    对照关系是**逐索引**的（镜像件由 `mirror_objects` 从同一份 mesh 复制、只搬顶点，顺序逐位相同），
+    所以这里必须按同一个步长取样，不能各抽各的。
+    """
+    if ctx["mirror_refl"] is None:
+        return
+    refl = Matrix(ctx["mirror_refl"])
+    reset_bones(armature, base)
+    update_depsgraph()
+    worst, worst_at, pairs = 0.0, None, 0
+    for name_a, name_b in zip(ctx["instances"][0]["objects"], ctx["instances"][1]["objects"]):
+        ob_a, ob_b = bpy.data.objects[name_a], bpy.data.objects[name_b]
+        va, vb = ob_a.data.vertices, ob_b.data.vertices
+        if len(va) != len(vb):
+            sys.exit(
+                "镜像件 %s 有 %d 个顶点而原件 %s 有 %d 个 ⇒ 逐索引对应关系断了，这条残差门禁失去意义"
+                % (name_b, len(vb), name_a, len(va))
+            )
+        ma, mb = world_of(ob_a), world_of(ob_b)
+        step = max(1, len(va) // 4000)
+        for i in range(0, len(va), step):
+            want = refl @ (ma @ va[i].co)
+            got = mb @ vb[i].co
+            d = (want - got).length
+            if d > worst:
+                worst, worst_at = d, "%s[%d]" % (name_b, i)
+            pairs += 1
+    tol = 1e-3 * max(ctx["size_ref_world"], 1e-9)  # 与 bind/漂移同一条相对带，别在这里再写一遍算式
     print(
-        "BAKE 配件尺寸量级：实测 %.1fpx vs 期望 %.1fpx（= %.2f 世界单位 / ortho %.3f × %d）⇒ 在带内；"
-        "其中帽圈 %.1fpx = %.2f × 头宽 %.1fpx"
+        "BAKE 镜像残差：比了 %d 对顶点（原件 %s ↔ 镜像件 %s）⇒ 最大偏差 %.7f 世界单位（容差 %.7f = 1e-3 × 定标后足迹）%s"
         % (
-            got,
-            expect,
-            ctx["size_ref_world"],
-            cam.data.ortho_scale,
-            cell,
-            ctx["ring_world"] / cam.data.ortho_scale * cell,
-            ctx["ring_world"] / ctx["head_region"]["width"],
-            ctx["head_region"]["width"] / cam.data.ortho_scale * cell,
+            pairs,
+            " ".join(ctx["instances"][0]["objects"]),
+            " ".join(ctx["instances"][1]["objects"]),
+            worst,
+            tol,
+            "⇒ 两只真的互为镜像" if worst <= tol else "（最大在 %s）⇒ **不对**" % worst_at,
         )
     )
-    reset_bones(armature, base)
+    if worst > tol:
+        sys.exit(
+            "镜像残差 %.7f 超容差 %.7f ⇒ 那两只靴子不是同一个东西的镜像（多半是某一件的 "
+            "inverse_matrix 带了点旋转/缩放，而单点挂点自检看不见）" % (worst, tol)
+        )
+
+
+def region_top(meshes, ctx):
+    """把"定标参照那块网格"的世界最高 z 量出来，用来验那根骨到底驱不驱动它。"""
+    if ctx["scale_ref"] == "foot_box":
+        return foot_top(
+            meshes,
+            ctx["head_region"]["crown_z"],
+            ctx["ref_side"],
+            Vector(ctx["ref_axis"]),
+            Vector(ctx["ref_plane"]),
+        )
+    if ctx["scale_ref"] == "hand_bone":
+        return hand_top(meshes, Vector(ctx["ref_center"]), ctx["ref_radius"])
+    return crown_top(meshes, ctx["head_region"]["pinch_z"])
+
+
+def region_drive_note(ctx, moved):
+    """那条 rig 事实的一句话读数：骨动了，可见的参照网格跟了多少 ⇒ 骨能不能当参照物。"""
+    subject = {
+        "foot_box": "该侧脚的网格",
+        "hand_bone": "该侧手的网格",
+    }.get(ctx["scale_ref"], "颅顶网格")
+    return (
+        "骨驱动的是可见的%s" % subject
+        if moved > 0.04
+        else "这根骨**不驱动可见的%s**（蒙皮权重在别处），所以它的位置/长度都不能当定标参照 ⇒ 参照必须是网格几何" % subject
+    )
+
+
+def hand_top(meshes, center, radius):
+    """该手球区内的网格最高点 —— 与 `hand_region` 用同一批点，是"这根骨驱动的是不是这只手"的读数。"""
+    r2 = radius * radius
+    top = -1e9
+    for ob in meshes:
+        for p in evaluated_points(ob, limit=1500):
+            if (p - center).length_squared <= r2:
+                top = max(top, p.z)
+    return top
+
+
+def foot_top(meshes, ankle_z, side, axis, plane_pt):
+    """该侧、踝以下的网格最高点 —— 与 `foot_region` 用同一批点，是"这根骨驱动的是不是这只脚"的读数。"""
+    top = -1e9
+    for ob in meshes:
+        for p in evaluated_points(ob, limit=1500):
+            if p.z <= ankle_z + 1e-6 and (p - plane_pt).dot(axis) * side > 0.0:
+                top = max(top, p.z)
+    return top
 
 
 def crown_top(meshes, pinch_z):
@@ -1043,6 +1926,132 @@ def hide_carrier(meshes):
     return [ob.name for ob in meshes]
 
 
+# 遮挡那一趟给配件挂的临时颜色。选品红不是审美：判据读的是"R、B 都明显高于 G"这个**关系**，
+# 它对 view transform 的具体曲线不敏感（AgX/Filmic 会把高饱和往灰里拉，但拉的幅度对 R/B 对称、
+# 对 G 不对称 ⇒ 关系保留），而载体自然色里没有一个落在这个锥形里（白/灰：R+B 追不上 2.4G；
+# 红：B 太小；蓝：R 太小）。第一次在新模型上开这一档时看那行 `遮罩判据实测` 读数，别看直觉。
+OCC_MASK_EMISSION = (1.0, 0.0, 1.0)
+
+
+def occ_front(r, g, b):
+    """遮罩那一趟里"这个像素最前面是配件吗"。"""
+    return min(r, b) > 0.55 * max(r, b) and (r + b) > 2.4 * g + 0.06
+
+
+def occ_mask_material():
+    mat = bpy.data.materials.get("OPET_OCC_MASK")
+    if mat is None:
+        mat = bpy.data.materials.new("OPET_OCC_MASK")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    em = nt.nodes.new("ShaderNodeEmission")
+    em.inputs["Color"].default_value = (OCC_MASK_EMISSION[0], OCC_MASK_EMISSION[1], OCC_MASK_EMISSION[2], 1.0)
+    em.inputs["Strength"].default_value = 1.0
+    nt.links.new(em.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
+def paint_occ_mask(hat):
+    """整组配件（含镜像那件）的材质槽临时换成品红自发光，返回"网格名 → 原材质表"用于逐格还原。
+
+    按**网格**存而不是按物体：镜像件是从原件 `copy()` 来的，而 `copy()` 复制的是物体不是 mesh 数据块
+    ⇒ 两件共用一份 `materials` 列表，按物体存会在还原时把同一份列表填两遍。
+    """
+    mat = occ_mask_material()
+    saved = {}
+    for ob in hat:
+        me = ob.data
+        if me.name in saved:
+            continue
+        saved[me.name] = list(me.materials)
+        me.materials.clear()
+        me.materials.append(mat)
+    return saved
+
+
+def wipe_occ_paint(saved):
+    for name, mats in saved.items():
+        me = bpy.data.meshes.get(name)
+        if me is None:
+            continue
+        me.materials.clear()
+        for m in mats:
+            me.materials.append(m)
+
+
+def apply_outfit_occlusion(path, mask_path, hat, meshes, totals):
+    """把这一格配件里**被载体挡在身后**的像素抹掉（就地改写 `path` 那张 PNG 的 alpha）。
+
+    只在 `--outfit-only` 下调用：那时载体是被 `hide_render` 藏着的，这一趟临时把它放回来、渲完再藏回去。
+    为什么能这么换：`hide_render` 只管成片里画不画，不动几何也不动姿态（见 `hide_carrier`），
+    而遮罩要的正是"同一台相机、同一批姿态下，谁在最前面"。
+    """
+    scene = bpy.context.scene
+    for ob in meshes:
+        ob.hide_render = False
+    saved = paint_occ_mask(hat)
+    eevee = getattr(scene, "eevee", None)
+    keep_spp = getattr(eevee, "taa_render_samples", None) if eevee is not None else None
+    if eevee is not None and hasattr(eevee, "taa_render_samples"):
+        # 遮罩要的是边界清楚，不是画面好看：1 采样既省掉一半以上的时间，也不给判据留半透明的边
+        eevee.taa_render_samples = 1
+    keep_path = scene.render.filepath
+    scene.render.filepath = mask_path
+    try:
+        bpy.ops.render.render(write_still=True)
+    finally:
+        scene.render.filepath = keep_path
+        wipe_occ_paint(saved)
+        for ob in meshes:
+            ob.hide_render = True
+        if eevee is not None and keep_spp is not None:
+            eevee.taa_render_samples = keep_spp
+
+    prod = bpy.data.images.load(path, check_existing=False)
+    mask = bpy.data.images.load(mask_path, check_existing=False)
+    try:
+        w, h = prod.size[0], prod.size[1]
+        if (mask.size[0], mask.size[1]) != (w, h):
+            sys.exit("BAKE 遮挡：遮罩图 %dx%d 与成品 %dx%d 不同尺寸 ⇒ 两趟不是同一个渲染设置" % (mask.size[0], mask.size[1], w, h))
+        pp = list(prod.pixels[:])
+        mp = mask.pixels[:]
+        kept = erased = 0
+        rg_sum = [0.0, 0.0, 0.0]
+        for i in range(w * h):
+            if pp[i * 4 + 3] <= 0.5:
+                continue
+            o = i * 4
+            if mp[o + 3] > 0.5 and not occ_front(mp[o], mp[o + 1], mp[o + 2]):
+                pp[o + 3] = 0.0
+                erased += 1
+            else:
+                kept += 1
+                rg_sum[0] += mp[o]
+                rg_sum[1] += mp[o + 1]
+                rg_sum[2] += mp[o + 2]
+        # kept==0 在这一格**未必是病**：位移小的那一档里旗在侧身整格躲到载体身后，正确的遮挡产物
+        # 就是全透明。上一版把它当场 sys.exit，于是探针梯被自己的门禁打断，而它要的恰恰是这个数。
+        # 真病是"整批一件都没留下"（材质没挂上 / 品红被 view transform 拉出锥形），那由批末那条
+        # 汇总判据负责，且那批的 empty 计数会等于 cells，读数一样清楚。
+        if kept == 0 and erased:
+            totals["empty"].append(path)
+        prod.pixels[:] = pp
+        prod.filepath_raw = path
+        prod.file_format = "PNG"
+        prod.save()
+    finally:
+        bpy.data.images.remove(mask)
+        bpy.data.images.remove(prod)
+    totals["cells"] += 1
+    totals["kept"] += kept
+    totals["erased"] += erased
+    if kept:
+        totals["rgb"] = [c + s / kept for c, s in zip(totals["rgb"], rg_sum)]
+    return kept, erased
+
+
 def check_hat_only_in_pixels(path, cam, cell, ctx):
     """`--outfit-only` 那一档的像素自检，判的是**另一件事**，所以不能沿用上面那条。
 
@@ -1114,7 +2123,22 @@ OUTFIT_RESTORE_DEFAULTS = {
     "outfit_tilt": 0.0,
     "outfit_seat": OUTFIT_SEAT,
     "outfit_subsurf": -1,
+    # 这三条是"靴子那一支"新加的开关，而它们直接决定像素：绑到 foot_l 还是 head、烘不烘第二件、
+    # 按头宽还是按脚尺寸定标 ⇒ 少记一条，测量轮就会拿帽子的几何去量靴子那批图（同族缺口见上面注释）。
+    # 默认值必须与 parse_args 逐字相同（"命令行没给"唯一的判据就是"当前值 == 默认值"）。
+    "outfit_attach_role": "head",
+    "outfit_mirror_to": "",
+    "outfit_scale_ref": "head_width",
+    # 这两条同样直接改像素，而且是 boot 这一支被眼判否之后才补的：**平移**决定筒套不套在腿上、
+    # **单轴压高**决定靴筒到哪 ⇒ 漏记一条就会拿"没挪、没压"的几何去量挪过、压过的那批图。
+    "outfit_offset": "",
+    "outfit_scale_z": 1.0,
 }
+
+
+def _kv_text(key, value):
+    """参数还原那两行打印的统一格式：数值键 %g，字符串键原样（`--outfit-attach-role` 是字符串）。"""
+    return "%s=%s" % (key, ("%g" % value) if isinstance(value, (int, float)) else value)
 
 
 def restore_from_meta(args):
@@ -1174,10 +2198,10 @@ def restore_from_meta(args):
                 continue
             if getattr(args, key) != default:
                 if getattr(args, key) != meta[key]:
-                    clash.append("%s：命令行 %g vs 记录 %g" % (key, getattr(args, key), meta[key]))
+                    clash.append("%s：命令行 %s vs 记录 %s" % (key, getattr(args, key), meta[key]))
                 continue
             setattr(args, key, meta[key])
-            from_meta.append("%s=%g" % (key, meta[key]))
+            from_meta.append(_kv_text(key, meta[key]))
         if clash:
             sys.exit(
                 "测量轮的配件参数与产出那批像素的记录不符：\n  %s\n"
@@ -1241,14 +2265,31 @@ def measure_outfit(args, cam, cell, spec, states, columns, pose, armature, roles
     data = {
         "comment": "挂点坐标的唯一事实源：由 tools/bake.py --outfit-measure-only 投影量出，不许手改。",
         "attach_bone": {"head": roles["head"], "neck": neck},
+        # 镜像那一支有第二件、第二根骨 ⇒ 每件各自是谁绑的、期望挂点在哪，都得有出处（逐实例那条门禁读它）
+        "instances": [
+            {
+                "role": inst["role"],
+                "bone": inst["bone"],
+                "objects": inst["objects"],
+                "expect_world": [round(v, 5) for v in inst["expect"]],
+            }
+            for inst in ctx["instances"]
+        ],
         "objects": ctx["objects"],
         "scale": ctx["scale"],
+        "scale_z": ctx["scale_z"],
+        "offset": ctx["offset"],
         "rot_z": ctx["rot_z"],
         "tilt": ctx["tilt"],
         "seat_fraction": ctx["seat"],
         # 帽檐落座的世界点：只有 fraction 的话，别人拿到这份 json 还要先复算 head_region 才知道帽在哪
         "seat_world": [round(v, 5) for v in ctx["anchor_world0"]],
-        "size_ratio": OUTFIT_SIZE_RATIO,
+        # 存**这次真的用了的那个系数**，不存模块常数：head_width 与 foot_box 两条公式系数不同，
+        # 写死 OUTFIT_SIZE_RATIO 会让靴子那份 json 自称按头宽定过标。
+        "size_ratio": ctx["size_ratio"],
+        "scale_ref": ctx["scale_ref"],
+        "attach_role": ctx["attach_role"],
+        "mirror_role": ctx["mirror_role"],
         "bone_len": round(ctx["bone_len"], 5),
         # 定标的参照物是网格量出来的头区，不是骨 ⇒ 这几条数是"帽子为什么这么大、落在哪"的唯一出处
         "head_region": {k: (round(v, 5) if isinstance(v, float) else v) for k, v in ctx["head_region"].items()},
@@ -1260,9 +2301,10 @@ def measure_outfit(args, cam, cell, spec, states, columns, pose, armature, roles
         "ring_object": ctx["ring_object"],
         "ring_width": round(ctx["ring_width"], 5),
         "size_ref_world": round(ctx["size_ref_world"], 5),
+        "tall_ref_world": round(ctx["tall_ref_world"], 5),
         "ring_world": round(ctx["ring_world"], 5),
         "ring_to_head_width": round(ctx["ring_world"] / ctx["head_region"]["width"], 4),
-        "anchor_local": [round(v, 5) for v in ctx["anchor_local"]],
+        "anchor_local": [round(v, 5) for v in ctx["instances"][0]["anchor_local"]],
         # meta 只记 --bones 覆盖值 ⇒ 完整角色表落在这里，"挂在哪根骨"这件事才有出处
         "bones": dict(sorted(roles.items())),
         "cell": cell,
@@ -1281,10 +2323,14 @@ def measure_outfit(args, cam, cell, spec, states, columns, pose, armature, roles
         frames = len(track["rows"])
         loop = track.get("loop", True)
         head_rows, neck_rows = [], []
+        # 逐实例各记一条（形状与 head_rows 同为 帧×列）：靴子那两件绑的是两根不同的骨，
+        # 而"两件的读数逐位相同"本身就是绑错骨的证据 ⇒ 不能只记第一件
+        extra_rows = [[] for _ in ctx["instances"][1:]]
         for frame in range(frames):
             pose(state, frame, frames, loop)
             update_depsgraph()
             col_head, col_neck = [], []
+            col_extra = [[] for _ in extra_rows]
             for index in columns:
                 place_camera(cam, index)
                 col_head.append(px(outfit_point(ctx)))
@@ -1293,8 +2339,12 @@ def measure_outfit(args, cam, cell, spec, states, columns, pose, armature, roles
                     if neck
                     else None
                 )
+                for k, rows in enumerate(col_extra):
+                    rows.append(px(outfit_point(ctx, k + 1)))
             head_rows.append(col_head)
             neck_rows.append(col_neck)
+            for rows, col in zip(extra_rows, col_extra):
+                rows.append(col)
         # 逐列的抖动量：把帽点在这一行所有帧里走过的包围盒对角线打出来（--plant-feet 会把它抬高）
         spread = []
         for i in range(len(columns)):
@@ -1308,10 +2358,20 @@ def measure_outfit(args, cam, cell, spec, states, columns, pose, armature, roles
             "neck": neck_rows,
             "spread_px": spread,
         }
+        for k, rows in enumerate(extra_rows):
+            data["states"][state]["instance_%d" % (k + 1)] = rows
     anchor_state = "idle" if "idle" in data["states"] else states[0]
     data["anchor_from"] = [anchor_state, 0, columns[0]]
-    data["anchor"]["head"] = data["states"][anchor_state]["head"][0][0]
+    # 键名 = 这份配件真的占的那个 slot（`--outfit-attach-role foot_l` 量出来的点写进 "head"
+    # 就是一份自称帽点的靴子读数，而 pack.py 会照原样写进本体清单的 outfit_anchors）。
+    anchor_slot = {
+        "foot_box": "feet",
+        "hand_bone": "hand",
+    }.get(ctx["scale_ref"], "head")
+    data["anchor"][anchor_slot] = data["states"][anchor_state]["head"][0][0]
     data["anchor"]["neck"] = data["states"][anchor_state]["neck"][0][0]
+    if extra_rows:
+        data["anchor"][anchor_slot + "_2"] = data["states"][anchor_state]["instance_1"][0][0]
     reset_bones(armature, base)
 
     out_path = os.path.join(args.out, "outfit.json")
@@ -1319,13 +2379,27 @@ def measure_outfit(args, cam, cell, spec, states, columns, pose, armature, roles
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=1, sort_keys=True)
     total = sum(len(v["head"]) * len(columns) for v in data["states"].values())
-    print(
-        "BAKE 挂点测量：head=[%s, %s] neck=[%s, %s]（%s 第 0 帧第 %d 列）⇒ 写了 %s，共 %d 个读数 × 2 slot"
-        % (*data["anchor"]["head"], *data["anchor"]["neck"], anchor_state, columns[0], out_path, total)
+    inst_note = "" if not extra_rows else " + 镜像件 [%s]" % ", ".join(
+        "%.1f" % v for v in data["anchor"][anchor_slot + "_2"]
     )
     print(
-        "BAKE 仍无事实源的 slot：face / back / hand 都是 null —— 这份 rig 没有手腕骨角色"
-        "（BONE_ROLES 只有 arm/forearm），也没有脸部和背部的几何来源，不硬写。"
+        "BAKE 挂点测量：%s=[%s, %s]%s neck=[%s, %s]（%s 第 0 帧第 %d 列）⇒ 写了 %s，共 %d 个读数 × %d 件"
+        % (
+            anchor_slot,
+            *data["anchor"][anchor_slot],
+            inst_note,
+            *data["anchor"]["neck"],
+            anchor_state,
+            columns[0],
+            out_path,
+            total,
+            1 + len(extra_rows),
+        )
+    )
+    missing = [s for s, v in sorted(data["anchor"].items()) if v is None]
+    print(
+        "BAKE 仍无事实源的 slot：%s —— 这份 rig 没有手腕骨角色（BONE_ROLES 只有 arm/forearm），"
+        "也没有那些部位的几何来源，不硬写。" % (" / ".join(missing) or "（无）")
     )
     return data
 
@@ -1474,6 +2548,13 @@ BONE_ROLES = {
     "arm_r": ("RightArm", "ArmR", "ShoulderR"),
     "forearm_l": ("LeftForeArm", "ForeArmL", "LeftArmLower"),
     "forearm_r": ("RightForeArm", "ForeArmR", "RightArmLower"),
+    # 手上那一档（旗子 / 拳套）的挂点。⚠️ 这四档**没有任何一支动作读它们**（STATE_BONE_NEEDS 里没有
+    # hand_*，apply_bone_pose / apply_bone_action 也不点名手骨）⇒ 加进来对已签收的十份本体像素逐字节
+    # 无影响；唯一可见的差别是 meta.json 的 `bones` 字典多出两行、以及"角色没对上"那行少列两项。
+    # 手指骨（LeftHandIndex1…4 / Thumb / Middle / Ring / Pinky）故意不进候选表：配件要挂在手掌根，
+    # 指骨一根 0.008 世界单位，拿它当参照物就是拿噪声定标。
+    "hand_l": ("LeftHand", "HandL", "LeftWrist", "LeftPaw"),
+    "hand_r": ("RightHand", "HandR", "RightWrist", "RightPaw"),
     "leg_l": ("LeftUpLeg", "UpLegL", "LeftThigh"),
     "leg_r": ("RightUpLeg", "UpLegR", "RightThigh"),
     "shin_l": ("LeftLeg", "ShinL", "LeftCalf"),
@@ -2392,6 +3473,11 @@ def main():
         # 而那正是 `--cell` 那条假开关的形状（存在 ≠ 能用）。拒绝比沉默便宜。
         sys.exit("--outfit-only 必须和 --outfit 一起用：它改的是「画面里留不留载体」，"
                  "没有配件就没有可留之物")
+    if args.outfit_occlusion and not args.outfit_only:
+        # 同一条理由第二次用：这一档改的是"配件图集里哪些像素留不留"，
+        # 而载体本来就在画面里时那张图集不是配件图集，抹它没有意义（静默 no-op = 假开关）。
+        sys.exit("--outfit-occlusion 必须和 --outfit --outfit-only 一起用：它抹的是**配件图集**里被载体挡住的像素，"
+                 "不带 --outfit-only 时载体就在画面里，那一趟遮罩什么都改不了")
     recorded = restore_from_meta(args) if args.outfit_measure_only else None
     spec = load_fixture()
     cell = args.cell or spec["grid"]["w"]
@@ -2568,7 +3654,7 @@ def main():
                      "所以'只渲配件'在那条路径上没有任何作用 ⇒ 两个一起给就是静默吞掉一个开关。"
                      "要挂点就单给 --outfit-measure-only，要配件图集就单给 --outfit-only")
         if not args.model:
-            sys.exit("--outfit 必须和 --model 一起用：配件要刚性附着到 head 骨上，"
+            sys.exit("--outfit 必须和 --model 一起用：配件要刚性附着到 --outfit-attach-role 那根骨上（默认 head），"
                      "而程序化占位小白没有骨架（它那些 head/ear 是物体不是骨）")
         if base is None:
             sys.exit("--outfit 走的是参数化骨骼那条路径 ⇒ 带 --action-map 时没有 roles/base 可附着")
@@ -2581,6 +3667,7 @@ def main():
         set_outfit_subsurf(hat, args.outfit_subsurf)
         outfit_ctx = attach_outfit(armature, roles, hat, meshes, args, base)
         check_attach(armature, roles, outfit_ctx, base, cam, cell, spec, pose, meshes)
+        check_mirror_residual(armature, outfit_ctx, base)  # 没给 --outfit-mirror-to 时它自己早退
         # check_attach 里跑过 idle 若干帧 ⇒ 贴地锁定把 armature.location.z 留在了最后一帧的补偿量上。
         # 测量必须从"什么都没动"开始，否则 rest 那一档的挂点读数会带上上一帧的抬升。
         armature.location.z = home_z
@@ -2672,6 +3759,13 @@ def main():
     ax, ay = feet_anchor_px(cam, cell)
     print("BAKE anchor.feet = [%s, %s]（cell=%d, ortho_scale=%.2f, view_transform=%s）" % (ax, ay, cell, ORTHO_SCALE, used_transform))
 
+    occ_mask_path = os.path.join(args.out, "occ_mask.png")
+    occ_totals = {"cells": 0, "kept": 0, "erased": 0, "rgb": [0.0, 0.0, 0.0], "empty": []}
+    if args.outfit_occlusion:
+        print(
+            "BAKE --outfit-occlusion：每格多渲一趟『载体 + 品红配件』当遮罩（载体临时 hide_render=False，"
+            "渲完藏回去；配件材质临时换掉，渲完还原；这一趟 taa=1 要的是边界不是好看）⇒ 成本约 ×2"
+        )
     baked, skipped = 0, 0
     for state in states:
         track = spec["states"][state]
@@ -2701,6 +3795,43 @@ def main():
                         check_hat_only_in_pixels(path, cam, cell, outfit_ctx)
                     else:
                         check_hat_in_pixels(path, cam, cell, outfit_ctx, meshes)
+                if args.outfit_occlusion:
+                    apply_outfit_occlusion(path, occ_mask_path, [bpy.data.objects[n] for n in outfit_ctx["objects"]], meshes, occ_totals)
+
+    if args.outfit_occlusion:
+        if skipped:
+            # 半批遮罩比整批没遮罩更坏：同一份图集里有些格挡过、有些没挡，而产物面读不出这件事
+            sys.exit(
+                "BAKE --outfit-occlusion：%d 格因为帧已存在而被跳过（没走遮挡那一趟）⇒ 这批图集会混着"
+                "'挡过的'与'没挡过的'两种格。带 --force 重跑整批" % skipped
+            )
+        n = max(occ_totals["cells"], 1)
+        r, g, b = (c / n for c in occ_totals["rgb"])
+        if occ_totals["kept"] == 0 and occ_totals["erased"]:
+            sys.exit(
+                "BAKE 遮挡：%d 格配件像素，遮罩那一趟里**整批一个像素都没留下** ⇒ 这才是真病"
+                "（临时材质没挂上，或这台机器的 view transform 把品红拉出了 `occ_front` 的锥形：R、B 都高于 G）。"
+                "逐格为零不判红，因为位移小的档位里'配件整格躲到载体身后'是正确结果，而它正是档位梯要量的数"
+                % occ_totals["erased"]
+            )
+        print(
+            "BAKE 遮挡汇总：%d 格，保留 %d px、抹掉 %d px（= 全部配件像素的 %.1f%%）；"
+            "遮罩判据实测：被认成'配件在最前'的像素平均 RGB = %.3f/%.3f/%.3f（品红应当 R≈B≫G，"
+            "若这个关系不成立说明这台机器的 view transform 把品红拉出了 `occ_front` 的锥形）\n"
+            "BAKE 遮挡档位读数：配件被整格挡没的格数 = %d/%d%s"
+            % (
+                occ_totals["cells"],
+                occ_totals["kept"],
+                occ_totals["erased"],
+                100.0 * occ_totals["erased"] / max(occ_totals["kept"] + occ_totals["erased"], 1),
+                r,
+                g,
+                b,
+                len(occ_totals["empty"]),
+                occ_totals["cells"],
+                ("，前几个 = " + " ".join(os.path.relpath(p, args.out) for p in occ_totals["empty"][:4])) if occ_totals["empty"] else "",
+            )
+        )
 
     meta = {
         "cell": {"w": cell, "h": cell},
@@ -2727,6 +3858,16 @@ def main():
     if args.outfit:
         # 像素里画了帽子的批次必须写明，否则以后没人知道这批图不是"裸宠"
         meta["outfit"] = args.outfit
+        if args.outfit_occlusion:
+            # 一句出处：这批图集里"被身体挡住的那部分配件像素"是被抹掉的，不是没烘出来。
+            # 它不进参数还原（遮挡不改几何、也不改相机），但没有它的话，以后看到"侧身那一格
+            # 手套只剩一只"会先怀疑挂点，而正确答案是"那是遮挡"。
+            meta["outfit_occlusion"] = True
+            # 整格挡没的格名也留档：产物面读到"run/f00_06 那一格配件是全透明"时，唯一能把它和
+            # "挂点漂了 / 那格没烘"分开的就是这张名单（批末那条读数只打进 stdout，而 scratch 会被清）
+            meta["outfit_occlusion_empty"] = [
+                os.path.relpath(p, args.out) for p in occ_totals["empty"]
+            ]
         meta["outfit_objects"] = [n for n in (args.outfit_objects or "").split(",") if n.strip()]
         meta["outfit_scale"] = outfit_ctx["scale"]
         # 这四个都直接改像素，而`--outfit-scale`之外那三个原先没人记 ⇒ 一批"@192 带帽、倾 25°"的图
@@ -2734,6 +3875,17 @@ def main():
         # 的出处只有这一份 ⇒ 补在这里。
         for k in ("rot_z", "tilt", "seat"):
             meta["outfit_" + k] = outfit_ctx[k]
+        # 这三条决定"这批像素上配件绑在哪根骨、有几件、按什么定标"，而 `--outfit-only` 的产物
+        # 只有这一份出处（outfit.json 仅测量轮写）⇒ 不记就等于以后没法解释"两只靴子从哪来"。
+        meta["outfit_attach_role"] = outfit_ctx["attach_role"]
+        meta["outfit_mirror_to"] = outfit_ctx["mirror_role"]
+        meta["outfit_scale_ref"] = outfit_ctx["scale_ref"]
+        # 平移和定标一样直接改像素（靴筒压在小腿上是这个数、不是缩放），而它同样只在 meta 里有出处
+        meta["outfit_offset"] = outfit_ctx["offset"]
+        meta["outfit_scale_z"] = outfit_ctx["scale_z"]
+        meta["outfit_instances"] = [
+            {"bone": i["bone"], "role": i["role"], "objects": i["objects"]} for i in outfit_ctx["instances"]
+        ]
         meta["outfit_subsurf"] = args.outfit_subsurf
         # 这一批是"配件图集"还是"带帽的宠物"，只有这两个数分得开，而它俩渲出来的像素在肉眼看来
         # 是同一类东西（都有帽）。不记 ⇒ 以后没人知道这张 sheet 该单独叠还是直接上屏。

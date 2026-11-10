@@ -9,16 +9,38 @@
 //! 会让已经存在的用户库和代码对不上，而 SQLite **不会**告诉你它对不上。
 
 /// 当前代码期待的 schema 版本。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 建库 SQL（设计书 §3.4 的 12 表 + `profiles`）。
 pub const SCHEMA_V1: &str = include_str!("schema.sql");
 
+/// v1→v2：`accessories.slot` 的 CHECK 加第六值 `'feet'`（靴子 = 一份网格镜像成两件，
+/// 挂在左右脚那对骨上；前五值里没有能诚实表达"脚"的值，`hand` 顶上去就是给以后留一笔假账）。
+///
+/// SQLite **不能** `ALTER TABLE ... DROP/ADD CHECK` ⇒ 只能整表重建再改名。这张表没有
+/// 任何外键指向它、也没有索引/触发器挂在它上面（`grep -n 'accessories' schema.sql` 只有建表
+/// 那一行和 `achievements.kind` 那个字符串枚举），所以重建是安全的：列清单逐列照抄 v1，
+/// `INSERT … SELECT` 显式列出列名（不写 `SELECT *` ⇒ 万一以后 v1 表被加过列，这里会红而不是静默错位）。
+const V1_TO_V2: &str = "
+CREATE TABLE accessories_v2 (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL,
+  slot TEXT NOT NULL CHECK (slot IN ('head','face','neck','back','hand','feet')),
+  rarity TEXT NOT NULL CHECK (rarity IN ('N','R','SR','SSR')),
+  anchor_offset TEXT,
+  z_order INTEGER DEFAULT 10, palette TEXT, manifest_path TEXT NOT NULL
+);
+INSERT INTO accessories_v2 (id, name, slot, rarity, anchor_offset, z_order, palette, manifest_path)
+  SELECT id, name, slot, rarity, anchor_offset, z_order, palette, manifest_path FROM accessories;
+DROP TABLE accessories;
+ALTER TABLE accessories_v2 RENAME TO accessories;
+";
+
 /// `from → to` 的增量迁移。`from` 必须严格等于它在链条里的位置，[`migrate`] 按序应用。
 ///
-/// 现在只有一条链的头，所以这张表是空的——但**空表本身就是文档**：
-/// 加第二个版本的人必须在这里追加，而不是去改 `SCHEMA_V1`。
-pub const MIGRATIONS: &[(i64, &str)] = &[];
+/// ⚠️ 加新版本的人必须在这里追加，而不是去改 `SCHEMA_V1`：那份 SQL 同时是**建库**用的，
+/// 就地改它 = 新库带上 v2 的约束却仍盖章 v1，老库停在 v1 的约束也盖章 v1 ⇒ 同一个版本号
+/// 替两种结构背书，而 SQLite 不会告诉你它对不上。
+pub const MIGRATIONS: &[(i64, &str)] = &[(1, V1_TO_V2)];
 
 pub const KEY_VERSION: &str = "schema_version";
 
@@ -282,10 +304,120 @@ mod tests {
 
     #[test]
     fn migration_table_is_ordered_and_in_range() {
-        // MIGRATIONS 必须是 (0,1),(1,2)... 的连续链，且不超过 SCHEMA_VERSION。
+        // 迁移链必须是 **1,2,…,SCHEMA_VERSION-1** 的连续 `from`，且每个都小于 SCHEMA_VERSION。
+        // ⚠️ 原先这条写的是"从 0 连续排"，那是**空表时的一条假话**（`&[]` 让循环体一次都没跑，
+        // 所以它从来没检查过任何东西）。而 `migrate()` 的循环是 `for from in start..SCHEMA_VERSION`，
+        // 老库最低只能是 v1（v0 = 空库，走 `build_fresh` 而不是迁移）⇒ 键 0 永远不会被查到，
+        // 真按那条写就会把第一条真实迁移判红。
         for (i, (from, _)) in MIGRATIONS.iter().enumerate() {
-            assert_eq!(*from as usize, i, "迁移链必须从 0 连续排");
-            assert!(*from < SCHEMA_VERSION);
+            assert_eq!(*from, (i + 1) as i64, "迁移链必须从 v1 起连续排");
+            assert!(
+                *from < SCHEMA_VERSION,
+                "v{from}→v{} 超出了当前版本",
+                SCHEMA_VERSION
+            );
         }
+        assert_eq!(
+            MIGRATIONS.len(),
+            (SCHEMA_VERSION - 1) as usize,
+            "v1 到 v{SCHEMA_VERSION} 之间每一步都要有迁移，缺一步就是 NoPath 而不是升版"
+        );
+    }
+
+    /// v1 的 `accessories` 表**原样**（五值 CHECK）。这是迁移测试要的"旧形状"，
+    /// 不是第二份现行 schema —— 现行的唯一来源仍是 `schema.sql`。
+    const V1_ACCESSORIES: &str = "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE accessories (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL,
+  slot TEXT NOT NULL CHECK (slot IN ('head','face','neck','back','hand')),
+  rarity TEXT NOT NULL CHECK (rarity IN ('N','R','SR','SSR')),
+  anchor_offset TEXT,
+  z_order INTEGER DEFAULT 10, palette TEXT, manifest_path TEXT NOT NULL
+);";
+
+    fn slot_error(conn: &rusqlite::Connection, slot: &str) -> Option<String> {
+        conn.execute(
+            "INSERT INTO accessories(id, name, slot, rarity, manifest_path) VALUES (?1,'n',?2,'N','m')",
+            rusqlite::params![format!("probe_{slot}"), slot],
+        )
+        .err()
+        .map(|e| e.to_string())
+    }
+
+    /// 升上来的库和新建的库，对同一个 slot 必须给**同一个答案**。
+    /// 这条比"迁移后 CHECK 长什么样"有用：读的是行为，不依赖 sqlite_master 的文本格式。
+    #[test]
+    fn migrated_and_fresh_databases_answer_the_slot_check_identically() {
+        let built = conn();
+        assert_eq!(migrate(&built).unwrap(), SCHEMA_VERSION);
+
+        let up = conn();
+        up.execute_batch(V1_ACCESSORIES).unwrap();
+        up.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, '1')",
+            rusqlite::params![KEY_VERSION],
+        )
+        .unwrap();
+        up.execute(
+            "INSERT INTO accessories(id, name, slot, rarity, manifest_path) VALUES ('bell','帽','head','R','m')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(current_version(&up).unwrap(), Some(1));
+        assert_eq!(migrate(&up).unwrap(), SCHEMA_VERSION);
+
+        assert_eq!(
+            up.query_row("SELECT slot FROM accessories WHERE id = 'bell'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "head",
+            "整表重建必须把老行原样搬过去"
+        );
+
+        // ⚠️ 每个 slot 在每份库里**只插一次**：`slot_error` 用的是确定性的 id（`probe_<slot>`），
+        // 同一个 slot 问两遍会先撞上 PRIMARY KEY 而返回一个和 CHECK 无关的错（本轮实测踩过，
+        // 那条假失败长得就像"升版没生效"）。
+        let answers: Vec<(&str, Option<String>, Option<String>)> =
+            ["head", "face", "neck", "back", "hand", "feet", "wing"]
+                .into_iter()
+                .map(|slot| (slot, slot_error(&up, slot), slot_error(&built, slot)))
+                .collect();
+        let answer = |slot: &str| {
+            answers
+                .iter()
+                .find(|(s, _, _)| *s == slot)
+                .unwrap_or_else(|| panic!("没有问过 {slot}"))
+        };
+
+        for (slot, up_a, built_a) in &answers {
+            assert_eq!(
+                up_a.is_none(),
+                built_a.is_none(),
+                "slot {slot}：升上来的库和新建的库答案不一样"
+            );
+        }
+        for (which, err) in [
+            ("升上来的库", answer("feet").1.as_ref()),
+            ("新建的库", answer("feet").2.as_ref()),
+        ] {
+            assert!(
+                err.is_none(),
+                "v2 之后 {which} 里 'feet' 必须写得进去（升版失败的最坏形状就是它悄悄还是五值）：{:?}",
+                err
+            );
+        }
+        for (which, err) in [
+            ("升上来的库", answer("wing").1.as_ref()),
+            ("新建的库", answer("wing").2.as_ref()),
+        ] {
+            let msg =
+                err.unwrap_or_else(|| panic!("{which}：'wing' 不在六值里，必须被 CHECK 拒掉"));
+            assert!(
+                msg.contains("CHECK"),
+                "{which}：拒绝必须来自 CHECK 而不是别的错（元测试要证明这道门真的在）：{msg}"
+            );
+        }
+        assert_eq!(current_version(&up).unwrap(), Some(SCHEMA_VERSION));
     }
 }

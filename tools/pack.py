@@ -35,9 +35,11 @@ FIXTURE = os.path.join(REPO, "crates", "petcore", "assets", "cat_shiro.pet.json"
 
 FACING_COLUMNS = 8  # manifest.rs 的 FACING_COLUMNS，硬校验
 ALPHA_THRESHOLD = 8  # 与 polygon.json、validate.py 同一口径
-# catalog.rs::Slot 的五个变体（serde(rename_all = "lowercase")）。写第六种挂点在 Rust 侧是
-# 解析失败，而这里先拒能给出"你写了什么、合法的是哪五个"这句话，而不是 serde 的字段错误。
-ACCESSORY_SLOTS = ("head", "face", "neck", "back", "hand")
+# catalog.rs::Slot 的六个变体（serde(rename_all = "lowercase")）。写不存在的挂点在 Rust 侧是
+# 解析失败，而这里先拒能给出"你写了什么、合法的是哪六个"这句话，而不是 serde 的字段错误。
+# ⚠️ 这张表与 `schema.sql` 的 `accessories.slot` CHECK、`catalog.rs::Slot::ALL` 是三处同源，
+# 加第七值必须三处一起动（v2 加 'feet' 那一次就是这三处 + 一条建表迁移）。
+ACCESSORY_SLOTS = ("head", "face", "neck", "back", "hand", "feet")
 
 
 def load_fixture():
@@ -488,7 +490,7 @@ def main():
     ap.add_argument("--frames", default="", help="帧目录（默认 <产物目录>/frames）")
     ap.add_argument("--out", default="", help="产物目录")
     ap.add_argument("--accessory", default="", help="配件 slug；给了它就走配件那一档")
-    ap.add_argument("--slot", default="", help="配件挂点，五值之一: " + " / ".join(ACCESSORY_SLOTS))
+    ap.add_argument("--slot", default="", help="配件挂点，六值之一: " + " / ".join(ACCESSORY_SLOTS))
     ap.add_argument("--body", default="", help="本体 pet.json；配件的行布局与格子全抄它")
     ap.add_argument(
         "--body-frames",
@@ -512,12 +514,12 @@ def main():
             )
         if not args.slot:
             sys.exit(
-                "--accessory %s 缺 --slot ⇒ 合法五值：%s（与 accessories.slot 的 CHECK 同源）"
+                "--accessory %s 缺 --slot ⇒ 合法六值：%s（与 accessories.slot 的 CHECK 同源）"
                 % (args.accessory, " / ".join(ACCESSORY_SLOTS))
             )
         if args.slot not in ACCESSORY_SLOTS:
             sys.exit(
-                "--slot %s 不是合法挂点；合法五值：%s" % (args.slot, " / ".join(ACCESSORY_SLOTS))
+                "--slot %s 不是合法挂点；合法六值：%s" % (args.slot, " / ".join(ACCESSORY_SLOTS))
             )
         if not args.body:
             sys.exit(

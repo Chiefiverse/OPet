@@ -460,9 +460,9 @@ fn clear_equip(gacha: &mut Option<Gacha>, dry_run: bool, slot: &str) -> Result<W
 
 /// `equipped.slot` 里代表**本体**那一行的取值（P5 = 拍板③ 的那个接口槽）。
 ///
-/// 为什么是一个裸字符串而不是 `Slot` 枚举的成员：`Slot` 是**配件的挂点**（`head`/`face`/…五值，
+/// 为什么是一个裸字符串而不是 `Slot` 枚举的成员：`Slot` 是**配件的挂点**（`head`/`face`/…六值，
 /// `accessory.json` 的 `slot` 字段就归它），而本体不挂在任何挂点上 —— 把 `body` 塞进那个枚举会让
-/// "一件配件的槽位是 body"这种组合变得**可以表示**，而它是没有意义的（`schema.sql:61` 那个
+/// "一件配件的槽位是 body"这种组合变得**可以表示**，而它是没有意义的（`schema.sql:65` 那个
 /// `slot` 列**故意没有 CHECK**，正是为这件事留的接口槽；petstore 的
 /// `the_slot_column_accepts_body_by_design` 钉着"写得进去"）。
 ///
@@ -561,7 +561,7 @@ fn plan_body_override(row: Option<&str>, pet_ids: &[String], start_id: &str) -> 
 ///
 /// ⚠️ 明写**不构成**危害的那一条，免得后人把它当成更强的理由：本体行**不会**把帽子挤掉。
 /// `plan_restore` 取的是"第一条过了四道的行"，而本体行在第 1 道（或第 3 道 `slot != 清单声明的
-/// 槽位`，因为 `Slot` 五值里没有 `body`）就被 `continue` 掉了，一次都不占 `wear`。⇒ 这条剥壳
+/// 槽位`，因为 `Slot` 六值里没有 `body`）就被 `continue` 掉了，一次都不占 `wear`。⇒ 这条剥壳
 /// 的全部意义是**不说假话**，不是"少剥就丢装备"。
 ///
 /// 返回 `(本体的 id, 只剩配件的行)`。多于一条 `body` 行 = 手工行或旧版本写的 ⇒ **取首条**，
@@ -603,7 +603,7 @@ struct RestorePlan {
 ///    [`DressView::select`] ⇒ 换装页"许不许穿"与恢复"穿不穿"从头就是同一道判据，不会有
 ///    "换装页看不见而启动却穿上了"那种分裂）。
 /// 3. **这一行记的槽位与清单声明不符** ⇒ 手工行的第二种形状，不穿。槽位的真值在清单
-///    （`Slot` 五值），而 `equipped.slot` 没有 CHECK（FLOW §5 第 2 条），所以只能这样对。
+///    （`Slot` 六值），而 `equipped.slot` 没有 CHECK（FLOW §5 第 2 条），所以只能这样对。
 /// 4. **多于一件**：内存档 M1 只容一件 ⇒ 取第一件，其余只报告、不穿，而**库里那几行原样留着**
 ///    （删掉等于把用户没让我删的东西丢了；哪天容得下多件，它们自己会恢复）。
 ///    "第一件"可重放的前提 = 行序由 `Store::equipped` 的 `ORDER BY slot, item_id` 给。
@@ -6933,7 +6933,10 @@ mod tests {
                 },
                 name: "蓝帽".repeat(1 + i % 4),
                 rarity: Rarity::ALL[i % 4],
-                slot: Slot::ALL.get(i % 5).copied(),
+                // ⚠️ 取模的数由 `Slot::ALL::len()` 给，不写死：写死的那个余数窗口会让新加的挂点
+                // 永远进不了这张"最坏情况"表，而这一屏的量就是靠它兜住的（v2 加 `feet` 时
+                // 原先这里写的是 5 ⇒ 第六值一次都没被排过版）。
+                slot: Slot::ALL.get(i % Slot::ALL.len()).copied(),
                 kind_pet: i % 7 == 3,
                 dup: i as u64,
             })

@@ -50,7 +50,7 @@ impl fmt::Display for ItemKind {
     }
 }
 
-/// `accessories.slot` 的取值（§3.4:418 的 CHECK 五值）。
+/// `accessories.slot` 的取值（§3.4 的 CHECK 六值；v1 只有前五值，`feet` 是 v2 加的）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Slot {
@@ -59,10 +59,20 @@ pub enum Slot {
     Neck,
     Back,
     Hand,
+    Feet,
 }
 
 impl Slot {
-    pub const ALL: [Self; 5] = [Self::Head, Self::Face, Self::Neck, Self::Back, Self::Hand];
+    /// 顺序 = 历史顺序，`feet` 追加在最后：换装页的"换一件"循环按这个下标走，
+    /// 插在中间会把已签收配件的循环序改掉。
+    pub const ALL: [Self; 6] = [
+        Self::Head,
+        Self::Face,
+        Self::Neck,
+        Self::Back,
+        Self::Hand,
+        Self::Feet,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -71,6 +81,7 @@ impl Slot {
             Self::Neck => "neck",
             Self::Back => "back",
             Self::Hand => "hand",
+            Self::Feet => "feet",
         }
     }
 }
@@ -162,7 +173,7 @@ impl Catalog {
                 (ItemKind::Accessory, None) => {
                     return Err(CatalogError::SlotMismatch {
                         id: item.id.clone(),
-                        reason: "配件必须有 slot ∈ head/face/neck/back/hand".into(),
+                        reason: "配件必须有 slot ∈ head/face/neck/back/hand/feet".into(),
                     });
                 }
                 _ => {}
@@ -366,10 +377,10 @@ mod tests {
 
     #[test]
     fn slot_and_kind_strings_match_the_ddl_check_constraints() {
-        // §3.4:418/:423 的 CHECK 值必须是这几个字符串，否则写入即失败。
+        // §3.4 的 CHECK 值必须是这几个字符串，否则写入即失败。
         assert_eq!(
             Slot::ALL.map(|s| s.as_str()),
-            ["head", "face", "neck", "back", "hand"]
+            ["head", "face", "neck", "back", "hand", "feet"]
         );
         assert_eq!(ItemKind::ALL.map(|k| k.as_str()), ["pet", "accessory"]);
     }

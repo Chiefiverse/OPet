@@ -39,7 +39,7 @@ pub struct AccessoryManifest {
     pub slug: String,
     #[serde(default)]
     pub display_name: Option<String>,
-    /// 挂在哪一类部位上，取值与 `accessories.slot` 的 CHECK 五值同源（[`Slot`]）。
+    /// 挂在哪一类部位上，取值与 `accessories.slot` 的 CHECK 六值同源（[`Slot`]）。
     pub slot: Slot,
     /// 为哪些宠物的相机/姿态烘的。空 = 未声明，装备时仍由 [`Self::validate_against`] 把关。
     #[serde(default)]
@@ -484,11 +484,14 @@ mod tests {
 
     #[test]
     fn slot_values_share_the_catalog_enum() {
-        // schema 与 `accessories.slot` 的 CHECK 五值同源 ⇒ 写第六种挂点必须解析失败
-        for good in ["head", "face", "neck", "back", "hand"] {
-            let json = HAT.replace("\"head\"", &format!("\"{good}\""));
+        // 逐 `Slot::ALL` 成员解析，而不是在这里再抄一份字符串表：抄的那份在下一次加值时
+        // 不会报错，只会**静默少测一个**（v2 加 `feet` 正是下一次）。
+        // schema 那一侧的同源断言在 `catalog.rs::slot_and_kind_strings_match_the_ddl_check_constraints`。
+        for good in Slot::ALL {
+            let name = good.as_str();
+            let json = HAT.replace("\"head\"", &format!("\"{name}\""));
             AccessoryManifest::parse(&json)
-                .unwrap_or_else(|e| panic!("slot {good} 必须可解析: {e}"));
+                .unwrap_or_else(|e| panic!("slot {name} 必须可解析: {e}"));
         }
         let json = HAT.replace("\"head\"", "\"tail\"");
         assert!(

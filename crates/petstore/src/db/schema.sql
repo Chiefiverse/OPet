@@ -46,7 +46,11 @@ CREATE TABLE pets (
 );
 CREATE TABLE accessories (
   id TEXT PRIMARY KEY, name TEXT NOT NULL,
-  slot TEXT NOT NULL CHECK (slot IN ('head','face','neck','back','hand')),
+  -- v2 起多了 'feet'（靴子/鞋：一份网格镜像成两件，挂在左右脚那对骨上）。
+  -- ⚠️ 改这一行**必须**同步 `migrate.rs` 的 `MIGRATIONS`：SQLite 改不了已存在表的 CHECK，
+  -- 只改这里 = 新建的库是六值、老库永远停在五值，而 `SCHEMA_V1` 就是这份文件 ⇒ 老库读到的
+  -- 版本号还会替一个它并没有的约束背书（`migrate.rs` 顶部明令禁止的那种形状）。
+  slot TEXT NOT NULL CHECK (slot IN ('head','face','neck','back','hand','feet')),
   rarity TEXT NOT NULL CHECK (rarity IN ('N','R','SR','SSR')),
   anchor_offset TEXT,             -- {"head":[0,-34]}
   z_order INTEGER DEFAULT 10, palette TEXT, manifest_path TEXT NOT NULL
