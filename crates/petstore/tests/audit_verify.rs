@@ -10,8 +10,8 @@
 //! 另外三条走"只吃导出文件"的路径（§6.1 对第三方的承诺：不需要数据库、不需要网络）。
 
 use petcore::gacha::{
-    AuditError, AuditRecord, Catalog, Currency, GachaParams, ItemKind, PullState, Rarity, hex,
-    rng_state_hash, verify_chain, verify_replay,
+    AuditError, AuditRecord, Catalog, Currency, GachaParams, ItemKind, Owned, PullState, Rarity,
+    hex, rng_state_hash, verify_chain, verify_replay,
 };
 use petstore::db::{AUDIT_HEAD_KEY, Store, StoreError};
 use petstore::ledger::derive_state;
@@ -82,7 +82,7 @@ fn export_verifies_without_any_database() {
         petcore::gacha::unhex(&rep.head_hex).unwrap(),
         "导出的链尾与库里的链尾该是同一个值"
     );
-    let replayed = verify_replay(SEED, &p, &cat, &records).unwrap();
+    let replayed = verify_replay(SEED, &p, &cat, &records, &Owned::new()).unwrap();
     assert_eq!(replayed.counts[..], chain.counts[..]);
     assert_eq!(
         replayed.counts[Rarity::SSR.index()] as u32,
@@ -315,7 +315,8 @@ fn a_handed_in_seed_or_params_mismatch_is_caught() {
     let (_d2, mut other) = seeded_store();
     other.reseed(SEED + 1).unwrap();
     let records = s.records(PROFILE, BANNER).unwrap();
-    let err2 = verify_replay(SEED + 1, &p, &cat, &records).expect_err("错 seed 该被拒");
+    let err2 =
+        verify_replay(SEED + 1, &p, &cat, &records, &Owned::new()).expect_err("错 seed 该被拒");
     assert!(
         matches!(err2, AuditError::ReplayMismatch { at: 1, .. }),
         "{err2}"

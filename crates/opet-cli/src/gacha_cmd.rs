@@ -15,8 +15,8 @@ use petcore::gacha::sim::{
     Observed, effective_rates, simulate,
 };
 use petcore::gacha::{
-    Catalog, ChainReport, DEFAULT_RATES_JSON, GachaParams, Rarity, Rates, RatesFile, disclose, hex,
-    verify_chain, verify_chain_anchored, verify_replay,
+    Catalog, ChainReport, DEFAULT_RATES_JSON, GachaParams, Owned, Rarity, Rates, RatesFile,
+    disclose, hex, verify_chain, verify_chain_anchored, verify_replay,
 };
 use petstore::ledger::PullRow;
 use petstore::{DbPath, Store, StoreError};
@@ -99,9 +99,10 @@ fn dispatch_inner(cmd: &str, args: &[String]) -> Cmd {
         "catalog" => catalog(args),
         "pull" => pull(args),
         "redeem" => redeem(args),
+        "starter" => starter(args),
         "audit" => audit(args),
         other => Err(fail(&format!(
-            "未知的 {cmd} 参数: {other}（可用：gacha-sim, catalog, pull, redeem, audit）"
+            "未知的 {cmd} 参数: {other}（可用：gacha-sim, catalog, pull, redeem, starter, audit）"
         ))),
     }
 }
@@ -735,6 +736,35 @@ fn redeem(args: &[String]) -> Cmd {
     Ok(())
 }
 
+/// 开箱赠送（便携测试版）。`--db` 必填：这条路**写库存**，而写默认存档要另一道显式门禁。
+fn starter(args: &[String]) -> Cmd {
+    let f = parse_flags(args).map_err(|e| fail(&e))?;
+    if f.db.is_none() {
+        return Err(fail(
+            "starter 会写库存 ⇒ 必须显式给 --db 绝对路径（缺省那条指向真实存档，由 \
+             --allow-default-archive 单独守）。",
+        ));
+    }
+    let catalog = load_catalog(f.catalog.as_deref()).map_err(|e| fail(&e))?;
+    let mut store = open_store(&f)?;
+    store
+        .install_catalog(&catalog)
+        .map_err(|e| fail(&format!("装目录失败: {e}")))?;
+    let grant = store.grant_starter(&catalog).map_err(store_fail)?;
+    println!(
+        "starter 新增={} 已有={}（赠送不掷骰 ⇒ 不进 gacha_pull，也不进审计链；库存记 obtained_from='starter'）",
+        grant.added.len(),
+        grant.already.len()
+    );
+    for key in &grant.added {
+        println!("  + {key}");
+    }
+    for key in &grant.already {
+        println!("  = {key}（已在库里，count 不动）");
+    }
+    Ok(())
+}
+
 // ---- audit ----
 
 fn audit(args: &[String]) -> Cmd {
@@ -805,7 +835,9 @@ fn verify_export(path: &Path, f: &Flags, params: &GachaParams, catalog: &Catalog
             verify_chain(&records).map_err(|e| fail(&format!("链校验失败: {e}")))?
         }
     };
-    verify_replay(f.seed, params, catalog, &records)
+    // 第三方只有导出文件，没有库 ⇒ 账本外所有权（starter/pack/redeem）无从得知，起点传空集。
+    // 代价明写：若这份账本来自"先赠送再抽卡"的库，重放会在 duplicate 上假报不符。
+    verify_replay(f.seed, params, catalog, &records, &Owned::new())
         .map_err(|e| fail(&format!("重放不一致（骰子被动过的证据）: {e}")))?;
     println!(
         "audit verify mode=file file={} seed={} len={} head={} counts={} {} {} {} 重放一致",

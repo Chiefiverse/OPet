@@ -291,16 +291,25 @@ pub fn verify_chain_anchored(
 ///
 /// 这是 §6.1"审计重放脚本可校验任意记录"的真正口径——哈希链只能证明"记录之间自洽"，
 /// 重放才能证明"记录和骰子自洽"。前提是 `seq` 从 1 开始、无删减（链校验已经管这个）。
+///
+/// `initial_owned` = **账本外的所有权**（`starter` / `pack:` / `redeem:shards` 三条不掷骰的
+/// 发放路径写进库存的件）。`duplicate` 与 `shards_gained` 是按"抽之前已经拥有什么"算的，
+/// 而重放只看账本 ⇒ 起点必须是空集**加上**这些件，否则赠送之后第一次抽到它们就会假报
+/// "duplicate 与重放不符"。第三方只拿导出文件时传空集（导出里没有库存信息）。
+///
+/// ⚠️ 口径边界：这里假设那些件在**整段账本之前**就已拥有。若发放发生在账本中途，早期
+/// 记录的重放仍不严谨（要完全严谨得把发放本身也记成带序号的事件）。
 pub fn verify_replay(
     seed: u64,
     params: &GachaParams,
     catalog: &Catalog,
     records: &[AuditRecord],
+    initial_owned: &Owned,
 ) -> Result<ChainReport, AuditError> {
     let report = verify_chain(records)?;
     let engine = Engine::new(params, catalog).map_err(AuditError::Engine)?;
     let mut state = super::pity::PullState::fresh();
-    let mut owned = Owned::new();
+    let mut owned = initial_owned.clone();
     for r in records {
         if r.rng_state_hash != rng_state_hash(seed, r.seq) {
             return Err(AuditError::ReplayMismatch {
@@ -516,7 +525,7 @@ mod tests {
     #[test]
     fn honest_chain_replays_and_head_matches() {
         let (p, c, recs) = real_chain(11, 30);
-        let report = verify_replay(11, &p, &c, &recs).unwrap();
+        let report = verify_replay(11, &p, &c, &recs, &Owned::new()).unwrap();
         assert_eq!(report.len, 30);
         assert_eq!(report.head, verify_chain(&recs).unwrap().head);
         let total: u64 = report.counts.iter().sum();
@@ -535,7 +544,7 @@ mod tests {
             verify_chain(&recs).is_ok(),
             "重链之后哈希链理应自洽，否则这条测试没意义"
         );
-        let err = verify_replay(11, &p, &c, &recs).unwrap_err();
+        let err = verify_replay(11, &p, &c, &recs, &Owned::new()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -554,7 +563,7 @@ mod tests {
         // 换 seed 不改链：rng_state_hash 在 canonical 里，但它同时也是重放的输入，
         // 拿别人的 seed 来，第一条就对不上。
         let (p, c, recs) = real_chain(11, 10);
-        let err = verify_replay(12, &p, &c, &recs).unwrap_err();
+        let err = verify_replay(12, &p, &c, &recs, &Owned::new()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -576,7 +585,7 @@ mod tests {
         relink(&mut recs);
         assert!(verify_chain(&recs).is_ok());
         assert!(matches!(
-            verify_replay(11, &p, &c, &recs),
+            verify_replay(11, &p, &c, &recs, &Owned::new()),
             Err(AuditError::ReplayMismatch {
                 at: 30,
                 field: "pity_before",
@@ -593,7 +602,7 @@ mod tests {
         recs2[idx].shards_gained = 0;
         relink(&mut recs2);
         assert!(verify_chain(&recs2).is_ok());
-        let err = verify_replay(21, &p2, &c2, &recs2).unwrap_err();
+        let err = verify_replay(21, &p2, &c2, &recs2, &Owned::new()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -612,7 +621,7 @@ mod tests {
         let (mut p, c, recs) = real_chain(11, 30);
         p.soft_start = 30;
         assert!(matches!(
-            verify_replay(11, &p, &c, &recs),
+            verify_replay(11, &p, &c, &recs, &Owned::new()),
             Err(AuditError::ReplayMismatch { .. })
         ));
     }

@@ -35,7 +35,7 @@ const NOTICE: &str = include_str!("../assets/fonts/NOTICE-ui-font.txt");
 
 /// `--verify` 三次连续重建逐字节一致后钉下来的摘要。改任何文案 → 重跑 `--emit-codes` +
 /// `--build` + `--verify` → **这里的常数必须一起改**（它就是"资产与清单漂移"的证据）。
-const FONT_SHA256: &str = "1eeb28310460b2930d4954ca707f44ba3177f962be857761c7584e63e829558a";
+const FONT_SHA256: &str = "e5b0ab586ef37c4560989d07aa2aa5b22df6db2d49e437831e96bc06e7d0798a";
 /// 源 .ttc 的摘要，与 `tools/subset_font.py` 的 `SOURCE_SHA256` 同一个数。
 const SOURCE_SHA256: &str = "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a";
 /// §4.2 的体积门禁（i18n 把子集从"只中文"涨到四 locale 并集后重算的档）。实测 54,516 B

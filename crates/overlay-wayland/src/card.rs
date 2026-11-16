@@ -903,6 +903,9 @@ mod tests {
     impl Shot {
         /// **默认档（`full` + `zh`）**的一次出图 —— 已签收的那套像素口径走的就是中文。
         /// 现有断言全部从这里取，于是"这一轮没改掉默认观感"本身就是测试形状。
+        /// ⚠️ 基线**钉死 `Lang::Zh`**（不用 `Lang::DEFAULT`）：生产默认已改 en，而像素对照
+        /// 必须与生产默认解耦，否则 `burst_plaque_relays_out_for_every_locale` 的 zh 对照
+        /// 会随默认漂成 en、把"换语言必须换像素"那条断言弄红。
         fn at(scale: f32, anim: &MenuAnim, balance: i64, dry: bool, err: &str) -> Self {
             Self::with_motion(scale, anim, balance, dry, err, Motion::Full)
         }
@@ -915,7 +918,7 @@ mod tests {
             err: &str,
             motion: Motion,
         ) -> Self {
-            Self::paint_at(scale, anim, balance, dry, err, motion, Lang::DEFAULT)
+            Self::paint_at(scale, anim, balance, dry, err, motion, Lang::Zh)
         }
 
         /// 逐 locale 出图（提交 6/7 的对比度断言与出图过眼要用；`en` 比 `zh` 宽得多，
@@ -1388,7 +1391,7 @@ mod tests {
                             error: "",
                             scale,
                             motion: Motion::Full,
-                            lang: Lang::DEFAULT,
+                            lang: Lang::Zh,
                             page,
                             unowned_exempt: false,
                         },
@@ -1491,7 +1494,7 @@ mod tests {
                     error: "",
                     scale: SCALE,
                     motion: Motion::Full,
-                    lang: Lang::DEFAULT,
+                    lang: Lang::Zh,
                     page,
                     unowned_exempt: exempt,
                 },

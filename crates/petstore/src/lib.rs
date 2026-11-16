@@ -33,7 +33,7 @@ pub mod licenses;
 pub mod pack;
 pub mod paths;
 
-pub use db::{PackGrant, Store, StoreError};
+pub use db::{PackGrant, STARTER_ITEMS, StarterGrant, Store, StoreError};
 pub use ledger::{PullReport, derive_state};
 pub use licenses::{LicenseService, LicenseState, NoopLicenseService};
 pub use paths::DbPath;

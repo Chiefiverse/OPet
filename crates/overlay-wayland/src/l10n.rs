@@ -19,7 +19,7 @@
 
 use petcore::gacha::Rarity;
 
-/// 界面语言。**默认中文**（`DEFAULT`），四档在菜单底部语言行里循环。
+/// 界面语言。**默认英文**（`DEFAULT`，系统语言认不出时的兜底），四档在菜单底部语言行里循环。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lang {
     Zh,
@@ -31,8 +31,9 @@ pub enum Lang {
 impl Lang {
     pub const ALL: [Self; 4] = [Self::Zh, Self::En, Self::Ja, Self::Ko];
 
-    /// 没给 `--lang`、config 里没有、环境变量也认不出来时的落点。
-    pub const DEFAULT: Self = Self::Zh;
+    /// 没给 `--lang`、config 里没有、环境变量也认不出来时的落点。**默认英文**：系统语言
+    /// 不在四语之内时兜底到 en（首轮取系统语言，此后由 config 记住上次退出语言）。
+    pub const DEFAULT: Self = Self::En;
 
     /// 语言行的循环顺序：zh → en → ja → ko → zh。
     pub const fn next(self) -> Self {
@@ -650,8 +651,8 @@ mod tests {
     }
 
     #[test]
-    fn default_lang_is_zh_and_is_in_the_list() {
-        assert_eq!(Lang::DEFAULT, Lang::Zh);
+    fn default_lang_is_en_and_is_in_the_list() {
+        assert_eq!(Lang::DEFAULT, Lang::En);
         assert!(Lang::ALL.contains(&Lang::DEFAULT));
     }
 }

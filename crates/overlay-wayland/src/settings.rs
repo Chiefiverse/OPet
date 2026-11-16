@@ -209,7 +209,7 @@ impl Settings {
                         lang_from = from;
                         break;
                     }
-                    // `LC_ALL=C` 是真会出现的（VM、CI、别的发行版），静默落 zh 就永远没人知道
+                    // `LC_ALL=C` 是真会出现的（VM、CI、别的发行版），静默落 en 就永远没人知道
                     None => notices.push(format!(
                         "{name} = {v:?} 认不出来（只支持 {}）⇒ 跳过这一级",
                         lang_codes()

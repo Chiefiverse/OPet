@@ -27,6 +27,17 @@ pub const AUDIT_LEN_KEY: &str = "audit_len";
 /// 允许在"路径由默认解析得出（= 用户真实存档）"时写库的显式开关。
 pub const ALLOW_DEFAULT_ENV: &str = "OPET_ALLOW_DEFAULT_ARCHIVE";
 
+/// 便携测试版的开箱赠送：3 只 N 档本体 + 3 件对应配件（每宠一件 `head` 槽，`fits` 逐件对上）。
+/// 顺序即打印顺序：常量表本来就确定，不像 [`PackGrant`] 那样需要排序。
+pub const STARTER_ITEMS: [(ItemKind, &str); 6] = [
+    (ItemKind::Pet, "rabbit"),
+    (ItemKind::Pet, "bear"),
+    (ItemKind::Pet, "spacecat"),
+    (ItemKind::Accessory, "skicap"),
+    (ItemKind::Accessory, "ballcap"),
+    (ItemKind::Accessory, "dragonfly"),
+];
+
 #[derive(Debug)]
 pub enum StoreError {
     Sqlite(String),
@@ -185,6 +196,16 @@ impl PackGrant {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.already.is_empty()
     }
+}
+
+/// [`Store::grant_starter`] 的回执。形状同 [`PackGrant`]，但**没有 `is_empty`**：
+/// 赠送"一件都没发"是正常态（第二次运行六件全 `already`），不是需要被区分的错误。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StarterGrant {
+    /// 本次真的写进库存的项（`"kind/id"`）。
+    pub added: Vec<String>,
+    /// 库里已有同 `(kind, item_id)` ⇒ 一行都没写，`count` 也不 +1（幂等）。
+    pub already: Vec<String>,
 }
 
 pub struct Store {
@@ -477,6 +498,16 @@ impl Store {
             .collect::<Result<Vec<String>, _>>()?
             .into_iter()
             .collect())
+    }
+
+    /// 账本外的所有权：`starter` / `pack:` / `redeem:shards` 三条不掷骰的发放路径写进库存的件。
+    /// 重放要拿它当起点，否则赠送之后抽到同一件就会假报 duplicate 不符（见 `verify_replay`）。
+    fn off_ledger_owned(&self) -> Result<Owned, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT item_id FROM inventory WHERE obtained_from NOT LIKE 'gacha:%'")?;
+        let ids = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(ids.collect::<Result<Owned, _>>()?)
     }
 
     pub fn item_count(&self, item_id: &str) -> Result<u64, StoreError> {
@@ -985,6 +1016,59 @@ impl Store {
         self.shards(Currency::Shards)
     }
 
+    /// 开箱赠送 [`STARTER_ITEMS`]（便携测试版"启动即拥有 3 宠 3 配"）。
+    ///
+    /// 与 [`Self::grant_pack_items`] / [`Self::redeem_ssr`] 同族：不掷骰 ⇒ 不进 `gacha_pull`、
+    /// 不进审计链（`verify_chain` 只遍历 pull 记录）。三条与装包路径**刻意不同**的地方：
+    ///
+    /// 1. **不查 `PackItemInGachaPool`**。那道门禁守的是"付费包卖池外内容"（§3.11.5），
+    ///    而赠送是确定性开局礼物、六件全在池里；`redeem_ssr` 已有发池内件的先例。
+    /// 2. **逐项校验目录**，缺件或 kind 不符 ⇒ 整笔回滚、库里一个字都不多。
+    /// 3. **幂等**：已拥有就进 `already`，不 `count+1`、不发碎片、不插重复行
+    ///    （`duplicates` 是碎片的来源账，从这条路 +1 就是刷碎片的机器，同装包第 1 条）。
+    pub fn grant_starter(&mut self, catalog: &Catalog) -> Result<StarterGrant, StoreError> {
+        let mut items = Vec::with_capacity(STARTER_ITEMS.len());
+        for (kind, id) in STARTER_ITEMS {
+            let item = catalog
+                .find(id)
+                .ok_or_else(|| StoreError::UnknownItem(id.into()))?;
+            if item.kind != kind {
+                return Err(StoreError::UnknownItem(format!(
+                    "{id} 在目录里是 {}，赠送清单要的是 {}",
+                    item.kind.as_str(),
+                    kind.as_str()
+                )));
+            }
+            items.push((kind, id));
+        }
+
+        let now = clock::now_secs();
+        let tx = self.conn.transaction()?;
+        let mut grant = StarterGrant::default();
+        for (kind, id) in items {
+            let key = format!("{}/{id}", kind.as_str());
+            let have: Option<i64> = tx
+                .query_row(
+                    "SELECT count FROM inventory WHERE kind = ?1 AND item_id = ?2",
+                    params![kind.as_str(), id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            if have.is_some() {
+                grant.already.push(key);
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO inventory(kind, item_id, count, duplicates, obtained_at, obtained_from)
+                 VALUES (?1, ?2, 1, 0, ?3, 'starter')",
+                params![kind.as_str(), id, now],
+            )?;
+            grant.added.push(key);
+        }
+        tx.commit()?;
+        Ok(grant)
+    }
+
     // ---- 审计 ----
 
     /// 全链校验 + 用库里的 seed 与**库里存的**公示参数重放。
@@ -1030,7 +1114,7 @@ impl Store {
             Some(h) => verify_chain_anchored(records, h)?,
             None => verify_chain(records)?,
         };
-        verify_replay(self.seed, p, catalog, records)?;
+        verify_replay(self.seed, p, catalog, records, &self.off_ledger_owned()?)?;
         Ok(report)
     }
 

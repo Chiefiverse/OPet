@@ -2474,12 +2474,12 @@ mod tests {
     fn report_lines_are_one_per_line_in_the_puller_language() {
         let items = vec![
             ("太空猫".to_string(), Rarity::N, false),
-            ("铃帽".to_string(), Rarity::SR, true),
+            ("皇冠".to_string(), Rarity::SR, true),
         ];
         let lines = report_lines(&[1, 0, 1, 0], &items, 8, Lang::Zh, 1.0);
         assert_eq!(lines[0], "2 抽 最高 SR");
         assert_eq!(lines[1], "SR1 N1", "档位计数行从高到低、只列非零档");
-        assert_eq!(lines[2], "SR 铃帽 重复", "明细先列最高档");
+        assert_eq!(lines[2], "SR 皇冠 重复", "明细先列最高档");
         assert_eq!(lines[3], "N 太空猫 新");
         assert_eq!(lines[4], "碎片 +8");
         assert!(!lines.iter().any(|l| l.contains("演示")), "演示标不在这");
@@ -2490,7 +2490,7 @@ mod tests {
         let en = report_lines(&[1, 0, 1, 0], &items, 8, Lang::En, 1.0);
         assert_eq!(en[0], "2 pulled, best SR");
         assert_eq!(en[4], "+8 shards");
-        assert_eq!(en[2], "SR 铃帽 DUP", "物品名保留目录中文（§7-R12）");
+        assert_eq!(en[2], "SR 皇冠 DUP", "物品名保留目录中文（§7-R12）");
         // 全 0 计数（理论不可达，防御病态输入）不许 panic。
         let empty = report_lines(&[0, 0, 0, 0], &[], 0, Lang::Zh, 1.0);
         assert_eq!(empty[0], "0 抽");

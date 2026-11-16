@@ -1,5 +1,5 @@
 //! `opet` 命令行入口。M1 = headless 模拟与吞吐基准；
-//! M3 起加 `gacha-sim`/`catalog`/`pull`/`redeem`/`audit`（盲盒引擎与存档，见 [`gacha_cmd`]）；
+//! M3 起加 `gacha-sim`/`catalog`/`pull`/`redeem`/`starter`/`audit`（盲盒引擎与存档，见 [`gacha_cmd`]）；
 //! M4 起加 `overlay`（Wayland 宠物客户端，与 `opet-overlay-wayland` 共用参数口径）；
 //! P1（FLOW §9）加 `pack`（内容包装/卸/预览/校验，见 [`pack_cmd`]）。
 //! IPC 子命令在 M3 之后补（§10.2）。
@@ -36,6 +36,8 @@ M3 可用（headless，完整参数：`opet gacha-sim --usage`）：
       抽取并落账本；--dry-run 走内存库，不写盘不扣币
   opet redeem --item ID
       碎片商店自选 SSR（不掷骰 ⇒ 不进审计链）
+  opet starter --db FILE
+      开箱赠送 3 只 N 档本体 + 3 件对应配件（幂等；不掷骰 ⇒ 不进审计链）
   opet audit verify|export
       审计链校验与导出（第三方只需导出文件 + seed + 公示参数）
 
@@ -47,7 +49,7 @@ M4 可用（完整参数：`opet overlay --help`）：
       --panel-top = 顶部栏高度（逻辑像素）：layer-shell 的 margin 从可用区量起，
       不给这个值整只宠物会被下推一个栏高、脚掉到屏幕外
       --lang = zh/en/ja/ko；不写这个开关时依次看 ~/.config/opet/config.toml 的 [ui] lang、
-      再看 LC_ALL/LANG，最后默认 zh。写错值直接报错退出，不静默退回默认
+      再看 LC_ALL/LANG，最后默认 en。写错值直接报错退出，不静默退回默认
       --motion = full/reduce/off（判据②「抽卡动画强度可关 / 闪烁可关」，**不碰本体动画**）：reduce 把开箱扩散
       缩到 1/4 并关掉 SSR 白闪，off 整个跳过扩散；两档都不动结果卡停留时间与稀有度色带
   opet overlay --test-rect
@@ -71,7 +73,7 @@ const TICK_RATE_GATE: f64 = 1_000_000.0;
 
 /// M3 的子命令名。放在这里而不是 `gacha_cmd` 里，是因为**路由**发生在 `main`；
 /// 两处共用这一张表，就不会出现"加了一个命令但忘了进 usage"。
-const GACHA_CMDS: [&str; 5] = ["gacha-sim", "catalog", "pull", "redeem", "audit"];
+const GACHA_CMDS: [&str; 6] = ["gacha-sim", "catalog", "pull", "redeem", "starter", "audit"];
 
 #[derive(Debug)]
 pub struct Opts {

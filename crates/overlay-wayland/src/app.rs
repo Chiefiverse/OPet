@@ -1443,6 +1443,13 @@ pub fn run(opts: Options) -> Result<(), String> {
         settings::Settings::from_process(opts.lang.as_deref(), opts.motion.as_deref(), &cfg)?;
     settings.announce();
 
+    // 把本轮生效的语言写回 config，于是"首轮取系统语言、此后取上次退出语言"两条同时成立：
+    // 首轮没有 config ⇒ 走 env→DEFAULT，写回后重跑时 config 优先于 env。
+    // `--lang` 例外：它是一次性覆盖，不该被锁进文件（否则下次不带开关也回不去系统语言）。
+    if settings.lang_from != settings::ValueSource::Cli {
+        let _ = petstore::config::write_ui_key(petstore::config::KEY_LANG, settings.lang.code());
+    }
+
     let conn = Connection::connect_to_env().map_err(|e| format!("连不上 Wayland: {e}"))?;
     let (globals, event_queue) =
         registry_queue_init::<App>(&conn).map_err(|e| format!("registry 初始化失败: {e}"))?;
@@ -6257,7 +6264,7 @@ mod tests {
 
     /// P4 的 fixture：**一份把稀有度序打乱的合成目录**。
     ///
-    /// ⚠️ 目录里的数组顺序**故意**不是"同档相邻"（`hood_night` 那件 R 夹在 N 前面）：
+    /// ⚠️ 目录里的数组顺序**故意**不是"同档相邻"（`wand` 那件 R 夹在 N 前面）：
     /// [`Gacha::album_entries`] 按 `Rarity::ALL` × 档内序遍历 ⇒ 条目顺序由**档**决定，而
     /// 行上的载荷 `Wear(i)` 里的 `i` 必须是 `candidates` 的下标。fixture 里**每一件**的
     /// "目录枚举序号"与"`ids` 下标"都不同 ⇒ 谁把那句 `ids.iter().position(..)` 顺手写成
@@ -6278,11 +6285,11 @@ mod tests {
             id: real.id.clone(),
             banner_id: real.banner_id.clone(),
             items: vec![
-                pick("hood_night"), // R · 夜兜
-                pick("bell_gold"),  // N · 金铃
-                pick("spacecat"),   // N · 太空猫（宠物：下标在**本体那一张表**里，不在配件表里）
-                pick("cap_blue"),   // N · 蓝帽
-                pick("hat_straw"),  // SSR · 草帽（"抽到了而磁盘没产物"那一件）
+                pick("wand"),     // R · 权杖
+                pick("flag"),     // N · 旗
+                pick("spacecat"), // N · 太空猫（宠物：下标在**本体那一张表**里，不在配件表里）
+                pick("ballcap"),  // N · 棒球帽
+                pick("wing"),     // SSR · 翅膀（"抽到了而磁盘没产物"那一件）
             ],
         };
         g
@@ -6294,7 +6301,7 @@ mod tests {
 
     /// `candidates`（= 磁盘上真有产物、且匹配本体的那几件）的下标表，顺序与目录遍历序无关。
     fn album_ids() -> Vec<String> {
-        ["cap_blue", "hood_night", "spacecat", "bell_gold"]
+        ["ballcap", "wand", "spacecat", "flag"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -6315,7 +6322,7 @@ mod tests {
     fn the_row_payload_is_the_same_index_the_dress_page_cycles() {
         let g = album_fixture();
         let ids = album_ids();
-        let owned = owned_of(&["bell_gold", "spacecat", "cap_blue", "hood_night"]);
+        let owned = owned_of(&["flag", "spacecat", "ballcap", "wand"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
         // 本体表刻意与配件表**错位**：`spacecat` 在配件表是下标 2，在本体表是下标 1，
         // 而 `dinosaur` 没抽到 ⇒ 它被同一道闸门挡在外面（于是 `pet_visible` 只有 `[1]`，
@@ -6329,14 +6336,14 @@ mod tests {
             .album_entries(&owned, &ids, &visible, &pet_ids, &pet_view.visible)
             .expect("逐件条目该读得出来");
 
-        // 条目序 = 档序（N 三件按档内序 → R），而 `hat_straw` 不在 `owned` 里 ⇒ 根本不出现。
+        // 条目序 = 档序（N 三件按档内序 → R），而 `wing` 不在 `owned` 里 ⇒ 根本不出现。
         // 那只猫这一轮**给下标了**，但那是 `Body` 那套下标里的 1（= `pet_ids` 里的 `spacecat`）。
         use AlbumTarget::{Accessory, Body, None as Inert};
         let want = [
-            ("金铃", Accessory(3)),
+            ("旗", Accessory(3)),
             ("太空猫", Body(1)),
-            ("蓝帽", Accessory(0)),
-            ("夜兜", Accessory(1)),
+            ("棒球帽", Accessory(0)),
+            ("权杖", Accessory(1)),
         ];
         assert_eq!(entries.len(), want.len(), "条目数不等于 catalog ∩ owned");
         for (e, (name, t)) in entries.iter().zip(want) {
@@ -6344,7 +6351,7 @@ mod tests {
             assert_eq!(e.target, t, "{name} 的载荷下标不对");
         }
         assert!(
-            entries.iter().all(|e| e.name != "草帽"),
+            entries.iter().all(|e| e.name != "翅膀"),
             "未拥有的件不该进逐件册（它出现在汇总那一行就够了）"
         );
 
@@ -6544,7 +6551,7 @@ mod tests {
     /// 宠物行走 [`panel::PanelItem::Body`]（载荷 = [`App::bodies`] 的下标）。这两套下标**住在同一
     /// 个 `usize` 空间里**，所以同屏出现 `Wear(1)` 与 `Body(1)` 是完全正常的，而它们必须指着两件
     /// 不同的东西 —— 反过来说：谁把 `album_entries` 里那两次 `position()` 合并成一次（"反正都是
-    /// 查 id"），屏上就会有一行点下去换成一只猫、另一行点下去戴上夜兜，而**这两次都自洽**，
+    /// 查 id"），屏上就会有一行点下去换成一只猫、另一行点下去戴上权杖，而**这两次都自洽**，
     /// headless 里除了这一条没有别的读数。
     ///
     /// 抄 [`the_row_payload_is_the_same_index_the_dress_page_cycles`] 的 fixture 与"按 catalog 的
@@ -6554,10 +6561,10 @@ mod tests {
     fn the_album_routes_pets_to_the_body_index_space() {
         let g = album_fixture();
         let ids = album_ids();
-        let owned = owned_of(&["bell_gold", "spacecat", "cap_blue", "hood_night"]);
+        let owned = owned_of(&["flag", "spacecat", "ballcap", "wand"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
         // `dinosaur` 没抽到 ⇒ 被同一道闸挡在 `pet_visible` 外面，于是 `spacecat` 在本体
-        // 那一张表里落在**下标 1** —— 而 1 在配件那张表里是 `hood_night`（夜兜）。
+        // 那一张表里落在**下标 1** —— 而 1 在配件那张表里是 `wand`（权杖）。
         let pet_ids: Vec<String> = ["dinosaur", "spacecat"]
             .iter()
             .map(|s| s.to_string())
@@ -6579,14 +6586,14 @@ mod tests {
         let wear = rows
             .iter()
             .find(|r| r.item == panel::PanelItem::Wear(1))
-            .expect("夜兜该是 Wear(1)");
+            .expect("权杖该是 Wear(1)");
         let body = rows
             .iter()
             .find(|r| r.item == panel::PanelItem::Body(1))
             .expect("太空猫该是 Body(1)");
         assert!(
-            wear.text.contains("夜兜"),
-            "Wear(1) 那行没写夜兜：{:?}",
+            wear.text.contains("权杖"),
+            "Wear(1) 那行没写权杖：{:?}",
             wear.text
         );
         assert!(
@@ -6600,7 +6607,7 @@ mod tests {
             "Wear(1) 那行读到了本体那张表的东西 ⇒ 两套下标混用了（配件那臂去查了 pet_ids）"
         );
         assert!(
-            !body.text.contains("夜兜"),
+            !body.text.contains("权杖"),
             "Body(1) 那行读到了配件那张表的东西 ⇒ 两套下标混用了（本体那臂去查了 candidates）"
         );
 
@@ -6712,9 +6719,9 @@ mod tests {
     fn a_body_row_is_not_an_accessory_note() {
         let rows = vec![
             ("body".to_string(), "tiger".to_string()),
-            ("head".to_string(), "cap_blue".to_string()),
+            ("head".to_string(), "ballcap".to_string()),
         ];
-        let ids: Vec<String> = ["cap_blue"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = ["ballcap"].iter().map(|s| s.to_string()).collect();
         let slots: Vec<String> = ["head"].iter().map(|s| s.to_string()).collect();
         let visible = vec![0usize];
 
@@ -6723,7 +6730,7 @@ mod tests {
         assert_eq!(body.as_deref(), Some("tiger"), "body 那一行没被认出来");
         assert_eq!(
             accessories,
-            vec![("head".to_string(), "cap_blue".to_string())],
+            vec![("head".to_string(), "ballcap".to_string())],
             "剥壳把配件那一行也剥掉了 ⇒ 帽子从此不会恢复"
         );
 
@@ -6775,11 +6782,8 @@ mod tests {
     fn an_unowned_or_undiskable_entry_stays_inert() {
         let g = album_fixture();
         // 磁盘只有两件有产物（裸开发树 30 件只有 1 件 ⇒ **这才是常态**），而库存里躺着四件。
-        let ids: Vec<String> = ["cap_blue", "hood_night"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let owned = owned_of(&["cap_blue", "hood_night", "hat_straw", "spacecat"]);
+        let ids: Vec<String> = ["ballcap", "wand"].iter().map(|s| s.to_string()).collect();
+        let owned = owned_of(&["ballcap", "wand", "wing", "spacecat"]);
         let visible = DressView::select(false, Some(&owned), &ids).visible;
         // ⚠️ 本体表**交空** = 这一轮磁盘上没有一只本体（裸开发树的真实读数：`$OPET_PETS` 没指、
         // `$XDG_DATA_HOME/opet/pets` 不存在 ⇒ [`discover_pets`] 返空）。所以那只猫在这里是
@@ -6805,18 +6809,18 @@ mod tests {
                 .unwrap_or_else(|| panic!("屏上没有{name}那一行"))
         };
         // ✅ 有产物 + 过闸 ⇒ 可点，且载荷就是它在 `ids` 里的位置。
-        assert_eq!(row_of("蓝帽").item, panel::PanelItem::Wear(0));
-        assert_eq!(row_of("夜兜").item, panel::PanelItem::Wear(1));
+        assert_eq!(row_of("棒球帽").item, panel::PanelItem::Wear(0));
+        assert_eq!(row_of("权杖").item, panel::PanelItem::Wear(1));
         // ⚠️ 抽到了而磁盘没产物 ⇒ **只读行**，而名字照说（"消失了"和"不能穿"是两件事）。
-        let straw = row_of("草帽");
+        let straw = row_of("翅膀");
         assert_eq!(straw.item, panel::PanelItem::Info);
         assert_eq!(
             straw.text,
             format!(
                 "{} {} {}",
                 Rarity::SSR.as_str(),
-                Slot::Head.as_str(),
-                "草帽"
+                Slot::Back.as_str(),
+                "翅膀"
             ),
             "无产物的那一件把档名/挂点/名字丢了 ⇒ 这行读不出自己是什么"
         );
@@ -6870,10 +6874,10 @@ mod tests {
         for scale in [1.0f32, 1.5, 2.0] {
             let mut branch = [0usize; 4];
             for name in [
-                "蓝帽".to_string(),
-                "蓝帽".repeat(6),
-                "蓝帽".repeat(12),
-                "蓝帽".repeat(40),
+                "老虎".to_string(),
+                "老虎".repeat(6),
+                "老虎".repeat(12),
+                "老虎".repeat(40),
             ] {
                 let e = AlbumEntry {
                     target: AlbumTarget::Accessory(0),
@@ -6932,7 +6936,7 @@ mod tests {
                 } else {
                     AlbumTarget::Accessory(i)
                 },
-                name: "蓝帽".repeat(1 + i % 4),
+                name: "老虎".repeat(1 + i % 4),
                 rarity: Rarity::ALL[i % 4],
                 // ⚠️ 取模的数由 `Slot::ALL::len()` 给，不写死：写死的那个余数窗口会让新加的挂点
                 // 永远进不了这张"最坏情况"表，而这一屏的量就是靠它兜住的（v2 加 `feet` 时

@@ -26,6 +26,9 @@
 /assets/accessories/*/accessory.json
 /assets/accessories/*/polygon.json
 
+# 便携发布包构建产物（scripts/make_portable.sh 输出），不入库
+/dist/
+
 # CLI 会话在本项目目录里落的工作产物，与代码无关
 /.qoder/
 

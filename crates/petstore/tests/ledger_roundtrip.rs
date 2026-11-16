@@ -9,8 +9,8 @@
 //!
 //! 全部走 `tempfile` 里的库：这些测试会真写数据。
 
-use petcore::gacha::{Catalog, Currency, GachaParams, PullState, Rarity};
-use petstore::db::{AUDIT_HEAD_KEY, AUDIT_LEN_KEY, SEED_KEY};
+use petcore::gacha::{Catalog, Currency, GachaParams, ItemKind, PullState, Rarity};
+use petstore::db::{AUDIT_HEAD_KEY, AUDIT_LEN_KEY, SEED_KEY, STARTER_ITEMS};
 use petstore::ledger::{PullRow, ledger_items_outside_catalog};
 use petstore::{DbPath, Store};
 use tempfile::TempDir;
@@ -276,7 +276,7 @@ fn redeem_ssr_is_deterministic_and_outside_the_chain() {
     let head_before = s.meta_get(AUDIT_HEAD_KEY).unwrap().unwrap();
 
     // 碎片不够：先报错，什么都不写
-    let err = s.redeem_ssr(&p, &cat, "hat_straw").unwrap_err();
+    let err = s.redeem_ssr(&p, &cat, "wing").unwrap_err();
     assert!(
         matches!(err, petstore::db::StoreError::NotEnoughShards { .. }),
         "该先报碎片不足: {err}"
@@ -292,9 +292,9 @@ fn redeem_ssr_is_deterministic_and_outside_the_chain() {
     assert!(s.redeem_ssr(&p, &cat, &n_id).is_err(), "{n_id} 不是 SSR");
 
     s.add_shards(Currency::Shards, 200).unwrap();
-    let after = s.redeem_ssr(&p, &cat, "hat_straw").unwrap();
+    let after = s.redeem_ssr(&p, &cat, "wing").unwrap();
     assert_eq!(after, 200 - u64::from(p.ssr_redeem_cost));
-    assert_eq!(s.item_count("hat_straw").unwrap(), 1);
+    assert_eq!(s.item_count("wing").unwrap(), 1);
     // 兑换不进链：长度与链尾都不许动
     assert_eq!(s.meta_get(AUDIT_LEN_KEY).unwrap().unwrap(), len_before);
     assert_eq!(s.meta_get(AUDIT_HEAD_KEY).unwrap().unwrap(), head_before);
@@ -302,7 +302,7 @@ fn redeem_ssr_is_deterministic_and_outside_the_chain() {
     let from: String = s
         .conn()
         .query_row(
-            "SELECT obtained_from FROM inventory WHERE item_id = 'hat_straw'",
+            "SELECT obtained_from FROM inventory WHERE item_id = 'wing'",
             [],
             |r| r.get(0),
         )
@@ -379,4 +379,177 @@ fn the_default_archive_refuses_writes_unless_explicitly_allowed() {
         Err(e) => e,
     };
     assert!(err2.to_string().contains("绝对路径"), "{err2}");
+}
+
+// ---- starter 赠送（便携测试版的开箱礼物）----
+//
+// 这一族与 `redeem_ssr_is_deterministic_and_outside_the_chain` 同形：不掷骰 ⇒ 不进链。
+// 六件全在抽卡池里，所以**刻意**不查 `PackItemInGachaPool`（那道门禁只守付费包）。
+
+#[test]
+fn starter_is_idempotent_and_never_bumps_count_or_shards() {
+    let (_d, mut s) = store(SEED);
+    let cat = catalog();
+    let first = s.grant_starter(&cat).unwrap();
+    assert_eq!(first.added.len(), 6, "首跑六件全新增: {first:?}");
+    assert!(first.already.is_empty());
+
+    let second = s.grant_starter(&cat).unwrap();
+    assert!(second.added.is_empty(), "二跑一件都不该新增: {second:?}");
+    assert_eq!(second.already.len(), 6);
+
+    for (_, id) in STARTER_ITEMS {
+        assert_eq!(s.item_count(id).unwrap(), 1, "{id} 的 count 不许被赠送累加");
+    }
+    assert_eq!(s.shards(Currency::Shards).unwrap(), 0, "赠送不发碎片");
+    let rows: i64 = s
+        .conn()
+        .query_row("SELECT COUNT(*) FROM inventory", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 6, "幂等靠主键，不许插重复行");
+}
+
+#[test]
+fn starter_grants_three_pets_and_three_accessories_all_marked_starter() {
+    let (_d, mut s) = store(SEED);
+    s.grant_starter(&catalog()).unwrap();
+    let mut stmt = s
+        .conn()
+        .prepare("SELECT kind, item_id, obtained_from FROM inventory ORDER BY kind, item_id")
+        .unwrap();
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 6);
+    let pets = rows.iter().filter(|(k, _, _)| k == "pet").count();
+    let accs = rows.iter().filter(|(k, _, _)| k == "accessory").count();
+    assert_eq!((pets, accs), (3, 3), "3 只本体 + 3 件配件: {rows:?}");
+    for (_, id, from) in &rows {
+        assert_eq!(from, "starter", "{id} 的来源要写清楚，不能混进 gacha");
+    }
+    for (_, want) in STARTER_ITEMS {
+        assert!(
+            rows.iter().any(|(_, id, _)| id == want),
+            "{want} 没进库存: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn starter_stays_outside_the_audit_chain() {
+    let (_d, mut s) = store(SEED);
+    let cat = catalog();
+    let p = GachaParams::V1;
+    s.pull(&p, &cat, BANNER, 1).unwrap();
+    let len_before = s.meta_get(AUDIT_LEN_KEY).unwrap().unwrap();
+    let head_before = s.meta_get(AUDIT_HEAD_KEY).unwrap().unwrap();
+
+    s.grant_starter(&cat).unwrap();
+
+    assert_eq!(s.meta_get(AUDIT_LEN_KEY).unwrap().unwrap(), len_before);
+    assert_eq!(s.meta_get(AUDIT_HEAD_KEY).unwrap().unwrap(), head_before);
+    assert_eq!(
+        s.verify(&cat, PROFILE, BANNER).unwrap().len,
+        1,
+        "赠送之后整链仍验得过"
+    );
+}
+
+#[test]
+fn starter_does_not_loosen_the_pack_pool_gate() {
+    let (_d, mut s) = store(SEED);
+    let cat = catalog();
+    s.grant_starter(&cat).unwrap();
+    // 赠送发的是池内件；装包那条路对同一个 id 仍必须拒绝 ⇒ 两条路径各守各的。
+    let err = s
+        .grant_pack_items("demo_01", &cat, &[(ItemKind::Pet, "rabbit".to_string())])
+        .unwrap_err();
+    assert!(
+        matches!(err, petstore::db::StoreError::PackItemInGachaPool(_)),
+        "赠送不该把装包的池门禁松开: {err}"
+    );
+}
+
+#[test]
+fn starter_skips_an_already_owned_item_without_rewriting_it() {
+    let (_d, mut s) = store(SEED);
+    let cat = catalog();
+    s.conn()
+        .execute(
+            "INSERT INTO inventory(kind, item_id, count, duplicates, obtained_at, obtained_from)
+             VALUES ('pet', 'rabbit', 1, 0, 0, 'test:pre')",
+            [],
+        )
+        .unwrap();
+    let g = s.grant_starter(&cat).unwrap();
+    assert_eq!(g.already, vec!["pet/rabbit".to_string()]);
+    assert_eq!(g.added.len(), 5, "其余五件照发: {g:?}");
+    assert_eq!(s.item_count("rabbit").unwrap(), 1);
+    let from: String = s
+        .conn()
+        .query_row(
+            "SELECT obtained_from FROM inventory WHERE item_id = 'rabbit'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(from, "test:pre", "已拥有那件的来源不许被赠送改写");
+}
+
+#[test]
+fn starter_rolls_back_when_the_catalog_lacks_an_item() {
+    let (_d, mut s) = store(SEED);
+    let mut cat = catalog();
+    cat.items.retain(|i| i.id != "bear");
+    let err = s.grant_starter(&cat).unwrap_err();
+    assert!(
+        matches!(err, petstore::db::StoreError::UnknownItem(_)),
+        "该点名缺的是哪一件: {err}"
+    );
+    assert!(
+        s.owned().unwrap().is_empty(),
+        "缺件 ⇒ 整笔回滚，合规那五件也一个字不写"
+    );
+}
+
+/// 赠送写在账本外，而 `duplicate` 是按真实库存算的 ⇒ 重放起点必须带上那些件。
+/// 正反两半一起才算数：只写正的那一半，可能是"这 30 抽刚好没抽到赠送件"的假绿。
+#[test]
+fn starter_then_pull_replays_only_because_the_replay_knows_off_ledger_ownership() {
+    let (_d, mut s) = store(SEED);
+    let cat = catalog();
+    let p = GachaParams::V1;
+    s.grant_starter(&cat).unwrap();
+    s.pull(&p, &cat, BANNER, 30).unwrap();
+
+    let rows = s.rows(PROFILE, BANNER).unwrap();
+    let starter_ids: Vec<&str> = STARTER_ITEMS.iter().map(|(_, id)| *id).collect();
+    assert!(
+        rows.iter()
+            .any(|r| r.duplicate && starter_ids.contains(&r.item_id.as_str())),
+        "这 30 抽必须真的重复抽到一件已赠送的件，否则下面两半都测不到东西"
+    );
+
+    assert_eq!(s.verify(&cat, PROFILE, BANNER).unwrap().len, 30);
+
+    let records: Vec<_> = rows
+        .iter()
+        .map(PullRow::to_record)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let err =
+        petcore::gacha::verify_replay(s.seed(), &p, &cat, &records, &petcore::gacha::Owned::new())
+            .expect_err("起点传空集就该红 —— 这才是上面那条绿的理由");
+    assert!(
+        matches!(
+            err,
+            petcore::gacha::AuditError::ReplayMismatch {
+                field: "duplicate",
+                ..
+            }
+        ),
+        "该红在 duplicate 上: {err}"
+    );
 }

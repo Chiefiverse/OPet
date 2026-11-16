@@ -70,7 +70,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "cap_blue",
+      "id": "ballcap",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -78,7 +78,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "bow_pink",
+      "id": "cowboy_hat",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -86,7 +86,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "whisker_stars",
+      "id": "flag",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -94,7 +94,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "face_blush",
+      "id": "lash",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -102,7 +102,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "bell_gold",
+      "id": "pcap",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -110,7 +110,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "neckerchief_ink",
+      "id": "sparkler",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -118,7 +118,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "backpack_tiny",
+      "id": "sun_hat",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -126,7 +126,7 @@
       "percent": "5.1831"
     },
     {
-      "id": "paw_wraps",
+      "id": "xmas_hat",
       "kind": "accessory",
       "rarity": "N",
       "weight": 1000,
@@ -166,7 +166,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "hood_night",
+      "id": "ak",
       "kind": "accessory",
       "rarity": "R",
       "weight": 600,
@@ -174,7 +174,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "glasses_round",
+      "id": "catflag",
       "kind": "accessory",
       "rarity": "R",
       "weight": 600,
@@ -182,7 +182,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "mask_moon",
+      "id": "formal_hat",
       "kind": "accessory",
       "rarity": "R",
       "weight": 600,
@@ -190,7 +190,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "scarf_red",
+      "id": "plush_hat",
       "kind": "accessory",
       "rarity": "R",
       "weight": 600,
@@ -198,7 +198,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "wing_mini",
+      "id": "skicap",
       "kind": "accessory",
       "rarity": "R",
       "weight": 600,
@@ -206,7 +206,7 @@
       "percent": "2.7242"
     },
     {
-      "id": "lantern_mini",
+      "id": "wand",
       "kind": "accessory",
       "rarity": "R",
       "weight": 600,
@@ -230,7 +230,7 @@
       "percent": "2.0555"
     },
     {
-      "id": "crown_leaf",
+      "id": "crown",
       "kind": "accessory",
       "rarity": "SR",
       "weight": 200,
@@ -238,7 +238,7 @@
       "percent": "2.0555"
     },
     {
-      "id": "headband_leaf",
+      "id": "dragonfly",
       "kind": "accessory",
       "rarity": "SR",
       "weight": 200,
@@ -246,7 +246,7 @@
       "percent": "2.0555"
     },
     {
-      "id": "pendant_dew",
+      "id": "helmet",
       "kind": "accessory",
       "rarity": "SR",
       "weight": 200,
@@ -254,7 +254,7 @@
       "percent": "2.0555"
     },
     {
-      "id": "cape_dusk",
+      "id": "oldsh",
       "kind": "accessory",
       "rarity": "SR",
       "weight": 200,
@@ -270,7 +270,7 @@
       "percent": "1.1368"
     },
     {
-      "id": "hat_straw",
+      "id": "shield",
       "kind": "accessory",
       "rarity": "SSR",
       "weight": 50,
@@ -278,7 +278,7 @@
       "percent": "1.1368"
     },
     {
-      "id": "muffler_cloud",
+      "id": "wing",
       "kind": "accessory",
       "rarity": "SSR",
       "weight": 50,

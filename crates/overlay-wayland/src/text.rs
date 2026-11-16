@@ -458,7 +458,7 @@ mod tests {
         let f = face().expect("CFF spike：字体解不出来 ⇒ §7-R1 的退路（cu2qu 转 glyf / 换字形）");
         let mut rows = Vec::new();
         for px in TIERS {
-            for ch in ['蓝', '盲', '帽', '조', 'か'] {
+            for ch in ['熊', '盲', '帽', '조', 'か'] {
                 let (sp, v) = rasterize(f, px, ch).expect("清单里的字却栅格不出 ⇒ 资产与清单漂了");
                 let cov = v.len();
                 let (w, h) = (sp.w as usize, sp.h as usize);
@@ -586,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             FONT_BYTES.len(),
-            54_516,
+            54_068,
             "入库产物的大小变了 ⇒ 连同 tests/font_assets.rs 的摘要一起改了吗"
         );
     }
@@ -938,11 +938,11 @@ mod tests {
     #[test]
     fn missing_reports_only_the_first_uncovered_char() {
         assert_eq!(missing("余额 1,240"), None);
-        assert_eq!(missing("蓝帽"), None);
+        assert_eq!(missing("老虎"), None);
         // 用一个明确没收进子集的码位（CJK 扩展 A 段的第一字，清单里没有）。
         assert_eq!(missing("㐀"), '㐀'.into());
         assert_eq!(
-            missing("帽㐀蓝"),
+            missing("帽㐀虎"),
             '㐀'.into(),
             "应当报第一个缺字，而不是最后一个"
         );
