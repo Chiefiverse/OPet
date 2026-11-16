@@ -16,3 +16,6 @@ petcore = { workspace = true }
 petstore = { workspace = true }
 # `opet overlay` 复用 Wayland 客户端的解析与运行环（同一份参数口径）
 overlay-wayland = { workspace = true }
+# §3.12 `opet ctl`：请求/应答的编解码（白名单与上限直接读 `petcore::ipc`，不在这里抄表；
+# 路径默认推导直接调 `overlay_wayland::ipc::resolve_path`，同一个函数 = 同一个口径）
+serde_json = { workspace = true }

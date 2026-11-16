@@ -8,6 +8,7 @@ pub mod atlas;
 pub mod card;
 pub mod cli;
 pub mod font;
+pub mod ipc;
 pub mod l10n;
 pub mod menu;
 pub mod panel;

@@ -28,6 +28,14 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
                      off = 整个跳过扩散（只减提交、不增）；两档都不动 dwell 与稀有度色带，
                      也**完全不碰本体动画**（宠物该走还是走）。
                      判据②「闪烁可关」就是这一条 —— 前庭敏感是硬需求，优先于音效
+  --ipc              开控制套接字（§3.12）：NDJSON 一行一请求、方法白名单八条、每条都汇入
+                     既有点位的同一条路径。**默认关**（并发对照轮要干净基线 / 零外联最小面 /
+                     插件入口显式传）。撞活体 socket ⇒ 拒绝启动，不与它抢控制面。
+                     与 --test-rect 互斥：矩形那一轮没有内核，开了也无物可控 = 假开关。
+  --ipc-path PATH    覆盖套接字路径（默认 $XDG_RUNTIME_DIR/opet.sock）。没有 /tmp 兜底 ⇒
+                     缺那个变量时只能显式给这一条（鉴权全靠 socket 文件 0600，世界可写
+                     目录里的固定路径会把「仅该用户」的论证换成「赌没人占」）。
+                     单独给这条而没给 --ipc ⇒ 报错，不静默忽略（--db= 空值同族红线）。
 
 配件（换装）：命令行**没有**开关，只有屏上那三行（换一件 / 穿上 / 脱下）。
   库里有什么由启动时扫目录得出并逐件打进 stderr。库的位置只由环境决定：
@@ -85,6 +93,11 @@ pub struct Args {
     /// 开发态豁免：未拥有的宠物也能换。**与上面那条分开**是拍板④：那条的屏上记号（帽子页的
     /// `*`）作用域里没有宠物，合并就会"标打了而没放行"。`--db` 没给时同样不生效。
     pub allow_unowned_pets: bool,
+    /// §3.12 控制套接字开关。**默认关**（三条理由写在 USAGE 与 `crate::ipc`）。
+    pub ipc: bool,
+    /// `--ipc-path`：套接字路径的显式覆盖；`None` = `$XDG_RUNTIME_DIR/opet.sock`
+    /// （解析归 `crate::ipc::resolve_path`，这里只是把原始值带下去，不在 CLI 算第二遍）。
+    pub ipc_path: Option<String>,
 }
 
 impl Args {
@@ -124,6 +137,29 @@ impl Args {
                 "--db 给了空路径；不写真存档就别给 --db（默认是内存库 + DRYRUN 标）".to_string(),
             );
         }
+        // §3.12 三条形状各拒一次，理由都在 `crate::ipc` 与 USAGE：
+        // · `--ipc --test-rect` = **假开关**（矩形那一轮一行内核代码都不跑，开了 socket 也
+        //   无物可控 —— 与 `--cell` 那一族同形：广告了、解析了、下游没人读）；
+        // · `--ipc-path=` 空值 = `--db=` 同族（既不是默认也不是路径）；
+        // · `--ipc-path` 而没 `--ipc` = "看起来开了档但其实没用上"（用户真正想说的多半是 --ipc，
+        //   静默忽略等于让下一条真命令又踩一次）。
+        if self.ipc && self.test_rect {
+            return Err(
+                "--ipc 与 --test-rect 互斥：矩形路径没有内核，控制面在那里无物可控".to_string(),
+            );
+        }
+        if self
+            .ipc_path
+            .as_deref()
+            .is_some_and(|p| p.trim().is_empty())
+        {
+            return Err("--ipc-path 给了空路径；要默认位置就别给 --ipc-path（默认 = $XDG_RUNTIME_DIR/opet.sock）".to_string());
+        }
+        if !self.ipc && self.ipc_path.is_some() {
+            return Err(
+                "给了 --ipc-path 而没给 --ipc ⇒ 套接字不会开；要控制面就两条一起给".to_string(),
+            );
+        }
         // 配件不再从这里进来（`--accessory` 已删，用户 2026-11-02 原话"配件不是应该由菜单选择吗，
         // 这也不合理"）。⇒ 这一层没有任何配件相关的分支可写：**库里少一件、坏一件都不会让进程
         // 在这里拒绝启动**，那是 `app::discover_accessories` 的 stderr。留下的唯一形状是
@@ -146,6 +182,8 @@ impl Args {
             motion: self.motion.clone(),
             allow_unowned_accessories: self.allow_unowned_accessories,
             allow_unowned_pets: self.allow_unowned_pets,
+            ipc: self.ipc,
+            ipc_path: self.ipc_path.clone(),
         })
     }
 }
@@ -199,6 +237,8 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--no-cursor" => a.no_cursor = true,
             "--allow-unowned-accessories" => a.allow_unowned_accessories = true,
             "--allow-unowned-pets" => a.allow_unowned_pets = true,
+            "--ipc" => a.ipc = true,
+            "--ipc-path" => a.ipc_path = Some(next_val(&mut i)?),
             other => return Err(format!("未知参数: {other}")),
         }
         i += 1;
@@ -395,6 +435,61 @@ mod tests {
             !only_acc.allow_unowned_pets,
             "只放行配件不该顺手放行本体 ⇒ 反过来同样是两个事实源"
         );
+    }
+
+    /// §3.12：`--ipc` 必须走到 `Options` 且**默认关**；三件事的形状各拒一次。
+    ///
+    /// 这条为什么不能省：`every_flag_advertised_in_usage_exists` 只证明解析器认这两个开关，
+    /// 而 `--cell` 那轮的教训是"帮助里在、解析器认、下游没人读" ⇒ 这里把**最后一段**（解析 →
+    /// `Options.ipc`）接上；再下游（bind / 活体拒绝）在 `ipc.rs` 的测试与真机那一轮各自管。
+    /// 三个 `Err` 分支 = 假开关那一族的三个入口，每个都必须**出声**而不是静默修正。
+    #[test]
+    fn ipc_defaults_off_and_the_three_lies_are_refused() {
+        let off = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert!(!off.ipc, "默认必须关着 ⇒ 并发对照轮的干净基线不靠运气");
+        assert_eq!(off.ipc_path, None);
+
+        let on = parse(&v(&["--test-rect", "--ipc"])).unwrap();
+        // --ipc 单独配 --test-rect ⇒ 必须拒（上面那行的 off 用的是不带 ipc 的同一组参数，
+        // 正好证明"拒"来自组合而不是来自 --test-rect 本身）
+        assert!(
+            on.options().is_err(),
+            "矩形那一轮没有内核，控制面无物可控 = 假开关"
+        );
+
+        // --ipc + 真 manifest ⇒ 走到 Options
+        let live = parse(&v(&["--manifest", "x.json", "--ipc"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(live.ipc);
+
+        // 空路径与"给了路径没给开关"都必须报错，不许静默当"没给"
+        assert!(
+            parse(&v(&["--manifest", "x.json", "--ipc", "--ipc-path="]))
+                .unwrap()
+                .options()
+                .is_err()
+        );
+        assert!(
+            parse(&v(&["--manifest", "x.json", "--ipc-path", "/tmp/ctl.sock"]))
+                .unwrap()
+                .options()
+                .is_err(),
+            "给了 --ipc-path 而没 --ipc ⇒ 用户想说的多半是两条一起给"
+        );
+        // 两条一起给 ⇒ 原样带下去（解释路径归 ipc::resolve_path，CLI 不算第二遍）
+        let both = parse(&v(&[
+            "--manifest",
+            "x.json",
+            "--ipc",
+            "--ipc-path",
+            "/tmp/ctl.sock",
+        ]))
+        .unwrap()
+        .options()
+        .unwrap();
+        assert_eq!(both.ipc_path.as_deref(), Some("/tmp/ctl.sock"));
     }
 
     #[test]

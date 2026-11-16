@@ -27,6 +27,7 @@ pub mod behavior;
 pub mod gacha;
 pub mod geom;
 pub mod intent;
+pub mod ipc;
 pub mod physics;
 pub mod render;
 pub mod rng;

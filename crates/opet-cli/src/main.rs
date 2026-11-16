@@ -2,8 +2,9 @@
 //! M3 起加 `gacha-sim`/`catalog`/`pull`/`redeem`/`starter`/`audit`（盲盒引擎与存档，见 [`gacha_cmd`]）；
 //! M4 起加 `overlay`（Wayland 宠物客户端，与 `opet-overlay-wayland` 共用参数口径）；
 //! P1（FLOW §9）加 `pack`（内容包装/卸/预览/校验，见 [`pack_cmd`]）。
-//! IPC 子命令在 M3 之后补（§10.2）。
+//! §3.12 加 `ctl`（控制套接字客户端，与 overlay 的 `--ipc` 配对，见 [`ctl_cmd`]）。
 
+mod ctl_cmd;
 mod gacha_cmd;
 mod pack_cmd;
 
@@ -64,6 +65,14 @@ P1 可用（内容包，完整参数：`opet pack --usage`）：
       账本侧与磁盘侧并排 + 点名两侧差异（§9.2 第 20 条那条「互不相认」）
   opet pack uninstall PACK_ID
       按归属清单删，别人手工放的一律保留
+
+§3.12 控制套接字（完整参数：`opet ctl --usage`）：
+  opet ctl [--socket PATH] [--timeout MS] <method> [json-params]
+      给**在跑的**宠物（overlay 带 `--ipc` 起的那只）发一条 NDJSON 控制请求，一行一答，
+      应答原文进 stdout。方法白名单八条（pet.status/stop/pause/resume/pull/swap/equip、
+      lang.set），每一条都汇入既有点位的同一条路径 ⇒ ctl 能做的不超出鼠标能做的。
+      退出码 0/1/2/3 = 应答 ok / 宠物答了而拒绝 / 用法错（没上 socket）/ 连不上在跑的实例
+      —— 3 那一档就是设计书 §10.2 给插件 widget 读的「没在跑」信号，200 ms 超时。
 
   opet --help
 ";
@@ -242,6 +251,25 @@ fn overlay(args: &[String]) -> ExitCode {
     }
 }
 
+fn ctl(args: &[String]) -> ExitCode {
+    match ctl_cmd::talk(args) {
+        // 应答原文进 stdout（脚本自己 jq），退出码由 `ok` 字段决定 ⇒ 两件事各归一处。
+        Ok((reply, code)) => {
+            println!("{reply}");
+            ExitCode::from(code)
+        }
+        Err(ctl_cmd::CtlError::Usage(e)) => {
+            eprintln!("opet ctl: {e}（完整参数：opet ctl --usage）");
+            ExitCode::from(2)
+        }
+        Err(ctl_cmd::CtlError::Unreachable(e)) => {
+            // §10.2 那一档：widget 与脚本都读退出码 3，这句话给人看、带上原因。
+            eprintln!("opet: 没有在跑的宠物（overlay 需带 --ipc）: {e}");
+            ExitCode::from(3)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // overlay 与 M3 的退出码自成一套，不进下面的 Ok/Err 通道：
@@ -266,6 +294,16 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         return pack_cmd::dispatch(&args[1..]);
+    }
+    // `ctl` 与 overlay/gacha 同一形状：退出码自己的一套（0/1/2/3），不进 Ok/Err 通道、
+    // 不附 usage 全文 —— 脚本读 $? 就行，而 §10.2 把 3 定义成了 widget 的判据。
+    // 裸 `opet ctl` 打完整参数（与 `opet pack` 同一惯例：忘参数比写错参数常见）。
+    if args.first().map(String::as_str) == Some("ctl") {
+        if args.len() == 1 || args.get(1).map(String::as_str) == Some("--usage") {
+            print!("{}", ctl_cmd::USAGE);
+            return ExitCode::SUCCESS;
+        }
+        return ctl(&args[1..]);
     }
     let result = match args.first().map(String::as_str) {
         Some("sim") => {

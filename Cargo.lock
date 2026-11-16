@@ -369,6 +369,7 @@ dependencies = [
  "overlay-wayland",
  "petcore",
  "petstore",
+ "serde_json",
 ]
 
 [[package]]

@@ -46,6 +46,10 @@ pub enum ValueSource {
     /// **无条件打印**的，一句"已持久化"在失败那次就是假话。落没落地由两处单独说：stderr 的
     /// `ui: lang = "…" 已写回 <路径>` 与面板/菜单那条错误行（`app::App::persist_ui_key`）。
     MenuClick,
+    /// §3.12 `lang.set` 经控制套接字改的那一次。与 [`Self::MenuClick`] 同一形状的理由：
+    /// 退出摘要的来源列必须说实话，把 socket 改的记成"菜单/面板当场切换"就是把被控实例
+    /// 的一轮读成有人摸过它 —— 而"这轮到底谁动的"正是并发对照轮要排除的事。
+    Ipc,
 }
 
 impl ValueSource {
@@ -56,6 +60,7 @@ impl ValueSource {
             Self::EnvVar => "环境变量",
             Self::Default => "默认值",
             Self::MenuClick => "菜单/面板当场切换",
+            Self::Ipc => "控制套接字(opet ctl)",
         }
     }
 }

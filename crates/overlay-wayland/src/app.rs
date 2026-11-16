@@ -77,6 +77,7 @@ use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::atlas::Atlas;
 use crate::card;
+use crate::ipc;
 use crate::l10n::{self, Key, Lang};
 use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
 use crate::panel::{self, CollectionTab, PanelKind};
@@ -134,6 +135,14 @@ pub struct Options {
     /// 本体侧因此**没有**任何屏上记号（拍板④），判据只在 [`App::pet_exempt`] 一处；与配件那条
     /// 一样，不给 `--db` 时不生效（演示态本来就放行），那一档由启动时一行 stderr 说清。
     pub allow_unowned_pets: bool,
+    /// `--ipc`：开 §3.12 本地控制套接字。**显式 opt-in，缺省关闭**，三条理由在设计书那一节
+    /// 原文里：① 固定全局路径 + 默认开 = 第二个实例撞 `EADDRINUSE` 或更糟——控制通道静默留在
+    /// 第一个实例上，而**并发对照轮是这台机器既定的真机方法论**；② 与"默认零外联"同族的
+    /// 最小面原则；③ 插件形态的 `run.sh` 会显式带它，缺省关不损任何功能。
+    pub ipc: bool,
+    /// `--ipc-path <P>`：覆盖默认的 `$XDG_RUNTIME_DIR/opet.sock`。存在的理由就是设计书那两句
+    /// ——headless 传输测试与"故意起第二只验拒绝"都要一个不撞默认值的路径。
+    pub ipc_path: Option<String>,
 }
 
 impl Default for Options {
@@ -152,6 +161,8 @@ impl Default for Options {
             motion: None,
             allow_unowned_accessories: false,
             allow_unowned_pets: false,
+            ipc: false,
+            ipc_path: None,
         }
     }
 }
@@ -1659,6 +1670,26 @@ pub fn run(opts: Options) -> Result<(), String> {
         last_press: None,
         pointer_world: Vec2::ZERO,
     };
+    // §3.12：控制面的门**必须在进事件环之前过**。bind 失败（含"撞见活体监听者"那一支）=
+    // 这里 `?` 提前返回 Err ⇒ 进程非零退出、surface 一个都没映射 —— 宁可不起宠物，
+    // 也不起一只"给了 --ipc 而控制面不存在"的含糊档（假开关那一族）。
+    // `_ipc_guard` 绑到函数末尾：它的 Drop 就是退出时 unlink（kill -9 那一档留给 bind
+    // 的探针自愈，§3.12 验收⑤登记过）。
+    let (mut ipc_listener, _ipc_guard): (
+        Option<std::os::unix::net::UnixListener>,
+        Option<ipc::SocketGuard>,
+    ) = if app.opts.ipc {
+        let path = ipc::resolve_path(app.opts.ipc_path.as_deref())?;
+        let (listener, guard) = ipc::bind(&path)?;
+        eprintln!(
+            "ipc: 控制套接字 {} 就绪（NDJSON 一行一请求，白名单 {} 个方法；opet ctl 连这里）",
+            path.display(),
+            petcore::ipc::METHODS.len()
+        );
+        (Some(listener), Some(guard))
+    } else {
+        (None, None)
+    };
     let mut evl: EventLoop<App> = EventLoop::try_new().map_err(|e| e.to_string())?;
     let handle = evl.handle();
     let signal: LoopSignal = evl.get_signal();
@@ -1669,6 +1700,11 @@ pub fn run(opts: Options) -> Result<(), String> {
             TimeoutAction::ToDuration(period)
         })
         .map_err(|e| format!("定时器装不上: {e:?}"))?;
+    // §3.12 挂载监听者：一次性、永不摘除（摘掉 = 再没人能连，而这不是任何方法能请求的
+    // 状态）。`handle` 下面会被 WaylandSource 按值吃掉，所以这一对在它之前。
+    if let Some(listener) = ipc_listener.take() {
+        ipc::attach(&handle, listener);
+    }
     WaylandSource::new(app.conn.clone(), event_queue)
         .insert(handle)
         .map_err(|e| format!("wayland source 装不上: {e:?}"))?;
@@ -3521,7 +3557,8 @@ impl App {
         m.items = menu::rects(next);
     }
 
-    /// 点"退出"：**这是 `exit` 的第二个写入点**（第一个是 `--seconds` 到点）。
+    /// 点"退出"，或 §3.12 `pet.stop` 从套接字发来同一件事：**这是 `exit` 的第二个写入点**
+    /// （第一个是 `--seconds` 到点）。
     ///
     /// 两步的顺序是有意的：先 `close_menu()` 与 `close_panel()`（`teardown()` 已按 region →
     /// viewport → layer → surface 的次序收回，两块面都不会活得比决定久），再置 `exit`。
@@ -3541,7 +3578,7 @@ impl App {
         self.close_menu();
         self.close_panel();
         self.exit = true;
-        eprintln!("ui: 菜单请求退出 ⇒ 收尾并打退出摘要");
+        eprintln!("ui: 收到退出请求（菜单或控制套接字）⇒ 收尾并打退出摘要");
     }
 
     /// 动作页四行 + 暂停那一行 ⇒ 一条 `Command::Go`，**不在客户端预判内核会不会响应**。
@@ -4310,11 +4347,19 @@ impl App {
     /// 它对"这次到底落没落地"有最后发言权。
     fn cycle_lang(&mut self) {
         let next = self.ui.lang.next();
+        self.apply_lang(next, settings::ValueSource::MenuClick);
+    }
+
+    /// **一档新语言被应用 + 写回的唯一落点**（[`Self::cycle_lang`] 的点击臂与 §3.12
+    /// `lang.set` 的套接字臂共用这一处）。拆出这一层不是省事：`lang_from` 那一列必须记
+    /// **真的**是谁动的（点击 = `MenuClick`、socket = `Ipc`），两处各写一遍四步联动，
+    /// 第二份迟早漏一步 —— 而漏的那一步在退出摘要里读不出来。
+    fn apply_lang(&mut self, next: Lang, source: settings::ValueSource) {
         // 写回之前先记下这一档原来是从哪层来的：命令行高于文件（§4.6），所以从 `--lang`
         // 启动的那一次点了也不会下次生效，这句话必须说，不然是"点了没反应"的假故障。
         let from_cli = self.ui.lang_from == settings::ValueSource::Cli;
         self.ui.lang = next;
-        self.ui.lang_from = settings::ValueSource::MenuClick;
+        self.ui.lang_from = source;
         if let Some(m) = self.menu.as_mut() {
             m.lang = next;
             m.force_draw = true;
@@ -4471,6 +4516,145 @@ impl App {
         }
         if let Some(sim) = self.sim.as_mut() {
             sim.send(Command::DoubleTap);
+        }
+    }
+
+    /// §3.12：**IPC 侧唯一的应用点** —— `petcore::ipc::handle` 产出的 `Effect` 在这里落到
+    /// 既有的单入口函数，每一臂的现行落点就标在臂上（方法集表那一列的"不许绕过"在代码里的
+    /// 形状）。本函数自己只写两类东西：按 id 在**已扫盘的** `bodies`/`candidates` 表里解下标
+    /// （不重扫盘、不出现 `pet_root(`、不第二条 `accessory_root(`）与读 `ui_error` 侧的一眼。
+    ///
+    /// 失败返回 `(错误码, 一句人读的话)`，由 `crate::ipc` 的成帧层编成一行；**不 panic、
+    /// 不置 `exit`**（硬约束 3 同族 —— 唯一的例外是 `Stop` 臂，那一臂的效果就是请求本身）。
+    pub(crate) fn ipc_apply(
+        &mut self,
+        eff: petcore::ipc::Effect,
+    ) -> Result<Option<serde_json::Value>, (String, String)> {
+        use petcore::ipc::{Effect, code};
+        match eff {
+            // ── 纯读，现成分段全有 ──
+            Effect::Status => {
+                let mut data = serde_json::json!({
+                    "pid": std::process::id(),
+                    "ticks": self.ticks,
+                    "body": self.body_id,
+                    "lang": self.ui.lang.code(),
+                    "db": self.opts.db,
+                });
+                // `equipped` 那一列**刻意不 `ensure_gacha()`**：为一次"问一问"把 rusqlite 的
+                // 页缓存连本带利接进进程，正是 D16 那条 lazy 门设计要拦的事（lazy 的原文理由
+                // 就写在 `App::gacha` 的字段注释上）。⇒ `null` = 这一轮还没人用过库（演示态，
+                // 或第一次抽取/验账未发生），**不是**"库里没有"；数组 = 真读到了行；
+                // 对象带 `error` = 连了库而这一问失败，如实报出而不是把库读成空。
+                data["equipped"] = match self.gacha.as_ref() {
+                    None => serde_json::Value::Null,
+                    Some(g) => match g.store.equipped(petstore::DEFAULT_PROFILE) {
+                        Ok(rows) => serde_json::Value::Array(
+                            rows.into_iter()
+                                .map(|(slot, item)| {
+                                    serde_json::json!({ "slot": slot, "item_id": item })
+                                })
+                                .collect(),
+                        ),
+                        Err(e) => serde_json::json!({ "error": e.to_string() }),
+                    },
+                };
+                Ok(Some(data))
+            }
+            // ── 生命周期 ──
+            Effect::Stop => {
+                self.quit_pet();
+                Ok(None)
+            }
+            Effect::Pause => {
+                self.send_action(Action::Sleep);
+                Ok(None)
+            }
+            Effect::Resume => {
+                // `Command::Wake` 是内核早留的那一臂（machine.rs 的注释原文就写着
+                // "快捷键/IPC 显式唤醒"）⇒ 唤醒不挑动作，也不在客户端预判内核响应。
+                if let Some(sim) = self.sim.as_mut() {
+                    sim.send(Command::Wake);
+                }
+                Ok(None)
+            }
+            // ── 玩法：每一臂都汇入既有点位的那同一条同步路径 ──
+            Effect::Pull { banner, count } => {
+                if let Some(b) = banner.as_deref() {
+                    if b != petstore::DEFAULT_BANNER {
+                        return Err((
+                            code::UNAVAILABLE.to_string(),
+                            format!(
+                                "banner {b:?} 不在 v1 唯一的那一池 {:?}",
+                                petstore::DEFAULT_BANNER
+                            ),
+                        ));
+                    }
+                }
+                self.do_pull(count as u32);
+                // `do_pull` 把失败出声到错误行而**不停宠物**（硬约束 3），而错误行恰好是
+                // 它的失败信号：成功路径会清掉它，所以"事后还在"= 这一次失败。
+                match self.ui_error.clone() {
+                    Some(msg) => Err((code::INTERNAL.to_string(), msg)),
+                    None => Ok(Some(serde_json::json!({ "balance": self.gacha_balance() }))),
+                }
+            }
+            Effect::Swap { id } => {
+                // 键 = `BodyCandidate::id`（库目录名 = 库存那一侧的身份），不是清单 slug ——
+                // 与 `equipped` 的 `body` 行、P1 的 INV 门禁同一个键，那三处早就裁定过。
+                let Some(i) = self.bodies.iter().position(|b| b.id == id) else {
+                    return Err((
+                        code::UNAVAILABLE.to_string(),
+                        format!(
+                            "本体库里没有 {id:?}（启动四道门禁扫出的表，跨档的那几只不在其中）"
+                        ),
+                    ));
+                };
+                self.swap_body(i);
+                // **这里没有第二套判定**：same_id / 跨档的拒绝归 `swap_body` 的第 1 步，
+                // 应答带最终 body id，客户端拿它跟自己请求的那一对（ok:true ≠ 换成功了，
+                // 这一句在设计书那句"handler 只产 intent"的射程里）。
+                Ok(Some(serde_json::json!({ "body": self.body_id })))
+            }
+            Effect::Equip { slot, id } => {
+                let Some(i) = self.candidates.iter().position(|c| c.id == id) else {
+                    return Err((
+                        code::UNAVAILABLE.to_string(),
+                        format!(
+                            "配件库里没有 {id:?}（未抽到 / 未装包 / 被四道门禁跳过，三者之一）"
+                        ),
+                    ));
+                };
+                // 槽位以**配件清单**为准：客户端声称的与实际不符是请求错（BAD_PARAMS），
+                // 静默按清单穿上去就是"应答说谎"那一族。
+                let actual = self.candidates[i].manifest.slot;
+                if actual != slot {
+                    return Err((
+                        code::BAD_PARAMS.to_string(),
+                        format!("{id:?} 的槽位是 {actual}，请求里写的 {slot} 对不上"),
+                    ));
+                }
+                self.pick_and_wear(i);
+                Ok(Some(serde_json::json!({
+                    "wearing": self.worn.as_ref().map(|w| w.manifest.slug.clone())
+                })))
+            }
+            Effect::SetLang { code: want } => match Lang::parse(&want) {
+                Some(lang) => {
+                    self.apply_lang(lang, settings::ValueSource::Ipc);
+                    Ok(Some(serde_json::json!({ "lang": lang.code() })))
+                }
+                None => Err((
+                    code::BAD_PARAMS.to_string(),
+                    format!("不认识的语言码 {want:?}（只认 --help 列的那四码）"),
+                )),
+            },
+            // 协议层拒掉的东西到不了这里（`crate::ipc` 直接发回 `handle` 给的应答），
+            // 走到这说明成帧层写错了一臂 —— 那是接线 bug，如实报 internal。
+            Effect::Reply(_) => Err((
+                code::INTERNAL.to_string(),
+                "协议层应答被当成动作送进应用点".to_string(),
+            )),
         }
     }
 
@@ -5913,10 +6097,14 @@ mod tests {
         );
         // ④ 新那条路只有一个入口，别让它被复制一份到某个 `match` 臂里（复制的那份会自己
         //    决定"要不要先释放"，而那是这一整条设计的全部安全性所在）。
+        // ⚠️ **1 → 2 = §3.12 `pet.equip`**：第二个调用点在 `ipc_apply`，它同样只调这个函数、
+        // 不自写赋值 ⇒ 这一条从"只有一个入口"换成了"入口只许是这两个**转发**"。多出来的第三处
+        // 仍然是要人看一眼的时刻（它多半是在复制九步里的某几步）。
         assert_eq!(
             code.matches("self.pick_and_wear(").count(),
-            1,
-            "`pick_and_wear` 只许被 `on_panel_press` 的 `Wear` 那一臂调用，实际 {} 处",
+            2,
+            "`pick_and_wear` 只许有两个调用点：`on_panel_press` 的 `Wear` 臂 + §3.12 的 \
+             `ipc_apply`，实际 {} 处",
             code.matches("self.pick_and_wear(").count()
         );
 
@@ -5949,12 +6137,24 @@ mod tests {
         //    第五段（下面 ⑦）钉的是那九步的**次序**。全部理由同一个：`App` 在没有 compositor
         //    的机器上构造不起来 ⇒ "屏上是那只而记忆里是另一只"、"屏上一个像素没动而日志说换了"
         //    这两类形状在 headless 里除了读文本没有别的读数（①–⑤ 与 P3 变异 G 同一族）。
+        // ⚠️ **1 → 2 = §3.12 `pet.swap`**：第二个调用点在 `ipc_apply`，它只做"id → 下标"这一件
+        // 事再转发九步，自己**不判定**（same_id / 跨档的拒绝全部留在 `swap_body` 第 1 步）⇒
+        // 与 ④ 换的是同一个主语："唯一落点"现在是"两个转发点"。而 ⑥′ 那条"函数体里不许出现
+        // `pet_root(`"同样覆盖不到 ipc_apply 也不许覆盖到 —— 它读的是 `swap_body`，ipc_apply
+        // 里若有人手滑加扫盘，红的是下面 `self.bodies` 那一条不存在……所以这里补一条方向相同的
+        // 断言：`ipc_apply` 函数体内既不许 `pet_root(` 也不许 `accessory_root(`（它只许查表）。
         assert_eq!(
             code.matches("self.swap_body(").count(),
-            1,
-            "`swap_body` 只许被 `on_panel_press` 的 `Body` 那一臂调用，实际 {} 处 ⇒ 多出来的那份\
-             会自己决定九步的次序",
+            2,
+            "`swap_body` 只许有两个调用点：`on_panel_press` 的 `Body` 臂 + §3.12 的 `ipc_apply`，\
+             实际 {} 处 ⇒ 多出来的那份会自己决定九步的次序",
             code.matches("self.swap_body(").count()
+        );
+        let ipc_body = body("ipc_apply");
+        assert!(
+            !ipc_body.contains("pet_root(") && !ipc_body.contains("accessory_root("),
+            "`ipc_apply` 只许在**已扫盘的** bodies/candidates 表里按 id 解下标；出现扫盘调用 = \
+             第二条装载路径（P5 那条第 6 步扫错根的 P0 换了个入口复发）"
         );
         assert_eq!(
             code.matches("self.persist_body(").count(),
