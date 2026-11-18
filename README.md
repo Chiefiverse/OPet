@@ -29,6 +29,7 @@ crates/overlay-wayland/    Wayland layer-shell 客户端（宠物上屏 + 点击
   assets/fonts/            ui.otf 子集 + ui-codepoints.txt（码位单一事实源）+ OFL 许可证与声明
 scripts/                   真机验收清单
 shell-widget/              Omarchy 入口插件（manifest + Service.qml 拥有宠物进程生命周期 + 顶栏图标与四档弹卡，走 `--ipc`）
+                           ⚠️ 这里是唯一事实源；发布 = 摊平到独立仓（Omarchy 只认"仓库根 = 插件根"），见下面 publish_plugin.sh
 tools/                     bake.py / pack.py / validate.py / subset_font.py（子集重建与自检）
 ```
 
@@ -80,6 +81,12 @@ python3 tools/subset_font.py --verify            # 自检入库子集与码位�
 ./target/release/opet audit verify --file audit.jsonl --seed S
                                                  # 第三方重放：只吃这个文件 + seed
                                                  # 要证明"没被删尾行"必须加 --expect-head HEX
+
+bash scripts/publish_plugin.sh --verify          # Omarchy 插件仓防漂移门禁：产物与 shell-widget/
+                                                 # 不一致、或有提交没推 ⇒ exit 1（默认档只摊平，不碰网络）
+omarchy plugin add https://github.com/Chiefiverse/OPetPlugIn.git --enable
+                                                 # 别人怎么装入口插件（要 Omarchy 4+）；装完仍需在
+                                                 # Setup → Plugins 填 opet 可执行文件与 pet.json
 ```
 
 ## 许可
