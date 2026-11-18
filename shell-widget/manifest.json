@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "id": "opet.pet",
+  "name": "OPet",
+  "version": "0.1.0",
+  "author": "Chiefiverse",
+  "license": "AGPL-3.0-only",
+  "description": "Bar entry for the OPet desktop pet: start, stop, pause and pull without leaving the bar.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OPet",
+    "description": "Supervises the pet's layer-shell process and talks to it over its control socket.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "binary": "",
+      "petManifest": "",
+      "petsDir": "",
+      "accessoriesDir": "",
+      "db": "",
+      "panelTop": 0,
+      "autoStart": "No"
+    },
+    "schema": [
+      {
+        "key": "binary",
+        "type": "path",
+        "label": "opet executable",
+        "defaultValue": "",
+        "description": "Absolute path to the opet binary. Required - nothing is guessed."
+      },
+      {
+        "key": "petManifest",
+        "type": "path",
+        "label": "Body manifest (pet.json)",
+        "defaultValue": "",
+        "description": "The pet to start. Required - the overlay refuses to run without it."
+      },
+      {
+        "key": "petsDir",
+        "type": "path",
+        "label": "Pet library directory ($OPET_PETS)",
+        "defaultValue": "",
+        "description": "Needed for the collection book to list more than the one body above."
+      },
+      {
+        "key": "accessoriesDir",
+        "type": "path",
+        "label": "Accessory library directory ($OPET_ACCESSORIES)",
+        "defaultValue": "",
+        "description": "The wardrobe reads accessories from here."
+      },
+      {
+        "key": "db",
+        "type": "path",
+        "label": "Save file (--db)",
+        "defaultValue": "",
+        "description": "Empty = demo mode: nothing is written to disk and the card shows DRYRUN."
+      },
+      {
+        "key": "panelTop",
+        "type": "integer",
+        "label": "Bar height in logical pixels (0 = measure)",
+        "min": 0,
+        "max": 200,
+        "step": 1,
+        "defaultValue": 0,
+        "description": "0 asks Hyprland for the reserved top edge before every start. Set it only to override."
+      },
+      {
+        "key": "autoStart",
+        "type": "enum",
+        "label": "Start the pet when the shell loads",
+        "options": ["No", "Yes"],
+        "defaultValue": "No",
+        "description": "The pet lives under the shell's supervision, so restarting the shell restarts it."
+      }
+    ]
+  }
+}

@@ -28,6 +28,7 @@ crates/overlay-wayland/    Wayland layer-shell 客户端（宠物上屏 + 点击
   settings.rs              `--lang`/`--motion` > config.toml > LC_ALL/LANG > 默认 的唯一裁决处
   assets/fonts/            ui.otf 子集 + ui-codepoints.txt（码位单一事实源）+ OFL 许可证与声明
 scripts/                   真机验收清单
+shell-widget/              Omarchy 入口插件（manifest + Service.qml 拥有宠物进程生命周期 + 顶栏图标与四档弹卡，走 `--ipc`）
 tools/                     bake.py / pack.py / validate.py / subset_font.py（子集重建与自检）
 ```
 
