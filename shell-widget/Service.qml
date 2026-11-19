@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "i18n.js" as I18N
 
 // Owns the pet's process: the bar widget only reads the properties below.
 // Nothing here polls - state moves on Process signals and on the pet's own
@@ -29,14 +30,15 @@ Item {
     accessoriesDir: "",
     db: "",
     panelTop: 0,
-    autoStart: false
+    autoStart: false,
+    language: "en"
   })
   property var overridden: ({})
 
   function fillDefaults() {
     var d = root.defaults
     if (!d) return
-    var keys = ["binary", "petManifest", "petsDir", "accessoriesDir", "db", "panelTop", "autoStart"]
+    var keys = ["binary", "petManifest", "petsDir", "accessoriesDir", "db", "panelTop", "autoStart", "language"]
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i]
       if (root.overridden[k]) continue
@@ -74,6 +76,10 @@ Item {
 
   function truthy(v) {
     return v === true || String(v).toLowerCase() === "yes" || String(v) === "1"
+  }
+
+  function tr(key, subs) {
+    return I18N.t(root.cfg.language, key, subs)
   }
 
   function note(line) {
@@ -117,7 +123,8 @@ Item {
       if (root.cfg[k] !== v) {
         root.overridden[k] = true
         root.cfg[k] = v
-        if (k !== "autoStart") changed = true
+        // Neither of these changes anything the running process reads.
+        if (k !== "autoStart" && k !== "language") changed = true
       }
     }
     root.restartPending = changed && root.phase !== "stopped" && root.phase !== "refused"
@@ -154,24 +161,24 @@ Item {
   }
 
   function pause() {
-    if (root.phase !== "running") return "宠物没在跑"
+    if (root.phase !== "running") return tr("svc_not_running")
     return ctlSend("pet.pause", "", 200)
   }
 
   function resume() {
-    if (root.phase !== "running") return "宠物没在跑"
+    if (root.phase !== "running") return tr("svc_not_running")
     return ctlSend("pet.resume", "", 200)
   }
 
   function pull(count) {
-    if (root.phase !== "running") return "宠物没在跑"
+    if (root.phase !== "running") return tr("svc_not_running")
     var n = Number(count)
     if (!isFinite(n) || n < 1) n = 1
     return ctlSend("pet.pull", JSON.stringify({ count: Math.floor(n) }), 3000)
   }
 
   function refreshStatus() {
-    if (root.phase !== "running") return "宠物没在跑"
+    if (root.phase !== "running") return tr("svc_not_running")
     return ctlSend("pet.status", "", 200)
   }
 
@@ -195,15 +202,15 @@ Item {
     root.probeHandled = true
     var parts = String(line).trim().split(" ")
     if (parts[0] === "NO_BIN") {
-      refuse("没找到可执行的 opet（当前 binary = \"" + root.cfg.binary + "\"）")
+      refuse(tr("svc_no_binary", { v: root.cfg.binary }))
       return
     }
     if (parts[0] === "NO_MAN") {
-      refuse("本体清单不存在（当前 petManifest = \"" + root.cfg.petManifest + "\"）")
+      refuse(tr("svc_no_manifest", { v: root.cfg.petManifest }))
       return
     }
     if (parts[0] !== "OK") {
-      refuse("预检没有给出结果（读到 \"" + String(line).trim() + "\"）")
+      refuse(tr("svc_probe_no_result", { v: String(line).trim() }))
       return
     }
     var top = Number(root.cfg.panelTop)
@@ -243,7 +250,7 @@ Item {
     if (root.phase === "refused") return
     if (code === 2) {
       root.phase = "external"
-      root.reason = "控制套接字被另一个活的实例占着（退出码 2）⇒ 这一轮不接管"
+      root.reason = tr("svc_external")
       return
     }
     if (!root.desiredRunning) {
@@ -252,17 +259,18 @@ Item {
     }
     root.failCount += 1
     if (root.failCount >= 3) {
-      refuse("连续 " + root.failCount + " 次异常退出（最后一次退出码 " + code + "）⇒ 停止重启。尾部日志：" + root.tail.join(" | "))
+      refuse(tr("svc_fail_loop",
+        { n: root.failCount, code: code, tail: root.tail.join(" | ") }))
       return
     }
     root.phase = "backoff"
-    root.reason = "第 " + root.failCount + " 次重启（退出码 " + code + "）"
+    root.reason = tr("svc_restart_n", { n: root.failCount, code: code })
     retryTimer.interval = 500 * Math.pow(2, root.failCount - 1)
     retryTimer.restart()
   }
 
   function ctlSend(method, paramsJson, timeoutMs) {
-    if (root.cfg.binary === "") return "未配置 opet 可执行文件"
+    if (root.cfg.binary === "") return tr("svc_binary_unconfigured")
     var argv = [root.cfg.binary, "ctl"]
     if (timeoutMs) argv.push("--timeout", String(timeoutMs))
     argv.push(String(method))
@@ -300,7 +308,7 @@ Item {
       } else {
         root.statusError = doc && doc.error
           ? String(doc.error.message || doc.error.code)
-          : "pet.status 没有回话（宠物可能没在跑）"
+          : tr("svc_status_silent")
       }
     } else if (m === "pet.stop" && !(doc && doc.ok === true)) {
       pet.running = false
@@ -319,7 +327,7 @@ Item {
     id: probe
     stdout: SplitParser { splitMarker: "\n"; onRead: function(line) { root.handleProbe(line) } }
     onExited: function(code, status) {
-      if (!root.probeHandled) root.refuse("预检进程退出码 " + code + "，且没有给出结论")
+      if (!root.probeHandled) root.refuse(tr("svc_probe_exit", { code: code }))
     }
   }
 

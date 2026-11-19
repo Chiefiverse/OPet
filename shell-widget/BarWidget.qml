@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import qs.Ui
 import qs.Commons
+import "i18n.js" as I18N
 
 BarWidget {
   id: root
@@ -16,6 +17,11 @@ BarWidget {
 
   property bool popupOpen: false
 
+  // "language" is for the widget itself; the service gets its copy through
+  // the same stamp push below, so both sides always render the same tongue.
+  readonly property string lang: I18N.norm(
+    root.settings && root.settings.language ? String(root.settings.language) : "en")
+
   implicitWidth: glyphBox.implicitWidth + Style.space(8)
   implicitHeight: barSize
 
@@ -26,7 +32,7 @@ BarWidget {
 
   // The per-widget entry in shell.json is only readable here, so the effective
   // config is pushed into the service rather than duplicated by it.
-  readonly property var overrideKeys: ["binary", "petManifest", "petsDir", "accessoriesDir", "db", "panelTop", "autoStart"]
+  readonly property var overrideKeys: ["binary", "petManifest", "petsDir", "accessoriesDir", "db", "panelTop", "autoStart", "language"]
 
   // The host patches inline settings by reassigning `settings` on the live
   // widget, so the binding has to read that property itself: reading it only
@@ -54,29 +60,31 @@ BarWidget {
   Component.onCompleted: push()
 
   function tip() {
-    if (phase === "absent") return "OPet：服务没加载（插件未启用或没装好）"
-    if (phase === "refused") return "OPet 拒绝启动：" + (svc ? svc.reason : "")
-    if (phase === "external") return "OPet：已有一个实例在控制那个套接字，这一轮没接管"
-    if (phase === "starting") return "OPet：正在起"
-    if (phase === "backoff") return "OPet：进程掉了，正在重启（" + (svc ? svc.reason : "") + "）"
-    if (phase === "running") return "OPet：在跑（pid " + (svc ? svc.petPid : 0) + "）"
-    return "OPet：没在跑"
+    var L = root.lang
+    if (phase === "absent") return I18N.t(L, "tip_absent")
+    if (phase === "refused") return I18N.t(L, "tip_refused", { reason: svc ? svc.reason : "" })
+    if (phase === "external") return I18N.t(L, "tip_external")
+    if (phase === "starting") return I18N.t(L, "tip_starting")
+    if (phase === "backoff") return I18N.t(L, "tip_backoff", { reason: svc ? svc.reason : "" })
+    if (phase === "running") return I18N.t(L, "tip_running", { pid: svc ? svc.petPid : 0 })
+    return I18N.t(L, "tip_stopped")
   }
 
   Item {
     id: glyphBox
     anchors.centerIn: parent
-    implicitWidth: glyph.implicitWidth
-    implicitHeight: glyph.implicitHeight
+    implicitWidth: glyph.width
+    implicitHeight: glyph.height
 
-    Text {
+    Image {
       id: glyph
-      textFormat: Text.PlainText
-      text: root.alive ? "●" : (root.blocked ? "!" : "○")
-      color: root.phase === "running" ? root.bar.barForeground
-        : (root.blocked ? root.bar.urgent : Qt.darker(root.bar.barForeground, 1.6))
-      font.family: root.bar.fontFamily
-      font.pixelSize: Style.font.body
+      height: root.barSize
+      width: height
+      source: root.alive ? "assets/run.png" : "assets/logo.png"
+      sourceSize.width: 48
+      sourceSize.height: 48
+      fillMode: Image.PreserveAspectFit
+      smooth: true
     }
   }
 
@@ -119,7 +127,7 @@ BarWidget {
         spacing: Style.space(6)
 
         Button {
-          text: root.alive ? "停止" : "启动"
+          text: root.alive ? I18N.t(root.lang, "btn_stop") : I18N.t(root.lang, "btn_start")
           bordered: true
           foreground: root.bar.foreground
           enabled: root.svc !== null
@@ -131,7 +139,7 @@ BarWidget {
         }
 
         Button {
-          text: "暂停"
+          text: I18N.t(root.lang, "btn_pause")
           bordered: true
           foreground: root.bar.foreground
           enabled: root.phase === "running"
@@ -139,7 +147,7 @@ BarWidget {
         }
 
         Button {
-          text: "恢复"
+          text: I18N.t(root.lang, "btn_resume")
           bordered: true
           foreground: root.bar.foreground
           enabled: root.phase === "running"
@@ -151,7 +159,7 @@ BarWidget {
         spacing: Style.space(6)
 
         Button {
-          text: "抽一次"
+          text: I18N.t(root.lang, "btn_pull1")
           bordered: true
           foreground: root.bar.foreground
           enabled: root.phase === "running"
@@ -159,7 +167,7 @@ BarWidget {
         }
 
         Button {
-          text: "十连"
+          text: I18N.t(root.lang, "btn_pull10")
           bordered: true
           foreground: root.bar.foreground
           enabled: root.phase === "running"
@@ -180,17 +188,21 @@ BarWidget {
   }
 
   function detail() {
-    if (!root.svc) return "服务没加载"
+    var L = root.lang
+    if (!root.svc) return I18N.t(L, "detail_no_service")
     var bits = []
     var st = root.status
     if (st) {
-      if (st.body) bits.push("本体 " + st.body)
-      if (st.lang) bits.push("语言 " + st.lang)
-      bits.push(st.db ? "存档 " + st.db : "演示态（不写盘）")
+      if (st.body) bits.push(I18N.t(L, "detail_body", { v: st.body }))
+      if (st.lang) bits.push(I18N.t(L, "detail_lang", { v: st.lang }))
+      bits.push(st.db
+        ? I18N.t(L, "detail_db", { v: st.db })
+        : I18N.t(L, "detail_demo"))
     }
     if (root.svc.resolvedPanelTop > 0)
-      bits.push("栏高 " + root.svc.resolvedPanelTop + " (" + root.svc.panelTopSource + ")")
-    if (root.svc.restartPending) bits.push("配置已改，下次启动才生效")
+      bits.push(I18N.t(L, "detail_panel",
+        { v: root.svc.resolvedPanelTop, s: root.svc.panelTopSource }))
+    if (root.svc.restartPending) bits.push(I18N.t(L, "detail_restart_pending"))
     if (root.svc.statusError) bits.push(String(root.svc.statusError))
     return bits.join(" · ")
   }

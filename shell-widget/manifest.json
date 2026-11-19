@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "opet.pet",
   "name": "OPet",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Chiefiverse",
   "license": "AGPL-3.0-only",
   "description": "Bar entry for the OPet desktop pet: start, stop, pause and pull without leaving the bar.",
@@ -15,6 +15,11 @@
     "service": "Service.qml",
     "barWidget": "BarWidget.qml"
   },
+  "files": [
+    "i18n.js",
+    "assets/logo.png",
+    "assets/run.png"
+  ],
   "barWidget": {
     "displayName": "OPet",
     "description": "Supervises the pet's layer-shell process and talks to it over its control socket.",
@@ -28,7 +33,8 @@
       "accessoriesDir": "",
       "db": "",
       "panelTop": 0,
-      "autoStart": "No"
+      "autoStart": "No",
+      "language": "en"
     },
     "schema": [
       {
@@ -83,6 +89,14 @@
         "options": ["No", "Yes"],
         "defaultValue": "No",
         "description": "The pet lives under the shell's supervision, so restarting the shell restarts it."
+      },
+      {
+        "key": "language",
+        "type": "enum",
+        "label": "语言 / Language",
+        "options": ["en", "zh"],
+        "defaultValue": "en",
+        "description": "Language of the bar tooltip and the popup card. Takes effect immediately, no restart."
       }
     ]
   }

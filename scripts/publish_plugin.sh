@@ -32,12 +32,15 @@ while (( $# )); do
   shift
 done
 
-echo "== 1/4 发布清单（读 manifest 的 entryPoints，不硬编码文件名）"
+echo "== 1/4 发布清单（读 manifest 的 entryPoints 与 files，不硬编码文件名）"
 [[ -f "$SRC/manifest.json" ]] || { echo "缺 $SRC/manifest.json" >&2; exit 1; }
 files=(manifest.json)
 while IFS= read -r ep; do
   [[ -n $ep ]] && files+=("$ep")
 done < <(jq -r '.entryPoints | to_entries[] | .value' "$SRC/manifest.json" | sort -u)
+while IFS= read -r extra; do
+  [[ -n $extra ]] && files+=("$extra")
+done < <(jq -r '(.files // [])[]' "$SRC/manifest.json")
 for f in "${files[@]}"; do
   [[ $f != /* && $f != *..* ]] || { echo "入口必须是不含 .. 的相对路径，manifest 却写了：$f" >&2; exit 1; }
   [[ -f "$SRC/$f" ]] || { echo "manifest 指到 $SRC/$f，但它不存在" >&2; exit 1; }
@@ -76,7 +79,10 @@ fi
 
 echo "== 3/4 摊平"
 while IFS= read -r -d '' f; do rm -f "$OUT/$f"; done < <(git -C "$OUT" ls-files -z)
-for f in "${files[@]}"; do cp "$SRC/$f" "$OUT/$f"; done
+for f in "${files[@]}"; do
+  mkdir -p "$(dirname "$OUT/$f")"
+  cp "$SRC/$f" "$OUT/$f"
+done
 [[ -f LICENSE ]] || { echo "缺 LICENSE（产物仓要带许可）" >&2; exit 1; }
 cp LICENSE "$OUT/LICENSE"
 
@@ -86,24 +92,35 @@ case $REMOTE in
   *) PUB=$REMOTE; echo "  ⚠️ --remote 不是 https 形式，产物仓 README 里的安装命令会照抄它" ;;
 esac
 cat > "$OUT/README.md" <<'PUBDOC'
-# opet.pet（Omarchy 入口插件 · 发布件）
+# opet.pet (Omarchy entry plugin · release build)
 
-顶栏图标控制 [OPet](https://github.com/Chiefiverse/OPet) 桌面宠物：启动 / 停止 / 暂停 / 恢复 / 抽一次 / 十连。
-宠物是独立的 layer-shell 进程，由本插件的 Service.qml 拉起并监管（它崩了不影响桌面；重投连续 3 次失败就停手）。
+A bar icon that controls the [OPet](https://github.com/Chiefiverse/OPet) desktop pet:
+start / stop / pause / resume / pull x1 / pull x10, without leaving the bar.
+The pet is its own layer-shell process, launched and supervised by this plugin's
+Service.qml (a pet crash never touches the desktop; 3 consecutive failed restarts
+stops the supervisor).
 
-⚠️ **这里是产物，不是源码。** 唯一事实源 = OPet 仓库的 `shell-widget/`；在这里改的东西下一次摊平会被覆盖。
+Text is English by default; set **Language** to `zh` in the plugin settings for
+Chinese (takes effect immediately, no restart).
 
-安装（需要 Omarchy 4 以上）：
+⚠️ **This is a build artifact, not the source.** Single source of truth = the
+`shell-widget/` directory of the OPet repository; edits here are overwritten by
+the next flatten.
+
+Install (requires Omarchy 4+):
 
     omarchy plugin add __PUB__ --enable
 
-更新：`omarchy plugin update opet.pet`。
+Update: `omarchy plugin update opet.pet`.
 
-装完还要填两项：**opet 可执行文件** 与 **本体清单 pet.json**（Setup 里的 Plugins 页，或直接编辑
-`~/.config/omarchy/shell.json` 的 layout 项）。这两项**故意没有默认值** —— 插件不猜你机器上的路径，
-没填就拒绝启动并点名缺哪一样。不带 `db` 时宠物是演示态（内存库，卡片上打 DRYRUN，不写存档）。
+After installing, two settings are required: the **opet executable** and the
+**body manifest (pet.json)** — on the Plugins page of Setup, or by editing the
+layout entry in `~/.config/omarchy/shell.json`. Both deliberately have no
+defaults: the plugin never guesses paths on your machine, and it refuses to
+start while either is missing, naming the one that is. Without a `db` the pet
+runs in demo mode (in-memory save, the card shows DRYRUN, nothing is written).
 
-许可证：AGPL-3.0-only，与 OPet 代码同（见 LICENSE）。
+License: AGPL-3.0-only, same as OPet code (see LICENSE).
 PUBDOC
 # ⚠️ 这段必须是带引号的 heredoc：内容里有反引号（markdown 行内码）与 >，
 #    不带引号会被当命令替换与重定向执行。URL 由标记替换，不靠 heredoc 展开。
