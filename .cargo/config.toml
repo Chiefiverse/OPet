@@ -1,0 +1,20 @@
+# Windows 交叉编译（M5 第一批，2026-11-21 实测）。
+#
+# 这一行是**钉驱动**，不是改行为：本机装了 mingw-w64 后，rustc 不写 linker 也能链上
+# （实测 `x86_64-pc-windows-gnu` 默认就找到 `x86_64-w64-mingw32-gcc`）。写下来要的是
+# "换一台没装那 5 个包的机器时报错点名 gcc 找不到"，而不是"链接出一个说不清哪来的 exe"。
+#
+# ⚠️ **这里刻意没有 `rustflags = ["-C", "target-feature=+crt-static"]`**，理由是实测而不是省事：
+# 同一份 10 行 hello 程序两个变体都编了一遍（scratch/hello-win32/），
+# `objdump -p` 的 DLL 表**逐行相同** = KERNEL32 / ntdll / api-ms-win-core-synch-l1-2-0 /
+# api-ms-win-crt-{environment,heap,locale,math,private,runtime,stdio,string}-l1-1-0，
+# 两边都不出现 `libwinpthread-1.dll` 或 `libgcc_s_seh-1.dll`（`panic = "abort"` 已经把 unwinding
+# 那条需求拿掉了），体积同为 402,473 B、只差 PE 头里一个链接器时间戳。
+# ⇒ `+crt-static` 在本组合上消不掉任何依赖 = 一个买了零东西的开关 ⇒ 不开。
+# **同一答案在第 5 步的真 crate 上复现了一次**（不再只是 10 行 hello）：
+# `cargo build --release -p overlay-win32 --target x86_64-pc-windows-gnu` 出来的
+# `opet-overlay-win32.exe`（485,409 B）DLL 表 = 上面那 11 个，一字不多
+# （留盘 scratch/win32_dlls_step5_2026-11-21.txt）⇒ 那份清单就是第 9 步白名单判据的初值。
+# 判据落在 scripts/build_windows.sh 里：exe 的 DLL 名必须全在系统 DLL 白名单内，否则构建失败。
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

@@ -1,0 +1,32 @@
+[package]
+name = "overlay-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OPet 各平台 overlay 客户端共用的那一层：图集像素解码 + polygon 轮廓还原（§3.7，零显示服务器依赖）"
+
+# ⚠️ 这个 crate 的**立身之本是它没有的东西**：不许出现 wayland-* / smithay-* / calloop /
+# windows-sys / objc2 / 任何 X11 或 Cocoa 绑定，也不许出现 `std::os::unix`。
+# 那句话由 tests/no_platform_deps.rs 逐条读 Cargo.toml 钉着，不是注释里的愿望。
+[dependencies]
+petcore = { workspace = true }
+serde = { workspace = true }
+# region.rs 里 `serde_json::from_slice` 是**内联路径**调用（不在文件头的 use 里），
+# 抽 crate 时只按 import 列表补齐会漏掉它 —— 上面那条 grep 只列了 use 语句，不算全。
+serde_json = { workspace = true }
+image-webp = { workspace = true }
+
+[features]
+# `atlas::fixture` 那块"每个像素的 alpha 都由表写下"的合成图集，除本 crate 自用外
+# 还要给 **overlay-win32 的宿主测例**用（M5 第一批第 6 步：预乘字节序与 alpha 通道命中
+# 这两处数学必须在 Linux 上就能红）。不开这个开关时它连符号都不存在 ⇒ 发布出去的
+# 二进制里不留测试脚手架。
+test-fixture = []
+
+[dev-dependencies]
+# atlas.rs 的测例用 `tempfile::tempdir()` 往临时目录里写真产物再读回来（与 overlay-wayland
+# 那侧同一条理由：绝不让测例碰 `~/.local/share/opet/`）。抽 crate 时漏了它 = 那批测例
+# 编译不过，而 rc=101 只报"找不到 crate"，不报"哪几行要用"。
+tempfile = "3"

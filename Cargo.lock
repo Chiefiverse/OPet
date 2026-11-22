@@ -373,11 +373,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "overlay-common"
+version = "0.1.0"
+dependencies = [
+ "image-webp",
+ "petcore",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "overlay-wayland"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "image-webp",
+ "overlay-common",
  "petcore",
  "petstore",
  "serde",
@@ -387,6 +399,15 @@ dependencies = [
  "tempfile",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "overlay-win32"
+version = "0.1.0"
+dependencies = [
+ "overlay-common",
+ "petcore",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

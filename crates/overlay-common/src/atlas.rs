@@ -3,8 +3,22 @@
 //! 为什么在这里做而不在内核：`OverlayBackend` 只传图集格坐标（§3.7），
 //! Rust 侧 `petcore` 依赖只有 serde/serde_json（M1 的"内核不解码像素"约束）。
 //!
-//! `wl_shm` 的 `Argb8888` 要求**预乘** alpha，且小端内存布局是 B,G,R,A；
-//! 烘焙产物是直通 alpha 的 RGBA ⇒ 加载时一次性转好，逐帧退化成整块拷贝。
+//! **预乘 + 小端 B,G,R,A 这个字节布局是两个平台共同的口径**，不是某一家协议的要求：
+//! Wayland 的 `wl_shm` `Argb8888` 与 Win32 `UpdateLayeredWindow` 带 `AC_SRC_ALPHA` 吃的
+//! 都是"32 位小端、预乘"的同一串字节 ⇒ 烘焙产物（直通 alpha 的 RGBA）在这一层转一次，
+//! 两边各自**零转换**接走，逐帧退化成整块拷贝。
+//!
+//! 因此本模块**不做**的事：不认 surface、不认 HWND、不认 buffer scale。缩放与 DPI
+//! 由各客户端的 `to_phys` 那类函数解决（那边才有窗口系统）。
+
+/// 判定"这个像素算不算剪影内（吃点击）"的 alpha 阈值。
+///
+/// ⚠️ **这是跨三个事实源的同一个数，口径只此一处**：`tools/pack.py` 的 `column_spans`
+/// （产 `polygon.json` 的 span 表）、`tools/validate.py`（产物门禁）、
+/// 各平台客户端的命中判定（Win32 靠 `WM_NCHITTEST` 读屏上像素的 alpha）。
+/// 历史上它是三份各写一遍的 `8`（`tests/accessory_product.rs` 那条注释自己写着"三处必须一起改"）
+/// ⇒ 现在由这里当出处，那两处引用它。
+pub const ALPHA_HIT_THRESHOLD: u32 = 8;
 
 use std::io::Read;
 use std::time::Instant;
@@ -364,6 +378,135 @@ pub fn encode_lossless_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<
         .encode(rgba, width, height, ColorType::Rgba8)
         .map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// 合成图集：**每个像素的 alpha 都由这张表写下**，所以像素级判据能在没有烘焙产物的机器上跑。
+///
+/// 为什么要有这个模块（而不是让各平台客户端自己造一份 `Vec<u8>`）：Windows 那侧的
+/// hit-test 与 blit 数学要在 **Linux 宿主**上就能红，而拿烘焙产物当样本的那条断言只能
+/// `#[ignore]` —— 那就是零读数。这里给它一份真过一遍 WebP 编解码与预乘的图集。
+///
+/// ⚠️ 这里**没有**搬上面 `mod tests` 里那份四格纯色图集：它的四格全是 R=G=B 的纯色
+/// （红 `[255,0,0]` 之外都是通道等值），拿它做字节序判据会把"踩错通道"和"踩对了"混成一谈。
+/// 本模块的探针格故意让 **B=0 而 A=200**，见 [`DARK_OPAQUE`] 那条。
+#[cfg(any(test, feature = "test-fixture"))]
+pub mod fixture {
+    use super::*;
+
+    /// 探针图集的格尺寸 / 行列数（`cell_offset` 的跨距是整张 sheet 的宽，2×2 才量得出串格）。
+    pub const CELL: u32 = 4;
+    pub const COLS: u32 = 2;
+    pub const ROWS: u32 = 2;
+
+    /// 剪影格：中间两列（x∈{1,2}）从上到下不透明，其余全透。
+    ///
+    /// 它是 [`petcore::intent::PresentationIntent::hit_test_world`] 那四个探针的样本本体：
+    /// 脚锚在格内、四角在余量里、帧上边界上下各 1 px 一读一不读。
+    pub const SILHOUETTE: (u32, u32) = (0, 0);
+    /// 这颗锚点落在剪影的不透明列上，且贴在格的最后一行（= 贴 margin 下边）。
+    pub const FEET: [f32; 2] = [2.0, 3.0];
+    /// alpha 探针格：四个像素逐个点名一种"尺子会读错"的形状，位置见下面四个常量。
+    pub const ALPHA_PROBES: (u32, u32) = (0, 1);
+    /// 整格全透 —— 画它必须得到一块全零的 DIB，量的是"取样没串到隔壁格"。
+    pub const EMPTY: (u32, u32) = (1, 0);
+    /// 三色互不相等的实心格：字节序判据用（`[10,20,30]` 只有落对顺序才可分辨）。
+    pub const SOLID: (u32, u32) = (1, 1);
+
+    // 下面四个坐标是 `ALPHA_PROBES` 格内的 `(x, y)`，直通 RGBA（源）→ 预乘 BGRA（屏）。
+    // 每颗都注明"错的那把尺子会怎么答"，因为这四颗的全部意义就是让两种答法分开。
+
+    /// `a == 8`，恰好**等于**阈值 ⇒ 正确答"穿透"（判据是 `>` 不是 `>=`，与 `tools/pack.py:111`
+    /// 的 `alpha > ALPHA_THRESHOLD` 同一口径，而那份口径是 `polygon.json` 的 `threshold: 8` 的出处）。
+    pub const A_EQ_8: (u32, u32) = (0, 0);
+    /// `a == 9` ⇒ 阈值之上，正确答"命中"。与上一颗**成对**，单独一颗什么也不证明。
+    pub const A_EQ_9: (u32, u32) = (1, 0);
+    /// 源 `(R=9, G=0, B=0, A=0)`：预乘后四字节全零 ⇒ 正确答"穿透"。
+    ///
+    /// ⚠️ 这颗**不是**通道错位的判据（预乘把它抹成 `[0,0,0,0]`，读 index 0 与读 index 3 同答）。
+    /// 它钉的是源→DIB 那一跳：一个"红但全透"的源像素到屏上必须还是全零，
+    /// 否则屏上会多出一粒看得见的红点，而 `#[ignore]` 的产物门禁看不见它。
+    pub const RED_ZERO_ALPHA: (u32, u32) = (2, 0);
+    /// 源 `(R=255, G=0, B=0, A=200)` → 预乘 BGRA `[0, 0, 199, 200]`：**蓝道 0 而 alpha 200**。
+    ///
+    /// ⇒ 读 index 3 答"命中"，读 index 0（`§6.1.20⑮` 那条 `step_by(4)` 踩错通道的形状）答"穿透"。
+    /// 这一颗才是通道判据，而它错的方向是**假阴性**：深色不透明的像素被当成洞，
+    /// 症状是剪影上少一块、点不动，不是多一块。
+    pub const DARK_OPAQUE: (u32, u32) = (3, 0);
+
+    /// 探针图集的直通 RGBA 源像素（行优先，整张 8×8）。
+    pub fn probe_rgba() -> Vec<u8> {
+        let w = COLS * CELL;
+        let h = ROWS * CELL;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        let mut put = |cx: u32, cy: u32, px: u32, py: u32, c: [u8; 4]| {
+            let x = cx * CELL + px;
+            let y = cy * CELL + py;
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i..i + 4].copy_from_slice(&c);
+        };
+        // 剪影格：中间两列实心
+        for y in 0..CELL {
+            for x in 1..=2 {
+                put(SILHOUETTE.1, SILHOUETTE.0, x, y, [255, 255, 255, 255]);
+            }
+        }
+        // alpha 探针格
+        put(
+            ALPHA_PROBES.1,
+            ALPHA_PROBES.0,
+            A_EQ_8.0,
+            A_EQ_8.1,
+            [255, 255, 255, 8],
+        );
+        put(
+            ALPHA_PROBES.1,
+            ALPHA_PROBES.0,
+            A_EQ_9.0,
+            A_EQ_9.1,
+            [255, 255, 255, 9],
+        );
+        put(
+            ALPHA_PROBES.1,
+            ALPHA_PROBES.0,
+            RED_ZERO_ALPHA.0,
+            RED_ZERO_ALPHA.1,
+            [9, 0, 0, 0],
+        );
+        put(
+            ALPHA_PROBES.1,
+            ALPHA_PROBES.0,
+            DARK_OPAQUE.0,
+            DARK_OPAQUE.1,
+            [255, 0, 0, 200],
+        );
+        // 实心格
+        for y in 0..CELL {
+            for x in 0..CELL {
+                put(SOLID.1, SOLID.0, x, y, [10, 20, 30, 255]);
+            }
+        }
+        rgba
+    }
+
+    /// 走一遍**真**编解码与真预乘路径的合成图集（与 [`Atlas::load`] 同一个转换器）。
+    pub fn probe_atlas() -> Atlas {
+        let webp = encode_lossless_rgba(&probe_rgba(), COLS * CELL, ROWS * CELL).expect("encode");
+        let mut dec = WebPDecoder::new(std::io::Cursor::new(webp)).expect("decode");
+        let mut pixels = vec![0u8; dec.output_buffer_size().unwrap()];
+        dec.read_image(&mut pixels).expect("read");
+        premultiply_in_place(&mut pixels);
+        Atlas {
+            pixels,
+            width: COLS * CELL,
+            height: ROWS * CELL,
+            cell_w: CELL,
+            cell_h: CELL,
+            cols: COLS,
+            rows: ROWS,
+            decode_ms: 0,
+            encoded_bytes: 0,
+        }
+    }
 }
 
 #[cfg(test)]

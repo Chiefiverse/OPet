@@ -4,6 +4,12 @@
 //! Wayland 的点击穿透靠 `wl_surface.set_input_region`，而 `wl_region` **只接受矩形**，
 //! 所以逐帧精确轮廓必须在客户端从 `pack.py` 产的 span 表还原。
 //!
+//! ⚠️ **本模块的调用方只有 Wayland 客户端**，这不是遗漏而是分工：Windows 的
+//! `WM_NCHITTEST` 是逐点同步回答的，它直接读**刚交给 `UpdateLayeredWindow` 那块 buffer 的
+//! alpha 字节**（阈值 = [`crate::atlas::ALPHA_HIT_THRESHOLD`），读的是屏上像素本身；
+//! 这里的矩形是那份像素在 `pack.py` 那一刻的预计算近似。把近似搬到 Windows 上 =
+//! 同一只宠物的剪影出现两个事实源，而分叉的症状只有眼睛看得见。
+//!
 //! `polygon.json` 的 `spans` 是 `[[x, y_top, y_bottom], …]`，两端**闭区间**（`tools/pack.py:column_spans`）。
 //! 相邻且 y 区间相同的列合并成一个 run，实测把每格 ~40 个 span 压到几个矩形。
 

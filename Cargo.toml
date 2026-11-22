@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/petcore", "crates/overlay-wayland", "crates/petstore", "crates/opet-cli"]
+members = [
+    "crates/petcore",
+    "crates/overlay-common",
+    "crates/overlay-wayland",
+    "crates/overlay-win32",
+    "crates/petstore",
+    "crates/opet-cli",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -41,10 +48,69 @@ ab_glyph = { version = "=0.2.32", default-features = false, features = ["std"] }
 # **钉死版本**的理由与 ab_glyph 那条同族但更直接：writer 写出的**字节本身**就是"带注释的
 # config.toml 写回后注释仍在"那条判据的宾语 ⇒ 换版本 = 换写出的格式 = 那条往返测试要全部重跑。
 toml_edit = "=0.25.17"
+# 本项目**第三次**真加依赖（M5 Windows 第一批 / 设计书 §3.7）。
+# ⚠️ **这一条只给 `overlay-win32`，而且是 target-gated**（`[target.'cfg(windows)'.dependencies]`），
+# 不是顺手写在 `[dependencies]` 里：写在通用那一栏，Linux 宿主也能 `use windows_sys::…`
+# （这 crate 在非 Windows 上编出一个空壳而不是报错）⇒ 那一行要等**链接**才炸，
+# 而"链接才炸"在本项目就是"门禁看不见"（同 `--cell` 假开关那一族：错误必须发生在最早可能的那刻）。
+# D8 allowlist 逐条核过，两个 crate 都读了 `.crate` 解包后的许可证**原文**（不是凭记忆，也不是 grep 文件名）：
+#   windows-sys 0.61.2 = "MIT OR Apache-2.0" · windows-link 0.2.1 = "MIT OR Apache-2.0"（它唯一的依赖）
+# 全部落在 allowlist（BSD/MIT/Apache-2.0/LGPL-3）内，**GPL-2-only 那个排除项一个都没沾**；
+# 两个目录都 `ls` 过 ⇒ 只有 `license-apache-2.0` / `license-mit` / `readme.md` 三份 + 源码，
+# **没有** EXCEPTION / 附加条款文件，而且**没有 `NOTICE` 文件**（Apache-2.0 那条"第 4(d) 项要随附
+# 声明文件"的义务因此是空的 ⇒ 我们分发 `.exe` 时不必再摊任何第三方声明）。
+# Apache 那份读的是正文：201 行、`APPENDIX` 在第 178 行、末尾版权行填 "Copyright (c) Microsoft Corporation"
+# ⇒ 标准 2.0，不是带改动的版本。MIT 那份的持有人同样是 Microsoft Corporation。
+# MSRV 逐个查过：两个都是 **1.71** ⇒ 不高于本仓库声明的 1.86，**不需要抬 MSRV**。
+# 特性开九个（`Win32_Foundation` / `Graphics_Gdi` / `UI_WindowsAndMessaging` / `UI_HiDpi` /
+# `System_Threading` / `System_ProcessStatus` / `System_LibraryLoader` /
+# `UI_Input_KeyboardAndMouse` / `System_Security`）：
+# 这张清单逐个在 `Cargo.toml` 里存在过（`grep -c` = 9），
+# 而且九个都只指向自己那一层的父命名空间（`Win32_UI_HiDpi = ["Win32_UI"]` 那种）⇒ **互不牵连**，
+# 多开一个只是多编译。`default = []`（第 280 行实测）⇒ 不写 `default-features = false`，
+# 那是一条永远不改变任何东西的写法 = 假开关。
+# ⚠️ **后三个是第 8 步加上的，不是第 7 步数错**：
+# `GetModuleHandleW`（`RegisterClassExW`/`CreateWindowExW` 要的 `HINSTANCE`）与
+# `SetCapture`/`ReleaseCapture`（拖拽抓鼠 + `WM_CAPTURECHANGED` 那条 P0 的另一半）
+# 在第 7 步那份"六个特性"的清单里**没有来源**，因为那时还没写 `window.rs`。
+# 第三个 `Win32_Security` 尤其不是"顺手多开"：**它是 `CreateWaitableTimerExW` 的门控**
+# （实测 `grep -B1` = `#[cfg(feature = "Win32_Security")]`，因为它的第一个参数是
+# `*const SECURITY_ATTRIBUTES`）⇒ 不开它，60 Hz 那个高精度定时器**根本不存在**，
+# 而报错是一句"cannot find function"，看不出跟"安全"有什么关系。
+# ⇒ **登记这一格**：第 7 步那句"六个"当时的正确读法是
+# "**宿主可测的那五个文件**要六个"，而窗口层要的从来不止六个。
+# ⚠️ **第 5 步那份 11 项 DLL 表不是第 9 步的白名单**（这条差点被读成"白名单照旧"）：
+# 它测的是 `hello-win32`，**那时还没有 `window.rs`** ⇒ 逐字 = KERNEL32 / ntdll /
+# api-ms-win-core-synch / 8 项 api-ms-win-crt-∗（`scratch/win32_dlls_step5_2026-11-21.txt`）。
+# 窗口层一接上，`USER32.dll`（消息/类/ULW/捕获）与 `GDI32.dll`（`CreateDIBSection`）
+# **必然新进表**（这两个是从 windows-sys 的 `link!("user32.dll" …)` 定义处读出来的，不是猜的），
+# 而第九个特性 `Win32_Security` 只多给一个**类型**、函数仍在 `kernel32.dll` ⇒ 它不动表。
+# ⇒ **第 9 步那条 `objdump -p` 白名单必须在第 8 步完成后重测**，拿第 5 步那 11 项当门禁
+# 会把一份其实正常的 `.exe` 判成"多带了系统依赖"。
+# **钉死版本**的理由与上面两条同族但落在另一处：这些是 **FFI 签名**，我们那些 `unsafe` 块是按
+# 0.61 的函数形状写的 ⇒ 换次版本可能改签名，而**只有交叉编译会看见**（宿主根本不走这条路）。
+# 不 `=` 住，症状就是"某天 CI 突然编不过，而没人改过 Windows 那侧"。
+# 0.61 的依赖面也是选它而不是 0.59 的理由：0.61 只拖 `windows-link`，0.59 拖 `windows-targets`
+# ⇒ 八个架构的扇出（`Cargo.lock` 里 0.59.0 那份是别人在 Windows 上的传递依赖，不在我们的关键路径上）。
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Security",
+] }
 
 petcore = { path = "crates/petcore" }
 petstore = { path = "crates/petstore" }
+overlay-common = { path = "crates/overlay-common" }
 overlay-wayland = { path = "crates/overlay-wayland" }
+# 图集解码。**版本收在 workspace 一处**的理由与 overlay-common 的立身之本同一条：
+# 编解码器换一版 = 换一份解码字节 = 各平台屏上的像素漂移，而没有任何门禁会替你说"两边不同了"。
+image-webp = "0.2.4"
 
 [profile.release]
 opt-level = 3

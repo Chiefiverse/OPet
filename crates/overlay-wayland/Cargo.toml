@@ -9,12 +9,15 @@ description = "OPet 的 Wayland 适配层：wlr-layer-shell overlay 客户端（
 
 [dependencies]
 petcore = { workspace = true }
+# 图集解码与 polygon 轮廓（M5 第一批起与 Windows 客户端共用同一份，见 crates/overlay-common）。
+# 方向照旧单向：这一层零显示服务器依赖，反过来不依赖本 crate。
+overlay-common = { workspace = true }
 # M3-b：开箱 UI 直接落库。**方向是单向的** —— overlay 客户端依赖存储层，petcore 永不依赖
 # 显示服务器也永不碰磁盘（D12/D13）。不带 `--db` 时走 `Store::in_memory()` 并打 DRYRUN 标。
 petstore = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-image-webp = "0.2.4"
+image-webp = { workspace = true }
 wayland-client = "0.31.15"
 # viewporter（stable）解耦 buffer 物理尺寸与 surface 逻辑尺寸；
 # staging 里有 `wp_fractional_scale`——本机实测 eDP-1 是 **1.5×**（物理 1920x1080 / 逻辑 1280x720），

@@ -1,0 +1,48 @@
+[package]
+name = "overlay-win32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OPet 的 Windows 适配层：Win32 分层窗口（layered window）overlay 客户端（§3.7 / M5 第一批）"
+
+# ⚠️ 这一片**故意不依赖 `petstore`**（用户 2026-11-21 第 4 条拍板 = 只交 `opet-overlay-win32.exe`）。
+# 真实理由不是"最小化"而是**交叉编译**：`petstore` 拖 `rusqlite/bundled` ⇒ `libsqlite3-sys` 要在
+# `x86_64-pc-windows-gnu` 上编 C。那是本轮最可能失败的一环，把它留在关键路径之外，
+# 屏上那一格才能先被验掉。全功能 `opet.exe` 属下一轮单独拍板。
+#
+# `windows-sys` **在下面的 target 栏里，不在这一栏**，而且这是第 7 步特意选的写法：
+# 通用那一栏在 Linux 上也会 `use windows_sys::…` 成功（这 crate 在非 Windows 上是空壳、不是错误），
+# 于是"点名 OS 类型"那条规矩要到**链接**那一步才炸。
+# 第 5–6 步的文件（`cli.rs` / `stage.rs` / `layout.rs` / `windx.rs`）**一个 OS 类型都不点名**，
+# 所以在 Linux 宿主上就能编能测 —— 这是本次切模块的全部目的。
+[dependencies]
+petcore = { workspace = true }
+# 预乘 BGRA8 的图集解码 + 省电五档记账，与 Wayland 客户端共用同一份（见 crates/overlay-common）。
+overlay-common = { workspace = true }
+
+# 只有 `window.rs` / `monitor.rs` / `app.rs`（`#[cfg(windows)]` 那三个）读得到这一栏。
+# 九个特性各自要什么：Foundation = HANDLE/RECT/LRESULT/WINDOWPOS · Graphics_Gdi = BITMAPINFO/
+# CreateDIBSection · WindowsAndMessaging = 窗口类/样式/消息/UpdateLayeredWindow/GetSystemMetrics ·
+# HiDpi = SetProcessDpiAwarenessContext + GetDpiForWindow · Threading = GetProcessTimes ·
+# ProcessStatus = K32GetProcessMemoryInfo（VmHWM/VmRSS 那一格）·
+# LibraryLoader = GetModuleHandleW（`hinstance`，第 8 步加）·
+# Input_KeyboardAndMouse = SetCapture/ReleaseCapture（拖拽抓鼠，第 8 步加）·
+# Security = **只为 `CreateWaitableTimerExW` 开门**（它的 `lpTimerAttributes` 是
+# `*const SECURITY_ATTRIBUTES` ⇒ 函数整个被 `#[cfg(feature = "Win32_Security")]` 罩着；
+# 我们仍传 null，那个特性买到的是**符号存在**而不是安全语义）。
+# ⚠️ 后三个是第 8 步写 `window.rs` 时才加的 ⇒ 根 `Cargo.toml` 那里登记了它们与 DLL 白名单的关系。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[[bin]]
+name = "opet-overlay-win32"
+path = "src/main.rs"
+
+[dev-dependencies]
+# `atlas::fixture` = 那份"每颗像素的 alpha 都由表写下"的合成图集（`stage.rs` 那八条测例的样本）。
+# 走 feature 而不是 `#[cfg(test)]`：`test` 这个 cfg 只在**编译 overlay-common 自己**时为真，
+# 客户端的测例看不见它 ⇒ 只能在调用方按特性打开。不开 = 那个模块连符号都不存在，
+# 所以第 9 步发出去的 `.exe` 里不会留任何测试脚手架。
+overlay-common = { workspace = true, features = ["test-fixture"] }

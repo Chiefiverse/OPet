@@ -28,8 +28,10 @@ use petcore::assets::{AccessoryManifest, Manifest};
 use petcore::behavior::AssetKey;
 use petcore::intent::SURFACE_MARGIN;
 
-/// 与 `tools/pack.py` 的 `ALPHA_THRESHOLD`、`tools/validate.py` 同一口径（三处必须一起改）。
-const SPAN_ALPHA_THRESHOLD: u32 = 8;
+/// 出处在 `overlay_common::atlas::ALPHA_HIT_THRESHOLD`（M5 第一批起，那句"三处必须一起改"
+/// 收成了一处）；`tools/pack.py` 的 `ALPHA_THRESHOLD` 与 `tools/validate.py` 里的同值比较
+/// 仍各自读它 ⇒ 数值只由 overlay-common 定义，这两处是它的读者不是第二份事实源。
+const SPAN_ALPHA_THRESHOLD: u32 = overlay_common::atlas::ALPHA_HIT_THRESHOLD;
 
 /// 把 sheet 解成**直通 RGBA**（`Atlas` 里那份是预乘 BGRA 且私有，这里要的是原始 alpha）。
 fn decode_rgba(path: &Path) -> Vec<u8> {
