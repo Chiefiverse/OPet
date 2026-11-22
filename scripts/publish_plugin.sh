@@ -113,6 +113,25 @@ Install (requires Omarchy 4+):
 
 Update: `omarchy plugin update opet.pet`.
 
+Remove:
+
+    omarchy plugin remove opet.pet
+
+Removing the plugin stops its service and unloads the bar widget; it does not
+delete your pet saves or edit `~/.config/omarchy/shell.json` beyond dropping
+the widget entry. A pet process still on screen after removal can be stopped
+with: `pkill -f 'opet overlay'`.
+
+## External dependencies
+
+- The plugin itself is QML + JavaScript and runs inside Quickshell (bundled
+  with Omarchy 4+). It shells out to `hyprctl` and `jq` (both part of Omarchy)
+  for one pre-flight check that measures the bar's reserved height.
+- It controls the **opet** executable, which you build or install separately
+  from [the OPet repository](https://github.com/Chiefiverse/OPet) (AGPL-3.0-only)
+  and point at in the plugin settings. The plugin never downloads or executes
+  anything beyond the paths you configure.
+
 After installing, two settings are required: the **opet executable** and the
 **body manifest (pet.json)** — on the Plugins page of Setup, or by editing the
 layout entry in `~/.config/omarchy/shell.json`. Both deliberately have no

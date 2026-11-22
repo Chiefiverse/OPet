@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "opet.pet",
   "name": "OPet",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": "Chiefiverse",
   "license": "AGPL-3.0-only",
   "description": "Bar entry for the OPet desktop pet: start, stop, pause and pull without leaving the bar.",
@@ -18,7 +18,8 @@
   "files": [
     "i18n.js",
     "assets/logo.png",
-    "assets/run.png"
+    "assets/run.png",
+    "preview.png"
   ],
   "barWidget": {
     "displayName": "OPet",
