@@ -17,6 +17,9 @@ serde = { workspace = true }
 # 抽 crate 时只按 import 列表补齐会漏掉它 —— 上面那条 grep 只列了 use 语句，不算全。
 serde_json = { workspace = true }
 image-webp = { workspace = true }
+# 绘制层（`ui/text.rs`）的字形栅格。2026-11-22 随菜单/卡面/面板上提进来（M5 第二批拍板③）。
+# 纯 Rust、零平台绑定，不破本 crate 的立身之本；版本/特性钉死与 D8 许可证论证在根 Cargo.toml。
+ab_glyph = { workspace = true }
 
 [features]
 # `atlas::fixture` 那块"每个像素的 alpha 都由表写下"的合成图集，除本 crate 自用外
@@ -30,3 +33,6 @@ test-fixture = []
 # 那侧同一条理由：绝不让测例碰 `~/.local/share/opet/`）。抽 crate 时漏了它 = 那批测例
 # 编译不过，而 rc=101 只报"找不到 crate"，不报"哪几行要用"。
 tempfile = "3"
+# 字体子集是入库产物，改一个字节都必须是有意的 ⇒ tests/font_assets.rs 钉它的 sha256。
+# 用 workspace 已有的 sha2（petcore 的审计链在用），**不新增 crate**。
+sha2 = { workspace = true }

@@ -2,8 +2,8 @@
 """裁 OPet 的 UI 字体子集（`docs/UI_REDESIGN_V2.md` §4.2）。
 
 产物三件，全部入库：
-  crates/overlay-wayland/assets/fonts/ui-codepoints.txt  ← **码位的唯一事实源**
-  crates/overlay-wayland/assets/fonts/ui.otf             ← 子集本体（CFF 轮廓）
+  crates/overlay-common/assets/fonts/ui-codepoints.txt  ← **码位的唯一事实源**
+  crates/overlay-common/assets/fonts/ui.otf             ← 子集本体（CFF 轮廓）
   同目录 LICENSE-ui-font.txt / NOTICE-ui-font.txt        ← OFL-1.1 的再分发义务
 
 为什么不是"手抄一份清单 + 手跑 pyftsubset"：上一轮 M3-b 抓到"白字压金底读不出"之后，
@@ -47,10 +47,10 @@ FACE_INDEX = 2
 SOURCE_SHA256 = "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
 FONTTOOLS_PIN = "4.64.0"
 
-OUT_DIR = REPO / "crates/overlay-wayland/assets/fonts"
+OUT_DIR = REPO / "crates/overlay-common/assets/fonts"
 CODES = OUT_DIR / "ui-codepoints.txt"
 FONT_OUT = OUT_DIR / "ui.otf"
-L10N_SRC = REPO / "crates/overlay-wayland/src/l10n.rs"
+L10N_SRC = REPO / "crates/overlay-common/src/ui/l10n.rs"
 CATALOG = REPO / "crates/petcore/assets/gacha/cat_series_01.json"
 
 # 子字体家族名：OFL §3 规定 Modified Version **不得沿用 Reserved Font Name**（"Noto Sans CJK"）。

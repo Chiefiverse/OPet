@@ -72,6 +72,11 @@ impl Harness {
             home: None,
             xdg_data_home: None,
             opet_db: None,
+            // 全字段列出**是**这道安全闸的一部分（M5 第二批加 Windows 三档时逐个点名 None，
+            // 而不是 `..Env::default()`）：以后再加一档环境变量，编译器会强迫这里表态。
+            local_appdata: None,
+            appdata: None,
+            userprofile: None,
         };
         Self {
             tmp,

@@ -30,7 +30,7 @@ use ab_glyph::{Font, FontArc, OutlinedGlyph, ScaleFont};
 
 /// 入库的字体子集本体。**这就是资产**，不是从文件系统找的 —— `include_bytes!` 保证
 /// 客户端二进制里那份与 `tools/subset_font.py --verify` 钉住摘要的那份是同一个。
-pub const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/ui.otf");
+pub const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/ui.otf");
 
 /// 码位清单（`assets/fonts/ui-codepoints.txt`，每行 `U+XXXX # 来源`）解析出的**全集**。
 ///
@@ -41,7 +41,7 @@ pub const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/ui.otf");
 /// 第一版就栽在这儿 —— 解析出 264 个"码位"、严格递增、无重复，三条结构断言全绿，实际值却
 /// 一半是错的（含字母的直接变 `None` 被丢掉）。这正是"数字全绿但画面对不上"。
 pub fn codes_list() -> Vec<u32> {
-    const CODES: &str = include_str!("../assets/fonts/ui-codepoints.txt");
+    const CODES: &str = include_str!("../../assets/fonts/ui-codepoints.txt");
     CODES
         .lines()
         .filter_map(|line| {

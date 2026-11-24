@@ -49,7 +49,7 @@ pub const CARD_H: i32 = ROWS_TOP + (MAX_ROWS as i32 - 1) * menu::ROW_STEP + menu
 /// **只读行**（[`PanelItem::Info`]）文字能用的逻辑宽度 = 行矩形经 [`menu::row_text`] 让出左右
 /// 各半个 `PAD` 之后剩下的那一段（`240 − 3×8 = 216`）。
 ///
-/// 开这个口子的唯一理由：[`app`](crate::app) 的 `Gacha::missing_lines` 要在**产行的那一刻**
+/// 开这个口子的唯一理由：客户端的 `App` 的 `Gacha::missing_lines` 要在**产行的那一刻**
 /// 决定"这一档还列几个名字、剩下折成尾标"，而它手里只有 `scale`、没有画布 —— 让它去猜一个
 /// 字数就是"生产者和排版各有各的预算"那一族（`69fd158` 的兄弟）。
 ///
@@ -61,7 +61,7 @@ pub const ROW_TEXT_W: i32 = CARD_W - 3 * menu::PAD;
 /// **可点行**（[`PanelItem::Wear`] 那一格）文字能用的逻辑宽度 = [`ROW_TEXT_W`] 再让出左端那条
 /// 强调条（`menu::label_rect` 干的正是这件事，而 `card::paint_panel` 画可点行用的就是它）。
 ///
-/// 开这个口子只为一件事：[`app`](crate::app) 的 `album_rows` 要在**产行的那一刻**决定"这一行
+/// 开这个口子只为一件事：客户端的 `App` 的 `album_rows` 要在**产行的那一刻**决定"这一行
 /// 还带不带得上挂点名 / 重复数"，而它手里只有 `scale`、没有画布。可点行的预算比只读行**小 7 px**
 /// ⇒ 拿 `ROW_TEXT_W` 去裁可点行就会差出一个汉字，被排版截成 `…`，而"这件叫什么"是用户点它的
 /// 唯一依据（`69fd158` 的兄弟：生产者和排版各有各的账）。
@@ -103,7 +103,7 @@ impl RowRect {
 pub enum PanelItem {
     /// 只读的一行（收藏册的内容行）。
     Info,
-    /// 标题带 ⇒ **收藏册切 tab，设置页重载这一面的默认行**（[`app`](crate::app) 的
+    /// 标题带 ⇒ **收藏册切 tab，设置页重载这一面的默认行**（客户端的 `App` 的
     /// `on_panel_press` 是唯一解释它的地方）。两面都是控件不是对称美学：设置页被
     /// 「概率」/「复核」借走时，除 `Close` 外**只有这一格能回到那五行**。
     Header,
@@ -117,10 +117,10 @@ pub enum PanelItem {
     Verify,
     /// 最后一行 ⇒ 收掉面板。**宠物继续跑。**
     Close,
-    /// 收藏册「已获得」里**逐件**的一行 ⇒ 点它 = 把这一件直接穿上身（[`app`](crate::app)
+    /// 收藏册「已获得」里**逐件**的一行 ⇒ 点它 = 把这一件直接穿上身（客户端的 `App`
     /// 的 `pick_and_wear`）。
     ///
-    /// 载荷是 **[`app`](crate::app) 的 `candidates` 下标**，不是新造一套"收藏条目 id"。两个理由：
+    /// 载荷是 **客户端的 `App` 的 `candidates` 下标**，不是新造一套"收藏条目 id"。两个理由：
     /// ① `wear()` / `persist_worn()` / `picked` / `DressView::visible` **本来就都说这个下标** ⇒
     /// 点击时无需任何反查，也就不需要一个和 `rows` 平行保存的 `Vec<CollectionEntry>` 旁表
     /// （旁表要跨 `show_panel` / `refresh_panel_rows` / `open_panel_lines` 保持对齐 =
@@ -129,9 +129,9 @@ pub enum PanelItem {
     ///
     /// ⚠️ **下标进不了 [`content_sig`]**（那里只混判别量），见函数体里那条条件式纪律。
     Wear(usize),
-    /// 收藏册里**宠物**那一行 ⇒ 点它 = 当场换成那只（[`app`](crate::app) 的 `swap_body`，P5）。
+    /// 收藏册里**宠物**那一行 ⇒ 点它 = 当场换成那只（客户端的 `App` 的 `swap_body`，P5）。
     ///
-    /// 载荷是 **[`app`](crate::app) 的 `bodies` 下标**，与 [`Self::Wear`] 的 `candidates` 下标
+    /// 载荷是 **客户端的 `App` 的 `bodies` 下标**，与 [`Self::Wear`] 的 `candidates` 下标
     /// 是**两套下标空间**，故意不合成一个 `usize`：合并后"这个数字指哪张表"就只剩旁边一段注释在
     /// 说，而注释不是判据（`the_album_routes_pets_to_the_body_index_space` 那条门禁的全文理由）。
     /// 分开写还有一层：**没决定过的那一臂会编译不过** —— `on_panel_press` 的 `match` 少一支就是
@@ -211,7 +211,7 @@ pub enum PanelKind {
         /// 装不满一屏，也就永远到不了页码控件那一格（见 [`album_page`]）。
         ///
         /// 它为什么在**这里**而不是在 `App` 的某个字段里：这一面"此刻该画哪几条"这件事的
-        /// 全部输入就是 (哪一面, 哪一本, 第几页)，而 [`app`](crate::app) 的 `panel_rows`
+        /// 全部输入就是 (哪一面, 哪一本, 第几页)，而 客户端的 `App` 的 `panel_rows`
         /// 是**唯一**的行生产者 ⇒ 另立一个 `self.album_page` 字段就是第二个事实源（换 tab
         /// 忘了归零 = 一屏空白，正是这条纪律反复抓的那族）。
         page: usize,
@@ -241,12 +241,12 @@ impl PanelKind {
     /// 切 tab = **换一本，所以页码归零**。不设这一步就是"从「已获得」第 4 页切到「还缺」
     /// 而那一本只有 1 页" ⇒ 请求一个不存在的页。
     ///
-    /// ⚠️ **翻页不走这里** —— 页码只由 [`app`](crate::app) 在点到 [`PanelItem::More`] 时
+    /// ⚠️ **翻页不走这里** —— 页码只由 客户端的 `App` 在点到 [`PanelItem::More`] 时
     /// `+ 1` 得出，而**归一**（末页回卷）只在 [`album_page`] 一处做。一个页两件事分在两条
     /// 函数里，是为了让"归一"这件事没有第二个实现者。
     ///
     /// 设置页没有第二屏可切 ⇒ [`CollectionTab::next`] 那一步在这里返回自身；点它做什么由
-    /// [`app`](crate::app) 的 `on_panel_press` 解释（重载默认行），不是"点了没反应"。
+    /// 客户端的 `App` 的 `on_panel_press` 解释（重载默认行），不是"点了没反应"。
     pub const fn cycle(self) -> Self {
         match self {
             Self::Collection { tab, .. } => Self::Collection {
@@ -316,7 +316,7 @@ pub fn collection_rows(lang: Lang, lines: &[String]) -> Vec<PanelRow> {
 
 /// [`album_page`] 的产物：这一屏的行 + **归一后**真正落到的页码 + 总页数。
 ///
-/// 为什么要带回 `page`：调用方（[`app`](crate::app) 的 `panel_rows`）交出去的是
+/// 为什么要带回 `page`：调用方（客户端的 `App` 的 `panel_rows`）交出去的是
 /// "我想要第几页"，而屏上那句 `2/5` 必须是**实际**第几页。丢了这个返回值就只有两条路 ——
 /// 要么在 `App` 里再归一一次（两个事实源），要么让请求越界时显示一个不存在的页号。
 #[derive(Clone, Debug)]
@@ -327,7 +327,7 @@ pub struct AlbumPage {
 }
 
 /// 逐件收藏册**切出一屏**：`entries` 是这一本的全部条目行（顺序即屏序，由调用方
-/// [`app`](crate::app) 的 `album_rows` 定稿 —— 那里的每一格已经带着自己的身份
+/// 客户端的 `App` 的 `album_rows` 定稿 —— 那里的每一格已经带着自己的身份
 /// [`PanelItem::Wear`] 或 [`PanelItem::Info`]），这里只做**分页**这一件事。
 ///
 /// 三处判断，都是"只在这里做一次"的那种：

@@ -221,7 +221,7 @@ impl MenuPage {
     /// 只有 [`Self::Dress`] 会画：豁免改变的是那一页的候选表，别的页挂星号等于撒谎。
     ///
     /// 为什么是一个 `*` 而不是一句四语文案：`*` = **U+002A 已在字体子集清单里**
-    /// （`crates/overlay-wayland/assets/fonts/ui-codepoints.txt`）⇒ 零重裁成本，而新增非 ASCII
+    /// （`crates/overlay-common/assets/fonts/ui-codepoints.txt`）⇒ 零重裁成本，而新增非 ASCII
     /// 字要走那条"一处四常数联动"（`l10n.rs` → `subset_font.py` → `text.rs` 字节数 +
     /// `FONT_SHA256` + `NOTICE`，AGENTS.md 事实 8，历史上红过一次才看清）。
     /// 先例 = 页码 `n/N`：同一理由、同一条 ASCII 门禁（[`header_page_indicator_is_ascii_only`]）。

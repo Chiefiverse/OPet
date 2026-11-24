@@ -15,6 +15,8 @@
 //! 而那**只有手会摸出来**。
 
 use overlay_common::atlas::{ALPHA_HIT_THRESHOLD, Atlas};
+use petcore::assets::AccessoryManifest;
+use petcore::behavior::AssetKey;
 
 use crate::layout::Frame;
 
@@ -25,6 +27,16 @@ use crate::layout::Frame;
 pub struct Stage {
     px: Vec<u8>,
     frame: Frame,
+}
+
+/// 一件**穿着中**的配件：清单（回答"这一档状态烘过像素吗"）+ 图集（供像素）。
+///
+/// 与 Wayland 侧 `app.rs` 的 `Equipped` 同形同理由：两个字段必须同时存在才画得对，
+/// 铺成两个 `Option` 就能表示"有清单没像素"这种一画就错的组合。配件的命中并集在本平台
+/// 不需要单独维护 —— `hit` 读的就是叠完之后的那份像素（模块头"为什么 Windows 读像素"）。
+pub struct Worn {
+    pub manifest: AccessoryManifest,
+    pub atlas: Atlas,
 }
 
 impl Stage {
@@ -64,22 +76,58 @@ impl Stage {
     /// 失败 ⇒ 缓冲区已经清零但没画上新格（"这一帧是空的"）。这是有意的：
     /// 半张宠物在屏上与"宠物缺了一块"同形，而空帧下一 tick 就被覆盖，不需要额外状态。
     pub fn paint(&mut self, atlas: &Atlas, row: u32, col: u32) -> Result<(), String> {
+        self.paint_composited(atlas, None, (row, col), AssetKey::Idle)
+    }
+
+    /// 本体 + 穿着中配件的合成分：**整块清零 → 本体覆盖 → 配件 source-over**。
+    ///
+    /// 与 Wayland 的 `blit_cell`（`overlay-wayland/src/app.rs:2052`）**逐项同式**：
+    /// - 顺序恒定"本体先、配件后"，反过来帽子会变成透明底；
+    /// - `covers(key)` 那道门是**数据决定的可见性**：一份只声明 `idle` 的配件，在 `walk`
+    ///   那几行就是不叠 —— 拿 `idle` 的像素往 `run` 的本体上叠，画的是别的东西，而屏上
+    ///   看不出来；
+    /// - 配件叠加失败 ⇒ **整趟作废**（返回 `Err`，调用方不得 present）："半顶帽子"在屏上
+    ///   与"帽子歪了"同形，是又一种读不出根因的错。
+    ///
+    /// 与那边的一处**形状**差异（不是数学差异）：`body` 在这里不是 `Option` —— Wayland 的
+    /// `blit_cell` 要兼画 `--test-rect`（两份图集都没有），本平台的矩形档走 [`Stage::paint_solid`]，
+    /// 本体缺席在这里不是可达状态。`key` 只在 `worn` 在场时被读；`worn` 为 `None` 时随便给。
+    pub fn paint_composited(
+        &mut self,
+        body: &Atlas,
+        worn: Option<&Worn>,
+        cell: (u32, u32),
+        key: AssetKey,
+    ) -> Result<(), String> {
         self.px.fill(0);
         let (pw, ph) = self.frame.cell_phys();
         let off = self.frame.cell_offset_bytes();
         let take = off.min(self.px.len());
         // `dst_w/dst_h` 用**缩放后**的格尺寸、`stride` 用整块跨距：与 `app.rs:4704 draw_cell`
         // 逐项同式。放大由 `Atlas::blit` 的最近邻做掉，ULW 只搬像素（它若自己缩放 = 糊边）。
-        atlas
-            .blit(
-                row,
-                col,
-                &mut self.px[take..],
-                pw as u32,
-                ph as u32,
-                self.frame.stride(),
-            )
-            .map_err(|e| format!("blit ({row},{col}) 失败: {e}"))
+        let (row, col) = cell;
+        body.blit(
+            row,
+            col,
+            &mut self.px[take..],
+            pw as u32,
+            ph as u32,
+            self.frame.stride(),
+        )
+        .map_err(|e| format!("blit ({row},{col}) 失败: {e}"))?;
+        if let Some(acc) = worn.filter(|a| a.manifest.covers(key)) {
+            acc.atlas
+                .blit_over(
+                    row,
+                    col,
+                    &mut self.px[take..],
+                    pw as u32,
+                    ph as u32,
+                    self.frame.stride(),
+                )
+                .map_err(|e| format!("配件叠加 ({row},{col}) 失败: {e}"))?;
+        }
+        Ok(())
     }
 
     /// 纯色矩形档（`--test-rect`）：margin 那圈保持**全透**、格内填**预乘品红**。
@@ -499,5 +547,290 @@ mod tests {
             }
         }
         assert_eq!(t.alpha_at(0, 0), Some(0), "品红那圈把 margin 也填了");
+    }
+
+    // ── ⑥ 本体 + 配件合成（M5b：与 Wayland `blit_cell` 同一份数学）─────────────
+
+    use petcore::assets::{Grid, StateTrack};
+    use petcore::gacha::catalog::Slot;
+    use std::collections::HashMap;
+
+    /// 手搓一份只用来回答 `covers` 的配件清单（`covers` 只看 `states` 的键集，
+    /// 完整校验是装备那一刻 `validate_against` 的事，不归这块画布管）。
+    fn acc_manifest(states: &[&str]) -> AccessoryManifest {
+        AccessoryManifest {
+            format: 1,
+            slug: "test_hat".into(),
+            display_name: None,
+            slot: Slot::Head,
+            fits: vec![],
+            sheet: "sheet.webp".into(),
+            grid: Grid {
+                cols: fixture::COLS as usize,
+                rows: fixture::ROWS as usize,
+                w: fixture::CELL,
+                h: fixture::CELL,
+            },
+            states: states
+                .iter()
+                .map(|s| {
+                    (
+                        s.to_string(),
+                        StateTrack {
+                            rows: vec![0, 1],
+                            fps: 5.0,
+                            looped: None,
+                            note: None,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    fn worn_with(atlas: Atlas, states: &[&str]) -> Worn {
+        Worn {
+            manifest: acc_manifest(states),
+            atlas,
+        }
+    }
+
+    /// 逐格**纯色**的图集（整格 4×4 同一颗直通 RGBA）。
+    ///
+    /// 为什么要自己造一份而不是连 `probe_atlas()` 调两次：合成判据要"本体一格、配件另一格
+    /// 内容**不同**"，而同一份图集两侧只能取同一个 `(row,col)` —— 两边全同的叠加把
+    /// "顺序写反"与"根本没叠"两种病都藏住（`composite_over(x, x)` 与 `x` 在 `a==0/255`
+    /// 两档恰好等值，正是探针格挑出来的那两档）。
+    /// `lossless` 往返 + 预乘都在 `Atlas::load` 真路径上走，不留测试专用的后门构造。
+    fn sheet_atlas(
+        dir: &std::path::Path,
+        name: &str,
+        cell_rgba: impl Fn(u32, u32) -> [u8; 4],
+        rows: u32,
+    ) -> Atlas {
+        let w = fixture::COLS * fixture::CELL;
+        let h = rows * fixture::CELL;
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for cy in 0..rows {
+            for cx in 0..fixture::COLS {
+                let c = cell_rgba(cy, cx);
+                for py in 0..fixture::CELL {
+                    for px in 0..fixture::CELL {
+                        let i = (((cy * fixture::CELL + py) * w + cx * fixture::CELL + px)
+                            as usize)
+                            * 4;
+                        rgba[i..i + 4].copy_from_slice(&c);
+                    }
+                }
+            }
+        }
+        let webp = overlay_common::atlas::encode_lossless_rgba(&rgba, w, h).expect("encode");
+        let path = dir.join(format!("{name}.webp"));
+        std::fs::write(&path, webp).expect("write");
+        Atlas::load(
+            path.to_str().expect("UTF-8"),
+            fixture::COLS,
+            rows,
+            fixture::CELL,
+            fixture::CELL,
+        )
+        .expect("load")
+    }
+
+    /// stage 像素缓冲里格内 `(x,y)` 的四字节（scale 1.0 ⇒ 物理 = 逻辑，点名无歧义）。
+    fn px_at(f: &Frame, bytes: &[u8], x: i32, y: i32) -> [u8; 4] {
+        let (gx, gy) = f.cell_to_stage(x as f32, y as f32);
+        let i = (gy as usize) * f.stride() + (gx as usize) * 4;
+        bytes[i..i + 4].try_into().expect("四字节")
+    }
+
+    /// **接线判据**（数学本身钉在 `overlay-common::atlas` 的单测，这里不重验公式）：
+    /// ① `covers` 闸门真接在出图上 —— 只在 `idle` 声明过的配件，`run` 里一帧都不许叠；
+    /// ② 叠的是 **source-over** 而不是覆盖 —— 半透明配件下本体颜色必须按手算混进结果；
+    /// ③ 顺序是本体先、配件后 —— 不透明配件必须盖住本体（写反 = 本体盖帽子，红变蓝）。
+    /// 期望值全部**手算写死**：配件 `(0,0)` 格直通 `[0,255,0,128]` → 预乘 `[0,128,0,128]`，
+    /// 本体蓝 → 预乘 `[255,0,0,255]`；`keep = 255−128 = 127` ⇒
+    /// `B: 0+(255·127+127)/255 = 127`，`G: 128+(0·127+127)/255 = 128+0`，
+    /// `R: 0+(0·127+127)/255 = 0`，`A: 128+(255·127+127)/255 = 128+127` ⇒ `[127,128,0,255]`。
+    #[test]
+    fn worn_overlay_is_source_over_and_covers_gates_the_state() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let f = probe_frame();
+        let body = sheet_atlas(dir.path(), "body", |_, _| [0, 0, 255, 255], fixture::ROWS);
+        let hat = sheet_atlas(
+            dir.path(),
+            "hat",
+            |r, c| {
+                if (r, c) == (0, 0) {
+                    [0, 255, 0, 128] // 半透明绿：判"混"而不是"盖"
+                } else {
+                    [255, 0, 0, 255] // 不透明红：判顺序
+                }
+            },
+            fixture::ROWS,
+        );
+        let acc = worn_with(hat, &["idle"]);
+        let mut s = Stage::new(f);
+
+        // ② + ③：`idle` 覆盖的两格
+        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Idle)
+            .expect("idle 该叠上");
+        assert_eq!(
+            px_at(&f, s.bytes(), 1, 1),
+            [127, 128, 0, 255],
+            "(0,0) 不是 source-over 的手算值 ⇒ 混合或取样错"
+        );
+        s.paint_composited(&body, Some(&acc), (0, 1), AssetKey::Idle)
+            .expect("配件声明了 idle 的 rows=[0,1]，(0,1) 也该叠");
+        assert_eq!(
+            px_at(&f, s.bytes(), 1, 1),
+            [0, 0, 255, 255],
+            "(0,1) 不透明配件没盖住本体蓝 ⇒ 顺序反了（本体后画）或没叠"
+        );
+
+        // ①：同一件配件、同一个格，状态换成没声明过的 `run` ⇒ 逐字节回到纯本体
+        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Run)
+            .expect("run 也该出图（只是不叠）");
+        let (pw, ph) = f.cell_phys();
+        for y in 0..ph {
+            for x in 0..pw {
+                assert_eq!(
+                    px_at(&f, s.bytes(), x, y),
+                    [255, 0, 0, 255],
+                    "run 里帽子漏出来了 ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// 命中读的是**叠完**的那份 alpha：本体全透 + 配件可点 ⇒ 命中；配件恰好压在线下
+    /// （a==8）⇒ 叠完仍穿透。两颗配对：前一颗单独存在时，"配件从没画进缓冲"也能绿；
+    /// 后一颗挡住"叠加把 alpha 拉满"的错。
+    #[test]
+    fn hit_follows_the_composite_not_just_the_body() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let f = probe_frame();
+        let body = sheet_atlas(dir.path(), "clear", |_, _| [0, 0, 0, 0], fixture::ROWS);
+        let hat9 = sheet_atlas(dir.path(), "hat9", |_, _| [255, 255, 255, 9], fixture::ROWS);
+        let hat8 = sheet_atlas(dir.path(), "hat8", |_, _| [255, 255, 255, 8], fixture::ROWS);
+        let mut s = Stage::new(f);
+        let (hx, hy) = at(&f, 1, 1); // 格内 (1,1) → 窗口坐标（margin 之内）
+
+        s.paint_composited(&body, None, (0, 0), AssetKey::Idle)
+            .expect("裸本体");
+        assert!(!s.hit(hx, hy), "前提：全透本体该点不动");
+
+        s.paint_composited(
+            &body,
+            Some(&worn_with(hat9, &["idle"])),
+            (0, 0),
+            AssetKey::Idle,
+        )
+        .expect("帽子 a=9");
+        assert!(
+            s.hit(hx, hy),
+            "帽子可点而叠完点不动 ⇒ 命中没读合成后的像素（或配件没叠）"
+        );
+
+        s.paint_composited(
+            &body,
+            Some(&worn_with(hat8, &["idle"])),
+            (0, 0),
+            AssetKey::Idle,
+        )
+        .expect("帽子 a=8");
+        assert!(
+            !s.hit(hx, hy),
+            "a==8 压线：叠加后必须还是 8（阈值 `>` 与 Wayland/pack.py 同口径）"
+        );
+    }
+
+    /// 两侧失败**分得开**（照 Wayland `blit_cell_names_the_side_that_failed`）：清单说 2 行
+    /// 而配件像素只有 1 行 = "不同批产物"的形状，错必须点名是哪一侧，否则真机上
+    /// "帽子没显示"和"宠物没了"是同一条日志。本体侧失败还顺带量"先清零"的次序：
+    /// 缓冲必须还是全零（清零发生在取样之前）。
+    #[test]
+    fn paint_composited_names_the_side_that_failed() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let f = probe_frame();
+        let body = sheet_atlas(dir.path(), "full", |_, _| [0, 0, 0, 0], fixture::ROWS);
+        let short = sheet_atlas(dir.path(), "short", |_, _| [0, 0, 0, 0], 1);
+        let mut s = Stage::new(f);
+
+        let Err(err) = s.paint_composited(
+            &body,
+            Some(&worn_with(short, &["idle"])),
+            (1, 0),
+            AssetKey::Idle,
+        ) else {
+            panic!("配件图集只有 1 行，而行 1 被点名 ⇒ 必须失败");
+        };
+        assert!(
+            err.starts_with("配件叠加"),
+            "要指明失败的是配件那一侧: {err}"
+        );
+        assert!(err.contains("图集只有 1 行"), "要带上图集自己的说法: {err}");
+
+        let Err(err) = s.paint_composited(&body, None, (5, 0), AssetKey::Idle) else {
+            panic!("本体图集只有 2 行 ⇒ 行 5 必须失败");
+        };
+        assert!(err.starts_with("blit"), "本体侧不该被写成配件的错: {err}");
+        assert!(
+            s.bytes().iter().all(|&b| b == 0),
+            "本体失败后缓冲不许留任何字节（先清零、后取样）"
+        );
+    }
+
+    /// [`Stage::paint`] 这个包装必须**逐字节**等于"无配件的合成" —— 它现在被 `present`
+    /// 与那批第一批冻结测例共走。哪天包装里被塞进第二份画格逻辑（或 `fill(0)` 少一次），
+    /// 这条先红，而不是让矩形档/宠物档在屏上悄悄分叉。
+    #[test]
+    fn the_plain_paint_wrapper_is_exactly_a_composite_without_accessory() {
+        let a = fixture::probe_atlas();
+        for cell in [fixture::SILHOUETTE, fixture::ALPHA_PROBES, fixture::EMPTY] {
+            let mut plain = Stage::new(probe_frame());
+            plain.paint(&a, cell.0, cell.1).expect("paint");
+            let mut comp = Stage::new(probe_frame());
+            // `key` 在无配件时**不该被读** —— 故意给一个配件永不会声明的组合也无妨，
+            // 这一条同时钉住"`worn` 缺席 ⇒ 不碰清单"。
+            comp.paint_composited(&a, None, cell, AssetKey::Climb)
+                .expect("paint_composited");
+            assert_eq!(
+                plain.bytes(),
+                comp.bytes(),
+                "cell {cell:?}：包装与合成分叉了"
+            );
+        }
+    }
+
+    /// 同参数连叠两次逐字节不变（ULW 复用同一块内存的那条老规矩在合成分上继续成立），
+    /// 换回无配件也不能留帽子字节。
+    #[test]
+    fn compositing_is_replace_not_accumulate() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let f = probe_frame();
+        let body = sheet_atlas(dir.path(), "body2", |_, _| [0, 0, 255, 255], fixture::ROWS);
+        let acc = worn_with(
+            sheet_atlas(dir.path(), "hat2", |_, _| [0, 255, 0, 128], fixture::ROWS),
+            &["idle"],
+        );
+        let mut s = Stage::new(f);
+        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Idle)
+            .expect("first");
+        let once = s.bytes().to_vec();
+        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Idle)
+            .expect("second");
+        assert_eq!(s.bytes(), once, "连叠两次不逐字节同 ⇒ 在累加不是在替换");
+        s.paint_composited(&body, None, (0, 0), AssetKey::Idle)
+            .expect("脱下");
+        for y in 0..f.cell_phys().1 {
+            for x in 0..f.cell_phys().0 {
+                assert_eq!(
+                    px_at(&f, s.bytes(), x, y),
+                    [255, 0, 0, 255],
+                    "脱下后 ({x},{y}) 还留着绿 ⇒ 没先清零"
+                );
+            }
+        }
     }
 }

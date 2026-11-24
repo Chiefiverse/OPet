@@ -3,7 +3,7 @@
 //!
 //! 这里**不出现任何 wayland 类型**（和 `menu.rs` 同族约束）：只吃 `(canvas, 尺寸, 缩放)`。
 //! 好处不是"整洁"，而是**能在 headless 里出图** —— `OPET_CARD_DUMP=1 cargo test -p
-//! overlay-wayland -- card::tests::dump_each_phase` 会把每个相位写成 `/tmp/` 下的 PPM。
+//! overlay-common -- card::tests::dump_each_phase` 会把每个相位写成 `/tmp/` 下的 PPM。
 //! 像素级的数字门禁看不见"少了一块"（M2 的"整张脸不存在"是被 14 项全绿放过去的），
 //! 所以这一步的验收必须包含目视。
 //!
@@ -2112,7 +2112,7 @@ mod tests {
     /// ```sh
     /// cd /home/jun/Projects/opet
     /// rm -f /tmp/opet_card_*.ppm /tmp/opet_card_*.png /tmp/sheet_*.png
-    /// OPET_CARD_DUMP=1 cargo test -p overlay-wayland --lib -- card::tests::dump_each_phase --ignored --nocapture
+    /// OPET_CARD_DUMP=1 cargo test -p overlay-common --lib -- card::tests::dump_each_phase --ignored --nocapture
     /// ls /tmp/opet_card_*.ppm | wc -l        # 必须是 256 = (菜单 6 页 + 帽子页豁免 1 张 = 7 × 4 locale + menuerr × 4 + 卡片 96) × 2 档
     /// cd /tmp && for f in opet_card_*.ppm; do magick "$f" -scale 300% "${f%.ppm}.png"; done
     /// # 拼总览：一张 = 一个 motion × scale，行=相位、列=locale

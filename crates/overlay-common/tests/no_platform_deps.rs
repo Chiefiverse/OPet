@@ -31,7 +31,10 @@ const ALLOWED: &[&str] = &[
     "serde",   // 清单与 polygon 的解析
     "serde_json",
     "image-webp", // `sheet.webp` 解码，纯 Rust（D12 判据①）
-    "tempfile",   // 只进 dev-dependencies：测例写临时产物，绝不碰 `~/.local/share/opet/`
+    // `ui/text.rs` 的字形栅格，纯 Rust、零平台绑定（2026-11-22 随绘制层上提进来）。
+    "ab_glyph",
+    "tempfile", // 只进 dev-dependencies：测例写临时产物，绝不碰 `~/.local/share/opet/`
+    "sha2", // 也只进 dev-dependencies：`tests/font_assets.rs` 钉字体子集的 sha256（随绘制层上提）
 ];
 
 /// 明确点名的禁止项。**空档由 `ALLOWED` 兜**：这张名单只是让红的时候能说清"你引的是哪家绑定"。

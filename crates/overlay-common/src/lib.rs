@@ -13,7 +13,8 @@
 //!
 //! ## 依赖面（由 `tests/no_platform_deps.rs` 钉，不靠自觉）
 //!
-//! 只有 `petcore` / `serde` / `serde_json` / `image-webp`（外加只在测例里用的 `tempfile`）。
+//! 只有 `petcore` / `serde` / `serde_json` / `image-webp` / `ab_glyph`（纯 Rust 字形栅格，
+//! M5 第二批随绘制层进来；外加只在测例里用的 `tempfile` 与 `sha2`（字体资产门禁钉摘要）。
 //! 没有 `wayland-*`、没有 `smithay-*`、没有 `calloop`、
 //! 没有 `windows-sys`、没有 `objc2`，也没有 `std::os::unix`。⇒ 任何一个平台的客户端都能依赖它，
 //! 包括 `x86_64-pc-windows-gnu` 与将来的 macOS 客户端。
@@ -22,7 +23,7 @@
 //! 依赖全集），不是这一段话 —— 所以改了 `Cargo.toml` 而没改测试会红，而这一段话漂了不会。
 //! 这一段是给人读的，那一条断言是守着的。
 //!
-//! ## 三个模块各自被谁用（不是"全都用"）
+//! ## 五个模块各自被谁用（不是"全都用"）
 //!
 //! - [`atlas`] —— **每个平台都用**。产出的字节布局是**预乘 BGRA8**（小端 = B,G,R,A），
 //!   这同时是 Wayland `wl_shm` 的 `Argb8888` 要的、和 Win32 `UpdateLayeredWindow` 带
@@ -35,7 +36,23 @@
 //!   穿透靠 `WM_NCHITTEST` 当场读**刚交出去那块 buffer 的 alpha 字节**，读的是屏上像素本身，
 //!   而 `polygon.json` 是那份像素的预计算近似（同一阈值 `atlas::ALPHA_HIT_THRESHOLD`）。
 //!   留着它是因为另一个消费者真的需要它，不是为了"看起来对称"。
+//! - [`ui`] —— 2026-11-22（M5 第二批拍板③）起是**菜单/卡面/面板/词表/文字**的唯一实现，
+//!   六个模块自 `overlay-wayland` 整搬而来，搬的判据 = 它们头部自带的"零 wayland 类型"约束
+//!   与实测依赖面（只有 `petcore` + `ab_glyph`）。`overlay-wayland` 与 `overlay-win32`
+//!   画的是**同一份数学**，分叉在结构上不可能。
+//! - [`dress`] —— 2026-11-23（M5e）起是**换装那几条判据**的唯一实现（"这一件许不许穿""这句
+//!   该不该打""上次穿的这一轮还穿不穿"），与 [`accounting`] 的 `classify_tick` 是同一条先例：
+//!   纯决策上提，IO 与像素留在各家。落库那一步（`write_equip`/`clear_equip`）**没有**搬 ——
+//!   它要 `petstore`，而这一层的立身之本是不碰任何带状态的层；代价（"演示态不写"有两份实现）
+//!   明写在 `dress.rs` 头部。
 
 pub mod accounting;
 pub mod atlas;
+pub mod dress;
 pub mod region;
+pub mod ui;
+
+/// 再导出：搬进来的六个模块内部互引全走 `crate::menu::…` 这类**根路径**，把它们钉在 crate
+/// 根就等于**一个引用都不用改**（与 [`atlas`]/[`region`] 上提时 wayland 侧的同款手法是一对
+/// 镜像）。`settings` 也在其中：各家客户端自己的 `settings.rs` 只保留优先级链。
+pub use ui::{card, font, l10n, menu, panel, settings, text};

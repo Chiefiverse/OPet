@@ -43,6 +43,16 @@ DO_CLEAN=0
 # 到这里已经旧了：`window.rs` / `monitor.rs` 真调起 GDI 与 user32 ⇒ 多 2 个，std 那条随机数线
 # 多 1 个（bcryptprimitives）。这正是要重测的原因 —— 拿旧表当判据，第 4 步就白跑了。
 #
+# ⚠️ **2026-11-23 M5e 重跑到 16 个**（第二批第一次跑全流程时第 5 步真的红了，红的是**结果**而不是
+# 病）：M4 把 `petstore` 链进来 ⇒ `rusqlite/bundled` 那份 C 合并文件（`libsqlite3.a`）的两个未定义
+# 符号要人回答，实测出处 =
+#   `x86_64-w64-mingw32-nm -u …/release/build/libsqlite3-sys-*/out/libsqlite3.a`
+#     U _localtime64   ⇒ api-ms-win-crt-time-l1-1-0.dll
+#     U qsort          ⇒ api-ms-win-crt-utility-l1-1-0.dll
+#   （同一份 objdump 的成员名表里这两个符号各只出现一次，别处的 C 代码没有第三个消费者。）
+# 两个都是 **UCRT 的 api set**，Win10 起随系统 ⇒ 与 `libwinpthread` 那一族性质相反（那两个是
+# 交叉链的私货，这两个是 C 运行时的分模块）。**换依赖 / 换工具链必须重拿这张表**，见下面第 5 步。
+#
 # 为什么这张表必须存在：交叉链最容易带进来的私货是 `libwinpthread-1.dll` 与
 # `libgcc_s_seh-1.dll`。用户机器上没有这两个名字，缺 DLL 的 PE 在 `main` 之前就被加载器拒掉，
 # 症状是一句"找不到 xxx.dll"而没有任何一行我们的输出 —— 那一轮会 entirely 丢掉证据。
@@ -56,6 +66,8 @@ ALLOWED_DLLS=(
   "api-ms-win-crt-runtime-l1-1-0.dll"
   "api-ms-win-crt-stdio-l1-1-0.dll"
   "api-ms-win-crt-string-l1-1-0.dll"
+  "api-ms-win-crt-time-l1-1-0.dll"    # sqlite3.c 的 _localtime64（M4 接线带来，出处见上面）
+  "api-ms-win-crt-utility-l1-1-0.dll" # sqlite3.c 的 qsort（同上）
   "bcryptprimitives.dll" # 种子的随机来源（Windows 8.1 起随系统）
   "gdi32.dll"            # 显示器几何那一族（EnumDisplayMonitors / GetMonitorInfoW 侧）
   "kernel32.dll"

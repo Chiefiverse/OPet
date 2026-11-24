@@ -486,19 +486,28 @@ mod tests {
     }
 
     /// 路径回退必须和 `paths.rs` 同一条规则（XDG 只认绝对值）。两处不一致就是"两套 XDG 语义"。
+    ///
+    /// ⚠️ 样本路径用 [`crate::paths::host_abs`]（cwd 打底）而**不硬写 `/tmp/…`**：
+    /// 硬写 unix 绝对形制在 Windows target 上不成绝对路径，整条断言会因样本而非规则失败
+    /// —— 那是 M0 Wine 五红之一。规则本身与平台无关，样本必须无关。
     #[test]
     fn config_path_follows_the_same_xdg_rule_as_the_archive() {
-        let abs = Config::read_in(&ConfigEnv::with(Some("/tmp/xdg-cfg"), Some("/home/jun")));
+        let xdg = crate::paths::host_abs("xdg-cfg");
+        let home = crate::paths::host_abs("home_jun");
+        let abs = Config::read_in(&ConfigEnv::with(Some(&xdg), Some(&home)));
         assert_eq!(
             abs.path,
-            PathBuf::from("/tmp/xdg-cfg/opet/config.toml"),
+            PathBuf::from(&xdg).join("opet").join("config.toml"),
             "$XDG_CONFIG_HOME 绝对 ⇒ 直接用它"
         );
 
-        let rel = Config::read_in(&ConfigEnv::with(Some("relative/nope"), Some("/home/jun")));
+        let rel = Config::read_in(&ConfigEnv::with(Some("relative/nope"), Some(&home)));
         assert_eq!(
             rel.path,
-            PathBuf::from("/home/jun/.config/opet/config.toml"),
+            PathBuf::from(&home)
+                .join(".config")
+                .join("opet")
+                .join("config.toml"),
             "XDG 规范：相对值等于没设 ⇒ 必须回退 $HOME/.config"
         );
 
@@ -507,7 +516,7 @@ mod tests {
             &crate::paths::Env {
                 opet_db: None,
                 xdg_data_home: Some("relative/nope".into()),
-                home: Some("/home/jun".into()),
+                home: Some(home.clone()),
                 ..crate::paths::Env::default()
             },
             None,

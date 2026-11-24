@@ -7,10 +7,16 @@ repository.workspace = true
 rust-version.workspace = true
 description = "OPet 的 Windows 适配层：Win32 分层窗口（layered window）overlay 客户端（§3.7 / M5 第一批）"
 
-# ⚠️ 这一片**故意不依赖 `petstore`**（用户 2026-11-21 第 4 条拍板 = 只交 `opet-overlay-win32.exe`）。
-# 真实理由不是"最小化"而是**交叉编译**：`petstore` 拖 `rusqlite/bundled` ⇒ `libsqlite3-sys` 要在
-# `x86_64-pc-windows-gnu` 上编 C。那是本轮最可能失败的一环，把它留在关键路径之外，
-# 屏上那一格才能先被验掉。全功能 `opet.exe` 属下一轮单独拍板。
+# 第一批**有意**不依赖 `petstore`（用户 2026-11-21 第 4 条拍板 = 只交 `opet-overlay-win32.exe`），
+# 赌点是 `petstore` 拖 `rusqlite/bundled` ⇒ `libsqlite3-sys` 要在 `x86_64-pc-windows-gnu` 上编 C。
+# **M0（2026-11-22）证伪了那个担心**：本机 mingw-w64 交叉编译一次通过，无预编译 dll、无 JSONL 分叉、
+# 没引任何新 FFI。⚠️ 但**"DLL 白名单不动"那一句当时是推算，不是读数** —— M5e 第一次带着 petstore
+# 跑完整打包流程时第 5 步真红了：`libsqlite3.a` 的 `_localtime64` 与 `qsort` 各带进一个 UCRT api set
+# ⇒ 白名单 14 → **16**。实测出处与 nm 命令写在 `scripts/build_windows.sh` 那张表旁边（那里才是判据）。
+# 判据读数 =
+# Wine 11.22 全套：lib 69/0 + 7 个集成 exe（audit_verify 11 / equipped_roundtrip 6 / ledger_roundtrip 18 /
+# pack_install 22 / pack_inventory 12 / paid_randomness 5 / schema_redlines 7）全绿。
+# ⚠️ Wine 读数不是 Win11 判据（D5 口径），但"M0 的降级方案不必启动"这一条已经被它回答。
 #
 # `windows-sys` **在下面的 target 栏里，不在这一栏**，而且这是第 7 步特意选的写法：
 # 通用那一栏在 Linux 上也会 `use windows_sys::…` 成功（这 crate 在非 Windows 上是空壳、不是错误），
@@ -19,6 +25,7 @@ description = "OPet 的 Windows 适配层：Win32 分层窗口（layered window�
 # 所以在 Linux 宿主上就能编能测 —— 这是本次切模块的全部目的。
 [dependencies]
 petcore = { workspace = true }
+petstore = { workspace = true }
 # 预乘 BGRA8 的图集解码 + 省电五档记账，与 Wayland 客户端共用同一份（见 crates/overlay-common）。
 overlay-common = { workspace = true }
 
@@ -46,3 +53,6 @@ path = "src/main.rs"
 # 客户端的测例看不见它 ⇒ 只能在调用方按特性打开。不开 = 那个模块连符号都不存在，
 # 所以第 9 步发出去的 `.exe` 里不会留任何测试脚手架。
 overlay-common = { workspace = true, features = ["test-fixture"] }
+# ⑥ 组（本体+配件合成）要**两份内容不同的图集**，而 `Atlas` 只有从盘上 `load` 一条公开构造路。
+# 与 `overlay-wayland` 那组 `blit_cell` 测例同器（那边 dev-dep 也是 `tempfile = "3"`）。
+tempfile = "3"

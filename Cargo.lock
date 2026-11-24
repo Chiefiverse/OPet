@@ -376,10 +376,12 @@ dependencies = [
 name = "overlay-common"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "image-webp",
  "petcore",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -387,14 +389,12 @@ dependencies = [
 name = "overlay-wayland"
 version = "0.1.0"
 dependencies = [
- "ab_glyph",
  "image-webp",
  "overlay-common",
  "petcore",
  "petstore",
  "serde",
  "serde_json",
- "sha2",
  "smithay-client-toolkit",
  "tempfile",
  "wayland-client",
@@ -407,6 +407,8 @@ version = "0.1.0"
 dependencies = [
  "overlay-common",
  "petcore",
+ "petstore",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

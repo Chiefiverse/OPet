@@ -37,9 +37,12 @@ use overlay_common::accounting::Counters;
 
 /// 本片没链进来的那几块面的统一说法。
 ///
-/// ⚠️ 不能省成"什么都不打"：`菜单/面板/字体` 那三行在 Wayland 是有数的，Windows 上不打
+/// ⚠️ 不能省成"什么都不打"：`面板` 那一行在 Wayland 是有数的，Windows 上不打
 /// 会被读成"数为 0"，而 0 与"没有这块面"是两个完全不同的结论（同一族那句"不要把'没跑到'
-/// 读成'通过'"）。
+/// 读成'通过'"）。已经从这个族**毕业**的有三行：`ui:`（M5e 起改打"已接/未接"两张清单，
+/// M6 起卡面进已接那半）、`菜单`（M5c 起打状态 + `menu_commits` 真数）与
+/// `字体`（M5e 起打 [`Font`] 那五个实测数 —— 菜单文字从 M5c 那一刻就真在走
+/// `overlay_common::text`，那一行当时就该是数，M5e 补上）。
 pub const NOT_BUILT: &str = "本构建未接（M5 最小片）";
 
 /// 三个内存读数，单位**字节**（KB 换算留给 [`memory_line`]，这样采集器不必猜口径）。
@@ -51,6 +54,38 @@ pub struct Memory {
     pub working_set: u64,
     /// `PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`
     pub private_working_set: u64,
+}
+
+/// 字体那一层的五个数，**由调用方在退出那一刻取好后交进来**。
+///
+/// ⚠️ 为什么不在 [`lines`] 里现取：`face`/缓存/命中数全是进程全局，而 `lines()` 是宿主测例
+/// 的固定输入 → 固定输出。让它读全局 ⇒ 同一份摘要会随"这个二进制里先跑了哪条测例"变，
+/// 而 `the_three_grep_tokens_are_literal` 那一条的红必须是内容红、不是竞态红。
+/// 采集只有一个入口 = [`Font::collect`]，由 `app.rs` 的 `report()` 调。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Font {
+    /// `true` = 子集字体加载成功；`false` = 降级 5×7 点阵（与 Wayland 同一句判词）。
+    pub face_real: bool,
+    /// 字形缓存 arena 当前占用（字节）。
+    pub cache_bytes: usize,
+    /// 命中 / 栅格化 / 未缓存 三档，原文与 Wayland 的 `text::cache_stats()` 对齐。
+    pub hits: usize,
+    pub made: usize,
+    pub uncached: usize,
+}
+
+impl Font {
+    /// 从 `overlay_common::text` 的全局里取当下这一格。**只在退出摘要前调一次**。
+    pub fn collect() -> Self {
+        let (hits, made, uncached) = overlay_common::text::cache_stats();
+        Self {
+            face_real: overlay_common::text::face().is_some(),
+            cache_bytes: overlay_common::text::cache_bytes(),
+            hits,
+            made,
+            uncached,
+        }
+    }
 }
 
 /// 一轮运行的全部摘要输入。
@@ -77,21 +112,30 @@ pub struct Run<'a> {
     pub mem_reason: Option<&'a str>,
     pub cpu_secs: Option<f64>,
     pub cpu_reason: Option<&'a str>,
+    /// 退出那一刻菜单面开没开着（M5c 接线；提交数在 `counters.menu_commits`，这一格只是状态）。
+    pub menu_open: bool,
+    /// 字体那一层的五个数（M5e 接线；采集只在 [`Font::collect`]，理由写在那儿的注释里）。
+    pub font: Font,
 }
 
 /// 摘要正文，一行一个元素。
 ///
 /// 前三行的 token 与 Wayland `report()` 逐字对齐（`overlay:` / `  核对: 五档合计` /
-/// `  surface 逻辑`），差异只在两处：**被 inline 标注的恒 0 档**与**没链进来的那三行**。
+/// `  surface 逻辑`），差异只在两处：**被 inline 标注的恒 0 档**与**还没链进来的那几块面**
+/// （`ui:` 那一句列的 M7 + `面板` 那一行）。`菜单` 与 `字体` 两行从 M5c / M5e 起与 Wayland
+/// 一样是真数 —— 它们共用 `overlay_common`，本来就没有"这平台量不出"这一说。
 pub fn lines(run: &Run) -> Vec<String> {
     let c = run.counters;
     // 三档占比的分母：与 Wayland 同一个式子（提交 + 仅移动 + 无事，max 1 防零除）。
     let t = (c.commits + c.moves + c.idle).max(1) as f64;
     let pct = |n: u64| 100.0 * n as f64 / t;
 
-    let mut out = vec![format!(
-        "  ui: {NOT_BUILT} —— 无卡片/面板/字体/配件/库存 ⇒ 本片的 UI 只有宠物那几个像素"
-    )];
+    // `ui:` 从 M5e 起不再借用 [`NOT_BUILT`]：菜单面与换装都接完了，那一顶帽子就在屏上戴着，
+    // 而"本构建未接"会让读表的人以为这一轮什么 UI 都没测到。M6 起卡面也进"已接"，只剩面板。
+    let mut out = vec![
+        "  ui: 已接 = 宠物像素 + 菜单面（M5c）+ 换装（M5e）+ 卡面（M6）｜未接 = 面板（M7）"
+            .to_string(),
+    ];
 
     out.push(format!(
         "overlay: {} tick / {:.1}s 墙钟；提交 {}（{:.1}%）、仅移动 {}（{:.1}%）、无事 {}（{:.1}%）、延后 {}、buffer 错误 {}、帧回调看门狗 {}（{}）",
@@ -133,10 +177,32 @@ pub fn lines(run: &Run) -> Vec<String> {
         run.dpi_path,
     ));
 
-    // 这三行是"这块面不存在"，不是"这块面省电"。
-    for which in ["菜单", "面板", "字体"] {
-        out.push(format!("  {which}: {NOT_BUILT}"));
-    }
+    // 菜单行从 M5c 起是**真数**（与 Wayland 的 `菜单: N 提交` 同族同位）；`面板` 那一行才是
+    // "这块面不存在"，不是"这块面省电"。看门狗那一档写死在说明里而不是打 0：
+    // 本平台没有在飞帧回调，那个数与宠物那侧"帧回调看门狗"同一句结构性理由。
+    out.push(format!(
+        "  菜单: {}（{} 提交，静止时应当恒 0 增长；本平台无帧回调 ⇒ 看门狗结构上恒 0）",
+        if run.menu_open { "开着" } else { "没开" },
+        c.menu_commits,
+    ));
+    // 字体这行从 M5e 起是**真数**（与 Wayland `report()` 同一句式、同一批 token）。两个平台
+    // 共用 `overlay_common::text` ⇒ 命中/栅格化那两个数本来就该由同一份全局出来，这里只是
+    // 第一次把它打出来。缓存上限是编译期常量，两边读的是同一个数。
+    out.push(format!(
+        "  字体: face={} 资产 {} KiB / 字形缓存 {} B（上限 {} B，命中 {}，栅格化 {}，未缓存 {}）",
+        if run.font.face_real {
+            "真字体"
+        } else {
+            "降级 5×7 点阵"
+        },
+        overlay_common::text::FONT_BYTES.len() / 1024,
+        run.font.cache_bytes,
+        overlay_common::text::CACHE_MAX_BYTES,
+        run.font.hits,
+        run.font.made,
+        run.font.uncached,
+    ));
+    out.push(format!("  面板: {NOT_BUILT}"));
 
     if let Some((state, fp)) = run.kernel {
         out.push(format!("  内核: state={state} 指纹={fp:016x}"));
@@ -317,6 +383,8 @@ mod tests {
             mem_reason: None,
             cpu_secs: Some(7.17),
             cpu_reason: None,
+            menu_open: false,
+            font: Font::default(),
         }
     }
 
@@ -369,19 +437,91 @@ mod tests {
         assert!(line_with(&out, "核对:").contains("结构上恒 0"));
     }
 
-    /// 没链进来的三块面：一行一个，且**不是**空行也不是"0"。
+    /// 没链进来的那**一块**面（面板）：一行，且**不是**空行也不是"0"。
+    ///
+    /// 从这一族毕业的有三行：`ui:` 改打"已接/未接"两张清单，`菜单`（M5c）打状态 +
+    /// `menu_commits` 真数，`字体`（M5e）打 [`Font`] 那五个数。它们从"未接"变成"有数"是
+    /// 同一件事的两面 —— 菜单文字**早就**在走 `overlay_common::text`，那一行写着"未接"
+    /// 是错的，不是保守。
+    ///
+    /// ⚠️ `ui:` 那一行的断法是**双向**的，而且**按 `｜` 切成两半再断**：卡面从 M6 起毕业后，
+    /// `卡面（M6）`这个 token 还在同一行里（挪进了"已接"那半）⇒ 拿整行 `contains` 会把"未接
+    /// 清单被并进已接"这种改写读成通过。两半各查一遍，且已接的不许同时出现在未接那半。
+    /// 只断"不含未接"还会放过最坏的那种改写 —— 把整行删掉。
+    ///
+    /// ⚠️ 字体那五个数断的是**交进来的那五个**，不是"某处有数"：全局采集一旦混进 `lines()`，
+    /// 同一份摘要会随测例执行顺序变，而这条测例的红必须长得很像"标签写错了"而不是"运气不好"。
     #[test]
-    fn absent_surfaces_say_absent_three_times() {
+    fn absent_surfaces_say_absent_while_the_graduated_ones_say_numbers() {
         let c = Counters::default();
-        let all = lines(&run(&c)).join("\n");
-        assert_eq!(all.matches(NOT_BUILT).count(), 4, "{all}"); // ui + 菜单 + 面板 + 字体
-        for which in ["菜单:", "面板:", "字体:"] {
-            assert!(all.contains(which), "缺 {which} 那一行");
+        let out = lines(&run(&c));
+        let all = out.join("\n");
+        assert_eq!(all.matches(NOT_BUILT).count(), 1, "{all}"); // 只剩 面板
+        let ui = line_with(&out, "ui:");
+        let (built_half, missing_half) = ui
+            .split_once("｜")
+            .expect("ui: 必须是「已接 …｜未接 …」两段 ⇒ 少一半就没有可读的清单");
+        for built in ["宠物像素", "菜单面（M5c）", "换装（M5e）", "卡面（M6）"] {
+            assert!(
+                built_half.contains(built),
+                "已接的那块面被漏报：{built}\n{ui}"
+            );
+            assert!(
+                !missing_half.contains(built),
+                "同一块面同时出现在未接那半 ⇒ 清单自相矛盾：{built}\n{ui}"
+            );
         }
+        // 今天只剩面板未接（M7 落地那一格再回到两样）。
+        let missing = "面板（M7）";
         assert!(
-            !all.contains("菜单: 0"),
-            "菜单被打成了数 ⇒ 会被读成'量过且省'"
+            missing_half.contains(missing),
+            "未接的那块面被说成已接：{missing}\n{ui}"
         );
+        assert!(
+            !built_half.contains(missing),
+            "未接的被写进已接那半：{missing}\n{ui}"
+        );
+        assert!(
+            line_with(&out, "面板:").contains(NOT_BUILT),
+            "缺 面板 那一行"
+        );
+        let menu = line_with(&out, "菜单:");
+        assert!(menu.contains("没开"), "{menu}");
+        assert!(menu.contains("0 提交"), "{menu}");
+        // "开着"那一档由 `menu_open` 真值驱动，不是把数打上去就算数：
+        let c2 = Counters {
+            menu_commits: 7,
+            ..Default::default()
+        };
+        let mut r = run(&c2);
+        r.menu_open = true;
+        let menu = line_with(&lines(&r), "菜单:");
+        assert!(menu.contains("开着") && menu.contains("7 提交"), "{menu}");
+
+        // ── 字体行：两个 face 分支 + 五个数各自到位 ──
+        let mut r = run(&c);
+        r.font = Font {
+            face_real: true,
+            cache_bytes: 4096,
+            hits: 61,
+            made: 12,
+            uncached: 3,
+        };
+        let font = line_with(&lines(&r), "字体:");
+        assert!(font.contains("face=真字体"), "{font}");
+        assert!(font.contains("字形缓存 4096 B"), "{font}");
+        assert!(font.contains("命中 61"), "{font}");
+        assert!(font.contains("栅格化 12"), "{font}");
+        assert!(font.contains("未缓存 3"), "{font}");
+        // 上限那个数是编译期常量，两平台读同一个 ⇒ 断它不为 0，就断掉了"把上限漏进分子"那一类
+        // 抄写错（Wayland 那一行里它是括号里的第二个数）。
+        assert!(
+            font.contains(&format!("上限 {} B", overlay_common::text::CACHE_MAX_BYTES)),
+            "{font}"
+        );
+        r.font.face_real = false;
+        let font = line_with(&lines(&r), "字体:");
+        assert!(font.contains("face=降级 5×7 点阵"), "{font}");
     }
 
     /// 占比的分母是三档之和，不是 tick 总数（与 Wayland 同式）。

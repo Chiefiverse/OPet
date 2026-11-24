@@ -13,8 +13,8 @@
 //!
 //! ## 这个子集之外的一条都不留"能解析、没人读"
 //!
-//! 九个 Wayland 侧的真开关在这里由 [`REFUSED`] **点名拒绝并给理由**，而不是落到
-//! "未知参数"那条默认分支。区别不是礼貌：默认分支说的是"我不认识这个词"，而这九条
+//! 剩下的 Wayland 侧真开关在这里由 [`REFUSED`] **点名拒绝并给理由**，而不是落到
+//! "未知参数"那条默认分支。区别不是礼貌：默认分支说的是"我不认识这个词"，而这些
 //! 用户没有打错字 —— 从 Wayland 那条命令行拷过来是最自然的动作，那句"未知"会把人
 //! 支去数字符，而不是去问"这台机器上它为什么不存在"。
 //!
@@ -33,10 +33,10 @@ USAGE: opet-overlay-win32 [OPTIONS]
   Wayland client drives. Pixels never cross into petcore: this process decodes the
   sheet and owns every byte it puts on screen.
 
-  This binary is M5's first slice = the pet on screen and nothing else. No
-  right-click menu, no gacha card, no collection panel, no accessories, no tray
-  icon, no control socket. The flags that would ask for those are REFUSED by name
-  at the bottom of this text, each with its reason - never accepted-and-ignored.
+  This binary is M5's SECOND slice: the pet on screen, the right-click menu and
+  accessory dress-up. No gacha card, no collection panel, no tray icon, no control
+  socket. The flags that would ask for those are REFUSED by name at the bottom of
+  this text, each with its reason - never accepted-and-ignored.
 
   One content source is required:
     --manifest FILE     pet.json for the pet to show (produced by tools/pack.py)
@@ -47,6 +47,13 @@ USAGE: opet-overlay-win32 [OPTIONS]
 OPTIONS:
   --manifest FILE       see above
   --test-rect           see above
+  --db FILE            sqlite archive for gacha persistence (petstore, bundled
+                       SQLite - linked since M5's second slice). Absolute path.
+                       Not given = demo state: the startup line prints where the
+                       Windows fallback WOULD write and no byte is written -
+                       the same no-touch contract as the Wayland client's
+                       missing --db (memory store, nothing near the real
+                       archive).
   --seconds N           stop after N seconds; 0 = run until killed. Default 3: a pet
                         started by hand on a live desktop must not linger there.
   --monitor NAME        GDI device name of the monitor to live on, e.g. \\.\\DISPLAY1
@@ -62,6 +69,13 @@ OPTIONS:
                         reservation, so this inset still has to be sayable.
   --seed N              seed for the behavioural core (default 1). Same seed replays
                         the same frames bit for bit.
+  --allow-unowned-accessories
+                        dev exemption: dress the pet with accessories the inventory
+                        does not own. Default OFF - letting an unowned item through
+                        has to be an explicit decision. No effect without --db
+                        (demo state has no inventory to check, so everything is
+                        already let through and the hat page prints 「演示」
+                        instead of this row's `*`).
   -h, --help            print this text and exit.
 
 NOT IN THIS BUILD (the parser names the reason for each; use opet-overlay-wayland
@@ -73,19 +87,23 @@ NOT IN THIS BUILD (the parser names the reason for each; use opet-overlay-waylan
   no --ipc   --ipc-path P          the control socket is a Unix-domain socket at
                                    $XDG_RUNTIME_DIR/opet.sock; no Windows transport
                                    has been designed for it yet.
-  no --db P                        gacha persistence lives in petstore (bundled
-                                   SQLite), which this executable deliberately does
-                                   not link - see the crate's Cargo.toml.
-  no --lang L                      this slice draws no text at all (no menu, no card,
-                                   no panel), so a language has nothing to say in.
-  no --motion M                    full/reduce/off gates card and panel motion; both
-                                   are absent here, so the value would change nothing.
+  no --lang L                      the language IS in effect (Lang::DEFAULT at start,
+                                   the menu row flips it); what this flag lacks is the
+                                   config-file -> command-line override chain and
+                                   printing which source won. That lands with M7.
+  no --motion M                    same as --lang: motion already drives the card's
+                                   starting phase (Motion::DEFAULT into
+                                   menu::after_pull). The config chain is what is
+                                   missing, not the surface. M7.
   no --no-cursor                   it works around 'the client owns the cursor image'
                                    on Wayland. Windows draws the cursor itself; there
                                    is nothing to switch off, and a flag that buys
                                    nothing is a trap waiting for the next reader.
-  no --allow-unowned-accessories   both flags exempt rows of the collection panel,
-  no --allow-unowned-pets          which does not exist in this build.
+  no --allow-unowned-pets          it exempts rows of the collection panel that you
+                                   do not own, and this build never swaps the body:
+                                   who is on screen is decided by --manifest alone.
+                                   (Accessory exemption, by contrast, IS implemented
+                                   - see the accepted flag in OPTIONS above.)
 ";
 
 /// 本片**认下**的开关全集（`--help` / `-h` 不在里面：[`dispatch`] 在 [`parse`] 之前就把
@@ -98,11 +116,13 @@ NOT IN THIS BUILD (the parser names the reason for each; use opet-overlay-waylan
 pub const ACCEPTED: &[&str] = &[
     "--manifest",
     "--test-rect",
+    "--db",
     "--seconds",
     "--monitor",
     "--panel-top",
     "--panel-bottom",
     "--seed",
+    "--allow-unowned-accessories",
 ];
 
 /// 本片**明确拒绝**的开关与各自的理由。
@@ -131,27 +151,20 @@ pub const REFUSED: &[(&str, &str)] = &[
         "同上：那条路径的默认值本身就是 Unix 域套接字的位置，套接字没有后端时覆盖它无意义",
     ),
     (
-        "--db",
-        "抽卡与账本在 `petstore`（bundled SQLite），而本可执行文件**有意**不链它 —— \
-         那会把 C 交叉编译放上关键路径（见 crates/overlay-win32/Cargo.toml 顶上那段）",
-    ),
-    (
         "--lang",
-        "这一片屏上一个字都不画（没有菜单、没有卡面、没有面板），语言没有可作用的地方；\
-         给它 = 让用户以为某处文字会跟着变",
+        "语言**已经在生效**（起法 `Lang::DEFAULT`，菜单那一行逐次翻），但这个开关要的是\
+         「配置文件 → 命令行」那条覆盖链，它和把生效值与来源打进摘要一起归 M7；\
+         现在接上 = 给一个只有默认值的入口，用户改了以为生效了却没读配置文件",
     ),
     (
         "--motion",
-        "full/reduce/off 管的是卡面与面板的动效，两者都不在本片 ⇒ 这个值改了什么都不会发生",
+        "同 `--lang`：动效**已经在走**（`Motion::DEFAULT` 进 `menu::after_pull` 定卡面起始相位），\
+         缺的是那条配置链与摘要里的来源行（M7），不是「这块面不存在」",
     ),
     (
         "--no-cursor",
         "它绕的是 Wayland 那条「客户端自己拥有光标图像、主题加载失败就隐形」的病；\
          Windows 自己画光标，这里没有可关的东西 —— 买了零东西的开关是留给下一个读者的陷阱",
-    ),
-    (
-        "--allow-unowned-accessories",
-        "豁免的是收藏册里的行，而本片没有收藏册（配件本身也不在这一片）",
     ),
     (
         "--allow-unowned-pets",
@@ -178,11 +191,13 @@ fn refusal_message(key: &str) -> String {
 pub struct Args {
     manifest: Option<PathBuf>,
     test_rect: bool,
+    db: Option<String>,
     seconds: Option<f32>,
     monitor: Option<String>,
     panel_top: Option<f32>,
     panel_bottom: Option<f32>,
     seed: Option<u64>,
+    allow_unowned_accessories: bool,
 }
 
 impl Args {
@@ -216,17 +231,26 @@ impl Args {
                 }
             }
         }
-        // 空值那一族（Wayland 侧是 `--db=`）：既不是"不给"也不是一个值，语义上是最坏的一种
-        // "看起来开了档"。`--monitor=` 空串在 Windows 上还多一层坑：它会被大小写不敏感的
+        // 空值那一族（Wayland 侧最早是 `--db=` 与 `--seconds -5` 立下的规矩）：既不是"不给"也不是一个值，
+        // 语义上是最坏的一种"看起来开了档"。`--monitor=` 空串在 Windows 上还多一层坑：它会被大小写不敏感的
         // 前缀匹配当成"匹配所有"，于是"我没指定显示器"变成"我指定了第一台命中的"。
         if self.monitor.as_deref().is_some_and(|m| m.trim().is_empty()) {
             return Err(
                 "--monitor 给了空名字；不指定显示器就别给 --monitor（默认 = 主屏）".to_string(),
             );
         }
+        // `--db=` 与 Wayland 同族同文案的骨架："不写真存档就别给 --db"，只是这一片的兜底档
+        // 不是"内存库 + DRYRUN"而是"打实解路径、一个字不写"（M4 的口径，见 app::Options::db）。
+        if self.db.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return Err(
+                "--db 给了空路径；不写真存档就别给 --db（默认是兜底档：只打印实解位置，不写）"
+                    .to_string(),
+            );
+        }
         Ok(Options {
             manifest: self.manifest.clone(),
             test_rect: self.test_rect,
+            db: self.db.clone(),
             seconds: match self.seconds {
                 Some(0.0) => None,
                 s => Some(s.unwrap_or(3.0)),
@@ -235,6 +259,7 @@ impl Args {
             panel_top: self.panel_top,
             panel_bottom: self.panel_bottom,
             seed: self.seed.unwrap_or(1),
+            allow_unowned_accessories: self.allow_unowned_accessories,
         })
     }
 }
@@ -275,11 +300,29 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         match key {
             "--manifest" => a.manifest = Some(PathBuf::from(next_val(&mut i)?)),
             "--test-rect" => a.test_rect = true,
+            "--db" => a.db = Some(next_val(&mut i)?),
             "--seconds" => a.seconds = Some(num(&next_val(&mut i)?, key)?),
             "--monitor" => a.monitor = Some(next_val(&mut i)?),
             "--panel-top" => a.panel_top = Some(num(&next_val(&mut i)?, key)?),
             "--panel-bottom" => a.panel_bottom = Some(num(&next_val(&mut i)?, key)?),
             "--seed" => a.seed = Some(num(&next_val(&mut i)?, key)?),
+            // 裸旗**拒收值**而不是吞掉它。这一格真要说清三件事：
+            // * `--allow-unowned-accessories=false` 被读成"开了"是最坏的一种静默 —— 用户明确
+            //   写了"不要"，拿到的正是"要"。本项目对"看起来开了档"的一贯处置（`--db=`、
+            //   `--monitor `、`--seconds -5`）都是报错，不是猜。
+            // * 为什么只给这一条新旗立、不给 `--test-rect` 补：第一批的开关面逐字冻结
+            //   （AGENTS.md「第一批」），要改就得连 Wayland 侧同族一起改并重新签收，那是另一轮的事。
+            // * Wayland 侧这一条是**吞**的（`a.allow_unowned_accessories = true` 不看 inline），
+            //   所以两边对同一个错误写法的读数不同 —— 这条偏离登记给 §6.1.26。
+            "--allow-unowned-accessories" => {
+                if let Some(v) = &inline {
+                    return Err(format!(
+                        "--allow-unowned-accessories 是裸旗，不接受值（给了 {v:?}）；\
+                         要放行就别写它、要关着也别写它，没有第三种说法"
+                    ));
+                }
+                a.allow_unowned_accessories = true;
+            }
             other => return Err(refusal_message(other)),
         }
         i += 1;
@@ -320,7 +363,7 @@ mod tests {
     ///
     /// 只查行首，与 Wayland 侧同一条口径：正文里提到的 `tools/pack.py --accessory` 是**生产者**
     /// 的开关，不是这条命令的。而本片"NOT IN THIS BUILD"那一节的行首写的是 `no`，
-    /// 所以那九个被拒的旗**天然不在网里** —— [`no_refused_flag_is_advertised_as_an_option`]
+    /// 所以那八个被拒的旗**天然不在网里** —— [`no_refused_flag_is_advertised_as_an_option`]
     /// 断的就是这个排版选择没有骗人。
     fn advertised() -> Vec<&'static str> {
         USAGE
@@ -372,7 +415,7 @@ mod tests {
         ] {
             assert!(parse(&args).is_err(), "{args:?} 应当报错");
         }
-        // 真正不认识的词，走的是另一条分支（对比下面那条：这九个字**不是**未知参数）。
+        // 真正不认识的词，走的是另一条分支（对比下面那条：这八个字**不是**未知参数）。
         let err = parse(&v(&["--nope"])).err().unwrap();
         assert!(err.contains("未知参数"), "{err}");
     }
@@ -462,6 +505,107 @@ mod tests {
         }
     }
 
+    /// `--db` 转真（第二批 M4）后的三条：两种写法在**最后一层**也相等、空值是拒绝而不是
+    /// "开了一个空档"、不给是兜底档。与 Wayland 侧 `cli.rs` 那组同形，样本换成 Windows 拼法。
+    #[test]
+    fn db_is_accepted_and_an_empty_value_is_refused() {
+        let eq = parse(&v(&["--test-rect", r"--db=C:\Users\jun\opet_test.db"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        let sp = parse(&v(&["--test-rect", "--db", r"C:\Users\jun\opet_test.db"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(eq.db.as_deref(), Some(r"C:\Users\jun\opet_test.db"));
+        assert_eq!(eq, sp, "内联与分开两种写法必须在 options() 之后仍相等");
+        // 空值 = 最坏的"看起来开了档"：报错点名 --db，而不是静默退回兜底档。
+        let err = parse(&v(&["--test-rect", "--db="]))
+            .and_then(|a| a.options())
+            .err()
+            .unwrap_or_else(|| panic!("--db= 空值不该还能过"));
+        assert!(err.contains("--db"), "{err}");
+        // 不给 ⇒ None ⇒ 运行期走兜底解析（打实解路径、不写），这里只钉解析层不臆造路径。
+        assert_eq!(
+            parse(&v(&["--test-rect"])).unwrap().options().unwrap().db,
+            None
+        );
+    }
+
+    /// `--allow-unowned-accessories` 转真（第二批 M5e）后的三条：默认关、给了才开、
+    /// **给值不是"开了一个档"而是报错**。
+    ///
+    /// 为什么第三条值得单独一格：`--flag=false` 被吞成"开"是本文件那条「空值/假档」规矩的
+    /// 反面实例 —— 用户写了"不要"而拿到"要"，方向是**反的**，比 `--db=` 那种"给了个空档"更坏。
+    /// Wayland 侧这一条是吞的（同一条命令行在两平台读数不同），那条偏离写进了臂上的注释。
+    #[test]
+    fn allow_unowned_accessories_defaults_off_and_a_value_is_refused() {
+        let off = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert!(
+            !off.allow_unowned_accessories,
+            "默认必须关着 ⇒ 放行未拥有的配件是要显式给的决定（Wayland 侧 2026-11-05 第 3 问，\
+             本平台同一条判据）"
+        );
+        let on = parse(&v(&["--test-rect", "--allow-unowned-accessories"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(on.allow_unowned_accessories);
+        assert!(on.test_rect, "裸旗不该顺手把矩形档挤掉");
+        // 值 = 报错，而且点名是哪个旗、说的是"裸旗不接受值"。`false` 那一格是这一条的全部理由。
+        for bad in [
+            "--allow-unowned-accessories=false",
+            "--allow-unowned-accessories=0",
+            "--allow-unowned-accessories=x",
+        ] {
+            let err = parse(&v(&["--test-rect", bad]))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} 不该还能过（裸旗吞值 = 把「不要」读成「要」）"));
+            assert!(err.contains("--allow-unowned-accessories"), "{err}");
+            assert!(err.contains("裸旗"), "{err} 没说清为什么拒绝");
+        }
+        // 后一个 token 长得像旗 ⇒ 它**不**被当成本旗的值吃掉（本旗不吃值，所以没有那条歧义）。
+        let two = parse(&v(&[
+            "--test-rect",
+            "--allow-unowned-accessories",
+            "--seed",
+            "7",
+        ]))
+        .unwrap()
+        .options()
+        .unwrap();
+        assert!(two.allow_unowned_accessories);
+        assert_eq!(two.seed, 7, "下一旗被吃成值的话，种子会退回默认 1");
+    }
+
+    /// 配件那条转真**不等于**本体那条也转真（Wayland 侧 `cli.rs` 同一条拍板④的 Windows 版）。
+    ///
+    /// 这一格的存在理由是"两个旗共用一个词根"这件事本身：下一次有人翻转 `--allow-unowned-pets`，
+    /// 最容易犯的错是顺手把这一条删掉（它读起来像已经结案了）。两条判据在
+    /// [`overlay_common::dress::dress_exempt_for`] 是同一个函数、在参数面是**两个字段**，
+    /// 而屏上那个 `*` 只由配件那一根点亮 —— 合成一根必然出现"标打了而没放行"或反过来。
+    #[test]
+    fn the_two_unowned_switches_are_not_the_same_thing() {
+        assert!(
+            ACCEPTED.contains(&"--allow-unowned-accessories"),
+            "M5e 之后配件那一根必须已经转真（消费者 = App::dress_exempt）"
+        );
+        assert!(
+            refusal("--allow-unowned-pets").is_some(),
+            "本体那一根仍要**点名拒绝**并给理由，不许落到「未知参数」那条默认分支"
+        );
+        let acc = parse(&v(&["--test-rect", "--allow-unowned-accessories"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(acc.allow_unowned_accessories);
+        // 反过来：写 pets 不会 somehow 打开配件那一根（它连解析都过不去）。
+        let err = parse(&v(&["--test-rect", "--allow-unowned-pets"]))
+            .err()
+            .unwrap_or_else(|| panic!("--allow-unowned-pets 这一片还不该认"));
+        assert!(err.contains("--allow-unowned-pets"), "{err}");
+    }
+
     // ── USAGE ↔ parser 双向平权 ─────────────────────────────────────────────
 
     /// 方向一：**广告了的每一个开关都真的存在**。
@@ -517,16 +661,20 @@ mod tests {
         }
     }
 
-    /// 九条拒绝必须**点名是哪个旗**、给得出**理由正文**，而且说的是"这里没有那件事"
+    /// 七条拒绝必须**点名是哪个旗**、给得出**理由正文**，而且说的是"这里没有那件事"
     /// 而不是落到默认分支那句"未知参数"。
     ///
-    /// 为什么不用 `未知参数` 打发它们：那九个字用户没打错，是从 Wayland 那条命令行拷来的。
+    /// 为什么不用 `未知参数` 打发它们：那七个旗用户没打错字，是从 Wayland 那条命令行拷来的。
     /// "未知"会让人去数字符，"这里没有 registry"会让人去问平台。
+    ///
+    /// ⚠️ 这一族从八条缩到七条是**第二批 M5e**：`--allow-unowned-accessories` 转真了，
+    /// 它现在在 [`ACCEPTED`] 里，而 `the_two_unowned_switches_are_not_the_same_thing` 钉着
+    /// "只剩本体那一条还欠着"。
     #[test]
     fn out_of_scope_flags_are_refused_by_name_with_a_reason() {
         assert!(
-            REFUSED.len() >= 9,
-            "本片范围外的旗应当有 9 条，实读 {} ⇒ 有人删了一条而不是一一登记",
+            REFUSED.len() >= 7,
+            "本片范围外的旗应当有 7 条，实读 {} ⇒ 有人删了一条而不是一一登记",
             REFUSED.len()
         );
         for &(flag, why) in REFUSED {
@@ -549,10 +697,9 @@ mod tests {
         }
     }
 
-    /// 与上一条配对的方向：**被拒的旗不许长得像广告**，但**必须出现在帮助文本里**。
-    ///
+    /// 与上一条配对的方向：**被拒的旗不许长得像广告**，但**必须出现在帮助文本里**。    ///
     /// 两半各防一种漂移。只断"在文本里"，就能把它写成 `OPTIONS:` 下的一行而让读者以为能用；
-    /// 只断"不在行首"，就能把那九条从帮助里彻底删掉，于是从 Wayland 拷命令行的人只会撞到
+    /// 只断"不在行首"，就能把那八条从帮助里彻底删掉，于是从 Wayland 拷命令行的人只会撞到
     /// 一条错误而没有上下文。
     #[test]
     fn no_refused_flag_is_advertised_as_an_option() {
