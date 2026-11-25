@@ -386,11 +386,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "overlay-report"
+version = "0.1.0"
+dependencies = [
+ "overlay-common",
+ "petcore",
+ "petstore",
+]
+
+[[package]]
 name = "overlay-wayland"
 version = "0.1.0"
 dependencies = [
  "image-webp",
  "overlay-common",
+ "overlay-report",
  "petcore",
  "petstore",
  "serde",
@@ -406,6 +416,7 @@ name = "overlay-win32"
 version = "0.1.0"
 dependencies = [
  "overlay-common",
+ "overlay-report",
  "petcore",
  "petstore",
  "tempfile",

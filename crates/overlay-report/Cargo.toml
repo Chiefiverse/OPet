@@ -1,0 +1,19 @@
+[package]
+name = "overlay-report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OPet 的报表与库扫描层：抽卡读数的文本生产者 + 收藏册路由 + 本体库发现（两平台共用，零平台绑定）"
+
+[dependencies]
+petcore = { workspace = true }
+# 这一层的立身之处就是"落库与读库存"，所以 `petstore` 在这里是**正题**而不是代价。
+# 它不能待在 `overlay-common`：那边的 Cargo.toml 只允许 petcore + ab_glyph + thiserror + libc
+# （`crates/overlay-common/tests/no_platform_deps.rs` 的 ALLOWED 与清单**逐字相等**那条测例
+# 就是拦这个的）—— 把 `rusqlite/bundled` 拖进绘制层，换来的是"Windows 那一侧少写一行搬运"，
+# 赔掉的是"任何后端都能链接 overlay-common"这条结构保证。
+petstore = { workspace = true }
+# 文本生产者要说的是屏上那行字：预算问 `menu::fit_to` 本体、标签取 `l10n`、行型用 `panel::PanelRow`。
+overlay-common = { workspace = true }

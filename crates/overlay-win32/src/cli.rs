@@ -20,6 +20,8 @@
 //!
 //! ⚠️ 反面同样立着：**认下的每一个开关都必须真有人读**。所以 [`ACCEPTED`] 与 [`USAGE`]
 //! 之间是**双向**平权（两条测试各钉一个方向），而"下游有人读"这一段在第 6/8 步各接一段。
+//! M7e 那两条（`--lang` / `--motion`）从 [`REFUSED`] 搬进来时带的就是同一个条件：下游 =
+//! [`crate::settings`] 那条链 + `App::ui`，开关与消费者同一批落地，绝没有"先收参数、以后再接"。
 
 use std::path::PathBuf;
 
@@ -33,10 +35,11 @@ USAGE: opet-overlay-win32 [OPTIONS]
   Wayland client drives. Pixels never cross into petcore: this process decodes the
   sheet and owns every byte it puts on screen.
 
-  This binary is M5's SECOND slice: the pet on screen, the right-click menu and
-  accessory dress-up. No gacha card, no collection panel, no tray icon, no control
-  socket. The flags that would ask for those are REFUSED by name at the bottom of
-  this text, each with its reason - never accepted-and-ignored.
+  This binary is M5/M6/M7's Windows client: the pet on screen, the right-click menu,
+  accessory dress-up, the gacha pull with its result card, the collection panel and
+  the language/motion settings chain. What it does NOT have is the install surface:
+  no tray icon, no control socket. The flags that would ask for those are REFUSED by
+  name at the bottom of this text, each with its reason - never accepted-and-ignored.
 
   One content source is required:
     --manifest FILE     pet.json for the pet to show (produced by tools/pack.py)
@@ -69,6 +72,16 @@ OPTIONS:
                         reservation, so this inset still has to be sayable.
   --seed N              seed for the behavioural core (default 1). Same seed replays
                         the same frames bit for bit.
+  --lang CODE           UI language: zh / en / ja / ko. Not given = the chain decides:
+                        [ui] lang in config.toml -> LC_ALL/LANG -> en. An unrecognised
+                        code is an ERROR and exits - never a silent fall back to the
+                        default (a typo and 'the language is wrong but nobody said so'
+                        are two different failures). The startup line prints which file
+                        was read and which tier won.
+  --motion TIER         gacha card animation: full / reduce / off. reduce = the burst
+                        opens at 1/4 the size and does NOT flash white; off = the burst
+                        is skipped entirely (submissions only go down). Neither tier
+                        touches dwell, the rarity ribbon, or the pet's own animation.
   --allow-unowned-accessories
                         dev exemption: dress the pet with accessories the inventory
                         does not own. Default OFF - letting an unowned item through
@@ -76,34 +89,41 @@ OPTIONS:
                         (demo state has no inventory to check, so everything is
                         already let through and the hat page prints 「演示」
                         instead of this row's `*`).
+  --allow-unowned-pets
+                        same exemption for the rows that name a PET: without it a pet
+                        you have not pulled stays a read-only line in the collection
+                        panel even when its three files sit on disk. Default OFF.
+                        It buys no on-screen mark (the hat page's `*` belongs to the
+                        accessory flag only), and no effect without --db, same rule
+                        as above.
+  --probe            READ-ONLY diagnostic: print the monitors GDI enumerates (name,
+                       physical rect, work-area top/bottom, which one is primary and
+                       which one becomes the stage), the DPI this process can reach
+                       and which DPI tier the run would use, the two insets computed
+                       by the SAME function the startup line prints, and whether
+                       UpdateLayeredWindow resolves in this process. No window is
+                       created, no surface mapped, no asset byte read, and the
+                       process' DPI awareness is NOT changed - so the DPI printed is
+                       what an UNAWARE process sees, which on mixed-scale multi-monitor
+                       is not necessarily what a real run reads per window.
+                       Exit 0 = pass, 1 = the probe ran and did NOT pass (scripts read
+                       the number, hence the same codes as the Wayland client).
+                       Two things this deliberately does NOT check, each printed as
+                       such: DWM composition state (layered windows predate it, so it
+                       answers nothing here, while adding dwmapi.dll would force a
+                       re-measure of the whole DLL import whitelist) and per-monitor
+                       DPI (needs a window).
   -h, --help            print this text and exit.
 
 NOT IN THIS BUILD (the parser names the reason for each; use opet-overlay-wayland
   for the full feature set):
-  no --probe                       it prints the Wayland registry - which globals are
-                                   bound and at which versions. There is no registry
-                                   on this platform, and an empty list called PASS
-                                   is worse than no check at all.
   no --ipc   --ipc-path P          the control socket is a Unix-domain socket at
                                    $XDG_RUNTIME_DIR/opet.sock; no Windows transport
                                    has been designed for it yet.
-  no --lang L                      the language IS in effect (Lang::DEFAULT at start,
-                                   the menu row flips it); what this flag lacks is the
-                                   config-file -> command-line override chain and
-                                   printing which source won. That lands with M7.
-  no --motion M                    same as --lang: motion already drives the card's
-                                   starting phase (Motion::DEFAULT into
-                                   menu::after_pull). The config chain is what is
-                                   missing, not the surface. M7.
   no --no-cursor                   it works around 'the client owns the cursor image'
                                    on Wayland. Windows draws the cursor itself; there
                                    is nothing to switch off, and a flag that buys
                                    nothing is a trap waiting for the next reader.
-  no --allow-unowned-pets          it exempts rows of the collection panel that you
-                                   do not own, and this build never swaps the body:
-                                   who is on screen is decided by --manifest alone.
-                                   (Accessory exemption, by contrast, IS implemented
-                                   - see the accepted flag in OPTIONS above.)
 ";
 
 /// 本片**认下**的开关全集（`--help` / `-h` 不在里面：[`dispatch`] 在 [`parse`] 之前就把
@@ -122,25 +142,38 @@ pub const ACCEPTED: &[&str] = &[
     "--panel-top",
     "--panel-bottom",
     "--seed",
+    "--lang",
+    "--motion",
+    "--probe",
     "--allow-unowned-accessories",
+    "--allow-unowned-pets",
 ];
 
 /// 本片**明确拒绝**的开关与各自的理由。
 ///
 /// ⚠️ 每一条理由都必须说的是"这台机器上为什么没有那件事"，不是"还没做"。
-/// 后者的有效期只到下一个里程碑，而前者是平台的形状：registry 不存在、这一片屏上一个字都不画
-/// 所以语言没有作用处。
+/// 后者的有效期只到下一个里程碑，而前者是平台的形状：registry 不存在、光标由系统画。
+/// （曾经第三条是"语言没有作用处" —— 那句话随着 M7e 一起删了：语言早就在屏上生效，缺的只是链。）
 ///
 /// 达不到那个标准的条目要**自己承认**：`--ipc` 那一条的真实理由是"Windows 侧的传输还没设计"，
 /// **不是**"这个系统没有 Unix 套接字"（Win10 起 `AF_UNIX` 真在）。所以那里写的是前者。
 /// 把"没设计"写成"不可能"是这类注释最容易犯的错 —— 它读起来像一个决定，实际是一张
 /// 不会兑现的期票，而下一个人会照着它省掉一整段设计。
+///
+/// **这张表会随开关转真而缩短**：`--lang` / `--motion` 两条在 M7e 整条搬进 [`ACCEPTED`]
+/// （配置链落地 ⇒ 那句"缺的是链，不是这块面"兑现了），六条 → 四条；`--probe` 在 **M7f** 跟着走，
+/// 四条 → **三条**。
+///
+/// ⚠️ `--probe` 这一条的毕业**换了语义而不只是换了归属**：旧文案说的是"打的是 Wayland
+/// registry，这个平台上没有 registry"（那句话本身到 M7f 仍然成立），而 M7f 交出的不是 registry
+/// 的翻版，是**这个平台真读得到的四格**（监视器 / DPI / 留白 / 分层窗口符号），逐格的出处与
+/// 两格刻意的"不查"都写在 [`crate::probe`] 的模块头。留着旧文案 = 一句"这里没有那件事"，
+/// 而那句话现在会被 `--probe` 自己的输出当场证伪。
+///
+/// 剩下三条各有归属：`--ipc` / `--ipc-path` / `--no-cursor` 归第三批与平台形状。
+/// 缩短的时候**两条一起删**（`out_of_scope_flags_are_refused_by_name_with_a_reason` 那条
+/// 下限断言跟着改口径，别让它悄悄扫空集）。
 pub const REFUSED: &[(&str, &str)] = &[
-    (
-        "--probe",
-        "打印的是 Wayland registry（绑到哪些 global、各是什么版本），这个平台上没有 registry \
-         ⇒ 硬跑会给出一份空清单并称它通过",
-    ),
     (
         "--ipc",
         "§3.12 的控制面是 `$XDG_RUNTIME_DIR/opet.sock` 那个 Unix 域套接字；Windows 侧的传输\
@@ -151,24 +184,9 @@ pub const REFUSED: &[(&str, &str)] = &[
         "同上：那条路径的默认值本身就是 Unix 域套接字的位置，套接字没有后端时覆盖它无意义",
     ),
     (
-        "--lang",
-        "语言**已经在生效**（起法 `Lang::DEFAULT`，菜单那一行逐次翻），但这个开关要的是\
-         「配置文件 → 命令行」那条覆盖链，它和把生效值与来源打进摘要一起归 M7；\
-         现在接上 = 给一个只有默认值的入口，用户改了以为生效了却没读配置文件",
-    ),
-    (
-        "--motion",
-        "同 `--lang`：动效**已经在走**（`Motion::DEFAULT` 进 `menu::after_pull` 定卡面起始相位），\
-         缺的是那条配置链与摘要里的来源行（M7），不是「这块面不存在」",
-    ),
-    (
         "--no-cursor",
         "它绕的是 Wayland 那条「客户端自己拥有光标图像、主题加载失败就隐形」的病；\
          Windows 自己画光标，这里没有可关的东西 —— 买了零东西的开关是留给下一个读者的陷阱",
-    ),
-    (
-        "--allow-unowned-pets",
-        "豁免的是收藏册里的宠物行，而本片没有收藏册：屏上是谁完全由 --manifest 定",
     ),
 ];
 
@@ -189,6 +207,12 @@ fn refusal_message(key: &str) -> String {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Args {
+    /// `--probe`：**只读探测**，不建窗口、不改 DPI 感知档、不读资产。
+    ///
+    /// 它**不进** [`Options`]（与 Wayland 那家同形）：`Options` 是"一次真运行的全部输入"，
+    /// 而探测那一条路在 `dispatch` 里就返回了。留一个 `probe: bool` 在 `Options` 里
+    /// 只会多出一个"没人读的字段"（`--cell` 那一族假开关的形状）。
+    probe: bool,
     manifest: Option<PathBuf>,
     test_rect: bool,
     db: Option<String>,
@@ -197,7 +221,13 @@ pub struct Args {
     panel_top: Option<f32>,
     panel_bottom: Option<f32>,
     seed: Option<u64>,
+    /// `--lang` 的原始值。合法性由 [`crate::settings::validate_cli`] 判（**不在这里抄一张表**），
+    /// 语义由那条唯一的链判 ⇒ 这里只负责"原样带到底"（同 Wayland 侧 `cli::Args::lang`）。
+    lang: Option<String>,
+    /// `--motion` 的原始值，同上。
+    motion: Option<String>,
     allow_unowned_accessories: bool,
+    allow_unowned_pets: bool,
 }
 
 impl Args {
@@ -247,6 +277,10 @@ impl Args {
                     .to_string(),
             );
         }
+        // `--lang=` / `--motion=` 空值与任何不认识的值一样：**报错，不静默退默认**（R14）。
+        // 判据表在共用层（`lang_codes()` / `motion_codes()`），这里不抄第二份 —— 抄了就有
+        // "第五种语言加进 UI 而 Windows 的报错还写四种"那一族漂移（M7e 上提链的同一个理由）。
+        crate::settings::validate_cli(self.lang.as_deref(), self.motion.as_deref())?;
         Ok(Options {
             manifest: self.manifest.clone(),
             test_rect: self.test_rect,
@@ -259,7 +293,10 @@ impl Args {
             panel_top: self.panel_top,
             panel_bottom: self.panel_bottom,
             seed: self.seed.unwrap_or(1),
+            lang: self.lang.clone(),
+            motion: self.motion.clone(),
             allow_unowned_accessories: self.allow_unowned_accessories,
+            allow_unowned_pets: self.allow_unowned_pets,
         })
     }
 }
@@ -306,6 +343,24 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--panel-top" => a.panel_top = Some(num(&next_val(&mut i)?, key)?),
             "--panel-bottom" => a.panel_bottom = Some(num(&next_val(&mut i)?, key)?),
             "--seed" => a.seed = Some(num(&next_val(&mut i)?, key)?),
+            // M7-e 转真：**只搬运，不解释**。值原样进 `Args`，合法性在 `options()` 问共用层，
+            // 生效值与来源在 `settings::from_process` 那条唯一的链上算 ⇒ 这一家与 Wayland 那一
+            // 家在"给了 en 而屏上是中文"这件事上必然同一个答案（两家各抄一张表才是漂移的入口）。
+            "--lang" => a.lang = Some(next_val(&mut i)?),
+            "--motion" => a.motion = Some(next_val(&mut i)?),
+            // M7-f 转真。裸旗**拒收值**，与下面那两条豁免旗同形（同一个理由：`--probe=0`
+            // 被读成"开了"就是静默换档）。⚠️ Wayland 那侧这一条是**吞** inline 的
+            // （`a.probe = true` 不看值）⇒ 两边对同一个错误写法的读数不同，这条偏离与
+            // 豁免旗那两条是同一条线，一并登记给 §6.1.26。
+            "--probe" => {
+                if let Some(v) = &inline {
+                    return Err(format!(
+                        "--probe 是裸旗，不接受值（给了 {v:?}）；\
+                         要探测就别写值，不要探测就别写这条旗，没有第三种说法"
+                    ));
+                }
+                a.probe = true;
+            }
             // 裸旗**拒收值**而不是吞掉它。这一格真要说清三件事：
             // * `--allow-unowned-accessories=false` 被读成"开了"是最坏的一种静默 —— 用户明确
             //   写了"不要"，拿到的正是"要"。本项目对"看起来开了档"的一贯处置（`--db=`、
@@ -323,6 +378,18 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
                 }
                 a.allow_unowned_accessories = true;
             }
+            // M7-d 转真。写法与上面那条**同形**（裸旗拒收值），理由也同一条：`=false` 读成
+            // "开了"是静默换档。两条不合成一个 match 臂是选的 —— 报错文案必须点得出**哪一个**
+            // 旗写错了，用户下一步才知道改哪个词。
+            "--allow-unowned-pets" => {
+                if let Some(v) = &inline {
+                    return Err(format!(
+                        "--allow-unowned-pets 是裸旗，不接受值（给了 {v:?}）；\
+                         要放行就别写它、要关着也别写它，没有第三种说法"
+                    ));
+                }
+                a.allow_unowned_pets = true;
+            }
             other => return Err(refusal_message(other)),
         }
         i += 1;
@@ -332,12 +399,14 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
 
 /// `dispatch` 的分支结果，调用方据此决定退出码与输出。
 ///
-/// 比 Wayland 那份少一档 `Probed`：`--probe` 不在本片（见 [`REFUSED`]），
-/// 而**没有**给它补一个"打印显示器与 DPI"的 Windows 版 —— 那是下一片的事，
-/// 现在补就是一个没有后端的旗。
+/// ⚠️ **`Probed` 这一档是 M7-f 才补上的**，而它补的正是原先那句"没有后端的旗"里**没后端的
+/// 那一半**：旗现在有 [`crate::probe`] 这个真后端。退出码与 Wayland 那家**逐位相同**
+/// （0 = 通过、1 = 探测跑了而没通过、2 = 参数/运行错），因为 Phase B 的脚本读的是数字。
 pub enum Outcome {
     /// 打的是 `--help`，`String` 是用法文本
     Help(String),
+    /// 跑过探测：`bool` = 通过与否
+    Probed(bool),
     /// 真跑了一轮 overlay（正常退出或 `--seconds` 到点）
     Ran,
 }
@@ -348,6 +417,20 @@ pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
         return Ok(Outcome::Help(USAGE.to_string()));
     }
     let parsed = parse(args)?;
+    if parsed.probe {
+        // 探测不渲染任何东西 ⇒ 不吃语言/动画档，**但不许因此放过打错的值**：
+        // `--probe --lang=jap` 静默成功等于告诉用户"这个码是对的"，而他下次真起 overlay 时
+        // 看到的仍是默认档。`options()` 在探测路径上会因"没给 --manifest"先炸，所以这里
+        // 单独预检一次（与 Wayland `cli.rs` 那一条同一个理由、同一份共用层判据）。
+        crate::settings::validate_cli(parsed.lang.as_deref(), parsed.motion.as_deref())?;
+        let report = crate::probe::collect(
+            parsed.monitor.as_deref(),
+            parsed.panel_top,
+            parsed.panel_bottom,
+        );
+        print!("{}", crate::probe::format_report(&report));
+        return Ok(Outcome::Probed(crate::probe::probe_ok(&report)));
+    }
     crate::app::run(parsed.options()?).map(|()| Outcome::Ran)
 }
 
@@ -578,32 +661,57 @@ mod tests {
         assert_eq!(two.seed, 7, "下一旗被吃成值的话，种子会退回默认 1");
     }
 
-    /// 配件那条转真**不等于**本体那条也转真（Wayland 侧 `cli.rs` 同一条拍板④的 Windows 版）。
+    /// 两根旗**各自独立**（Wayland 侧 `cli.rs` 同一条拍板④的 Windows 版）。
     ///
-    /// 这一格的存在理由是"两个旗共用一个词根"这件事本身：下一次有人翻转 `--allow-unowned-pets`，
-    /// 最容易犯的错是顺手把这一条删掉（它读起来像已经结案了）。两条判据在
+    /// M7d 之前这一格断的是"本体那一根仍要**点名拒绝**"；P5 落地后它换成"两根都转真而互不相干"，
+    /// 而存在理由一个字没变 —— 两个旗共用一个词根，最容易犯的错是顺手合并成一根。两条判据在
     /// [`overlay_common::dress::dress_exempt_for`] 是同一个函数、在参数面是**两个字段**，
-    /// 而屏上那个 `*` 只由配件那一根点亮 —— 合成一根必然出现"标打了而没放行"或反过来。
+    /// 而屏上那个 `*` 只由配件那一根点亮 ⇒ 合成一根必然出现"标打了而没放行"或反过来。
     #[test]
     fn the_two_unowned_switches_are_not_the_same_thing() {
-        assert!(
-            ACCEPTED.contains(&"--allow-unowned-accessories"),
-            "M5e 之后配件那一根必须已经转真（消费者 = App::dress_exempt）"
-        );
-        assert!(
-            refusal("--allow-unowned-pets").is_some(),
-            "本体那一根仍要**点名拒绝**并给理由，不许落到「未知参数」那条默认分支"
-        );
-        let acc = parse(&v(&["--test-rect", "--allow-unowned-accessories"]))
+        for flag in ["--allow-unowned-accessories", "--allow-unowned-pets"] {
+            assert!(
+                ACCEPTED.contains(&flag),
+                "{flag} 必须已经转真（各自的消费者 = `App::dress_exempt` / `App::pet_exempt`）"
+            );
+            assert!(
+                refusal(flag).is_none(),
+                "{flag} 不再属于「点名拒绝」那张表：它同时进了 ACCEPTED 与 REFUSED = 参数面自相矛盾"
+            );
+        }
+
+        let only_pets = parse(&v(&["--test-rect", "--allow-unowned-pets"]))
             .unwrap()
             .options()
             .unwrap();
-        assert!(acc.allow_unowned_accessories);
-        // 反过来：写 pets 不会 somehow 打开配件那一根（它连解析都过不去）。
-        let err = parse(&v(&["--test-rect", "--allow-unowned-pets"]))
-            .err()
-            .unwrap_or_else(|| panic!("--allow-unowned-pets 这一片还不该认"));
-        assert!(err.contains("--allow-unowned-pets"), "{err}");
+        assert!(only_pets.allow_unowned_pets);
+        assert!(
+            !only_pets.allow_unowned_accessories,
+            "开本体那一根顺手打开了配件那一根 ⇒ 两根其实是同一个字段"
+        );
+
+        let only_acc = parse(&v(&["--test-rect", "--allow-unowned-accessories"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert!(only_acc.allow_unowned_accessories);
+        assert!(
+            !only_acc.allow_unowned_pets,
+            "反过来同样不许串（这一格在只写一根的时代是读不出来的）"
+        );
+
+        // 裸旗拒收值那一格两根同形，而**文案必须点得出是哪一个**：复制上一条臂而忘了改名，
+        // 用户按报错去改那个其实没写错的旗。
+        for (flag, other) in [
+            ("--allow-unowned-pets", "--allow-unowned-accessories"),
+            ("--allow-unowned-accessories", "--allow-unowned-pets"),
+        ] {
+            let err = parse(&v(&["--test-rect", &format!("{flag}=false")]))
+                .err()
+                .unwrap_or_else(|| panic!("{flag}=false 这种写法必须报错"));
+            assert!(err.contains(flag), "{err}");
+            assert!(!err.contains(other), "报错文案指错了旗：{err}");
+        }
     }
 
     // ── USAGE ↔ parser 双向平权 ─────────────────────────────────────────────
@@ -661,20 +769,25 @@ mod tests {
         }
     }
 
-    /// 七条拒绝必须**点名是哪个旗**、给得出**理由正文**，而且说的是"这里没有那件事"
+    /// 范围外的旗必须**点名是哪个旗**、给得出**理由正文**，而且说的是"这里没有那件事"
     /// 而不是落到默认分支那句"未知参数"。
     ///
-    /// 为什么不用 `未知参数` 打发它们：那七个旗用户没打错字，是从 Wayland 那条命令行拷来的。
+    /// 为什么不用 `未知参数` 打发它们：那几个旗用户没打错字，是从 Wayland 那条命令行拷来的。
     /// "未知"会让人去数字符，"这里没有 registry"会让人去问平台。
     ///
-    /// ⚠️ 这一族从八条缩到七条是**第二批 M5e**：`--allow-unowned-accessories` 转真了，
-    /// 它现在在 [`ACCEPTED`] 里，而 `the_two_unowned_switches_are_not_the_same_thing` 钉着
-    /// "只剩本体那一条还欠着"。
+    /// ⚠️ 这一族缩过**四**次，四次都不是"有人删了一条而不登记"：八条 → 七条 = **第二批 M5e**
+    /// （`--allow-unowned-accessories` 转真），七条 → 六条 = **M7d**（`--allow-unowned-pets`
+    /// 转真，随换本体落地），六条 → **四条** = **M7e**（`--lang` + `--motion` 一起走：配置链、
+    /// 生效值来源行与这两个开关同批落地 ⇒ 不存在收了参数没人读那一格），四条 → **三条** =
+    /// **M7f**（`--probe` 随 [`crate::probe`] 那四格读数转真，而且转真的同时换了语义：交出的不是
+    /// Wayland registry 的翻版）。剩下三条各有归属：`--ipc` / `--ipc-path` 归第三批，
+    /// `--no-cursor` 归平台形状（它永远不该转真）。**这个下限就是那张登记表**：
+    /// 删一条而不改这里，测试当场红。
     #[test]
     fn out_of_scope_flags_are_refused_by_name_with_a_reason() {
         assert!(
-            REFUSED.len() >= 7,
-            "本片范围外的旗应当有 7 条，实读 {} ⇒ 有人删了一条而不是一一登记",
+            REFUSED.len() >= 3,
+            "本片范围外的旗应当有 3 条，实读 {} ⇒ 有人删了一条而没有登记归属",
             REFUSED.len()
         );
         for &(flag, why) in REFUSED {
@@ -697,7 +810,138 @@ mod tests {
         }
     }
 
-    /// 与上一条配对的方向：**被拒的旗不许长得像广告**，但**必须出现在帮助文本里**。    ///
+    /// M7e：`--lang` / `--motion` **原样交给 `Options`**（解释在 `settings` 那条链上），
+    /// 两种写法同义，不给 = `None`。最后那半句是这条测例存在的理由：一旦解析层把默认写成
+    /// `Some("en")`，`config.toml` 与环境变量两级就永久失效，而屏上看不出任何区别。
+    #[test]
+    fn lang_and_motion_reach_the_options_verbatim() {
+        let eq = parse(&v(&["--test-rect", "--lang=en", "--motion=reduce"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(eq.lang.as_deref(), Some("en"));
+        assert_eq!(eq.motion.as_deref(), Some("reduce"));
+        let sp = parse(&v(&["--test-rect", "--lang", "en", "--motion", "reduce"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(sp.lang, eq.lang, "两种写法必须同义");
+        assert_eq!(sp.motion, eq.motion);
+        let none = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert_eq!(none.lang, None);
+        assert_eq!(none.motion, None);
+        // 子标签合法的形制（`zh_TW` → 落简体）在两家必须是同一个答案，否则"同一份配置
+        // 两个平台不同语言"这种报告就只能靠人猜是哪一层归一化掉的。
+        let sub = parse(&v(&["--test-rect", "--lang=zh-tw"]))
+            .unwrap()
+            .options()
+            .expect("zh_TW 是合法的（本轮只有简体文案 ⇒ 落 zh）");
+        assert_eq!(sub.lang.as_deref(), Some("zh-tw"), "不许在解析层归一化");
+    }
+
+    /// 坏值 = **报错退出**，绝不静默退默认（R14）。报错要点名是哪个开关、列出支持范围，
+    /// 否则用户只能翻源码。空值 `--lang=` 也算坏值：它是"看起来开了档"的最坏一种。
+    #[test]
+    fn bad_lang_or_motion_is_an_error_and_never_a_silent_default() {
+        for bad in [
+            "--lang=zz",
+            "--lang=",
+            "--lang=jap",
+            "--motion=high",
+            "--motion=",
+            "--motion=off2",
+        ] {
+            let args = v(&["--test-rect", bad]);
+            let got = parse(&args).and_then(|a| a.options());
+            let Err(msg) = got else {
+                panic!("「{bad}」被静默接受了 ⇒ 用户看不到自己写错了");
+            };
+            let which = if bad.starts_with("--lang") {
+                "--lang"
+            } else {
+                "--motion"
+            };
+            assert!(msg.contains(which), "{bad} 的报错没点名开关：{msg}");
+            assert!(
+                msg.contains("zh/en/ja/ko") || msg.contains("full/reduce/off"),
+                "{bad} 的报错没列出支持哪些值：{msg}"
+            );
+        }
+    }
+
+    /// 值长得像 flag 的那条老规矩对这两个新开关同样成立：`--lang --test-rect` 吞掉
+    /// `--test-rect` 就等于"矩形档没了而没人报错"（这里连 `--manifest` 都没有 ⇒ 后面的
+    /// 语义检查会报一句不相干的话，用户更找不到方向）。
+    #[test]
+    fn lang_and_motion_never_swallow_the_next_flag() {
+        assert!(parse(&v(&["--lang", "--test-rect"])).is_err());
+        assert!(parse(&v(&["--motion", "--test-rect"])).is_err());
+        assert!(parse(&v(&["--lang"])).is_err(), "缺值也要报错");
+        assert!(parse(&v(&["--motion"])).is_err(), "缺值也要报错");
+    }
+
+    /// M7f：`--probe` 是**裸旗**，而且它**不进 `Options`**。三半各防一种漂移：
+    ///
+    /// * **默认必须是 `false`**：漏写它若变成"只探测"，`opet-overlay-win32.exe --manifest X`
+    ///   就变成"打一份报告、退 0、屏幕上什么都没有"—— 退 0 会让脚本以为宠物在跑。
+    /// * **`options()` 仍然报错**：这是"旗没有被塞进运行参数面"的可见证据。`Options` 里留一个
+    ///   没人读的 `probe` 字段，正是第一批登记过的那个形状病（一个开关同时活在两张表上，
+    ///   于是它能被解析、被打印，而不被任何人执行）。
+    /// * **`--probe=0` / `--probe=` 报错**：吞掉值 = 用户明确写了"不要"而拿到"要"。
+    ///   ⚠️ Wayland 那侧这一条是吞的 ⇒ 同一个错误写法两家读数不同，偏离登记给 §6.1.26。
+    #[test]
+    fn probe_is_a_bare_flag_that_never_reaches_the_options() {
+        let a = parse(&v(&["--probe"])).unwrap();
+        assert!(a.probe);
+        assert!(a.options().is_err(), "探测旗漏写默认值 ⇒ 它会变成运行档");
+        assert!(!parse(&v(&["--test-rect"])).unwrap().probe);
+        for bad in ["--probe=0", "--probe=false", "--probe="] {
+            let err = parse(&v(&[bad])).err().unwrap_or_default();
+            assert!(
+                err.contains("--probe") && !err.contains("未知参数"),
+                "{bad} 的报错要点名这条旗（不是当生词打发）: {err}"
+            );
+        }
+        // 值长得像 flag 那条老规矩在这条旗上最贵：`--monitor --probe` 若把 `--probe` 当名字吞掉，
+        // 用户要的是"只读探测"，拿到的是一扇映射到不存在的显示器上的窗。
+        assert!(parse(&v(&["--monitor", "--probe"])).is_err());
+        assert!(
+            parse(&v(&["--probe", "--monitor"])).is_err(),
+            "反方向同一条"
+        );
+    }
+
+    /// 与 Wayland 侧**同名测例**同一条不变量：探测路径不渲染任何东西，所以它绕过 `options()`
+    /// （那会因"没给 `--manifest`"先炸），但**不能因此放过打错的档**。R14 的口径是"任何一条
+    /// 路径都不静默退默认"，不是"只有会画像素的那条不静默"：`--probe --lang=jap` 静退 0 =
+    /// 探针在替用户确认"这个码是对的"。
+    ///
+    /// ⚠️ 宿主上 `collect()` 走的是"这个二进制不是为当前系统编的"那一条支（`probe.rs`），
+    /// 所以这里的 `Probed(false)` 是**平台支的形状**，不是 Windows 探测结果 —— 真读数归 M7g。
+    #[test]
+    fn probe_path_still_rejects_a_bad_lang_or_motion() {
+        for bad in [
+            &["--probe", "--lang=jap"][..],
+            &["--probe", "--motion=high"][..],
+            &["--probe", "--lang", ""][..],
+        ] {
+            let Err(msg) = dispatch(&v(bad)) else {
+                panic!("{bad:?} 被静默接受了 ⇒ 探测在告诉用户这个码是对的");
+            };
+            assert!(
+                msg.contains("认不出来")
+                    && (msg.contains("zh/en/ja/ko") || msg.contains("full/reduce/off")),
+                "{bad:?} 的报错没点名开关与支持范围：{msg}"
+            );
+        }
+        // 合法值在探测路径上必须放行，否则这条预检把诊断功能本身堵死了。
+        assert!(matches!(
+            dispatch(&v(&["--probe", "--lang=en", "--motion=reduce"])),
+            Ok(Outcome::Probed(_))
+        ));
+    }
+
+    /// 与上一条配对的方向：**被拒的旗不许长得像广告**，但**必须出现在帮助文本里**。
     /// 两半各防一种漂移。只断"在文本里"，就能把它写成 `OPTIONS:` 下的一行而让读者以为能用；
     /// 只断"不在行首"，就能把那八条从帮助里彻底删掉，于是从 Wayland 拷命令行的人只会撞到
     /// 一条错误而没有上下文。

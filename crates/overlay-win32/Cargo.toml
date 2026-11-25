@@ -28,6 +28,10 @@ petcore = { workspace = true }
 petstore = { workspace = true }
 # 预乘 BGRA8 的图集解码 + 省电五档记账，与 Wayland 客户端共用同一份（见 crates/overlay-common）。
 overlay-common = { workspace = true }
+# 报表与库扫描层（M7-b0 上提，2026-11-24）。第二批时本 crate 的 `dress.rs` 里手写了一份
+# `Gacha`，注释写的是"与 Wayland `Gacha::pull` 同一份语义，逐条对齐"—— 对齐靠人，
+# 现在靠编译器：那一份删了，两家点同一个 `overlay_report::Gacha`。
+overlay-report = { workspace = true }
 
 # 只有 `window.rs` / `monitor.rs` / `app.rs`（`#[cfg(windows)]` 那三个）读得到这一栏。
 # 九个特性各自要什么：Foundation = HANDLE/RECT/LRESULT/WINDOWPOS · Graphics_Gdi = BITMAPINFO/

@@ -228,7 +228,11 @@ impl DbPath {
 ///   本来就归一化两种分隔符）；`X:foo` 是**盘相对**，不算绝对 —— 平台 `is_absolute` 说的
 ///   也是这个，不是我的巧合。
 /// - UNC `\\server\share…`，含长路径前缀 `\\?\C:\…`；裸 `\\`（后无主机名）不是路径，不算。
-fn is_windows_absolute(s: &str) -> bool {
+///
+/// ⚠️ `pub(crate)` 的只有这一条**判据**：`config.rs` 的 Windows 配置根链要用同一个"什么算绝对"
+/// 的答案，两处各写一遍迟早漂移成"库在 `%LOCALAPPDATA%` 而配置在别处"。
+/// **选链的函数不在这里共享** —— 每条链各自决定读哪几个变量、兜底给谁。
+pub(crate) fn is_windows_absolute(s: &str) -> bool {
     let b = s.as_bytes();
     let drive = b.len() >= 3
         && b[0].is_ascii_alphabetic()

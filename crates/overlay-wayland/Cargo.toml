@@ -15,6 +15,10 @@ overlay-common = { workspace = true }
 # M3-b：开箱 UI 直接落库。**方向是单向的** —— overlay 客户端依赖存储层，petcore 永不依赖
 # 显示服务器也永不碰磁盘（D12/D13）。不带 `--db` 时走 `Store::in_memory()` 并打 DRYRUN 标。
 petstore = { workspace = true }
+# 报表与库扫描层（M7-b 前置上提，2026-11-24）：原来活在本 crate `app.rs` 里的那一族生产者
+# （`Gacha` 与它的四本册子、逐件收藏册的路由、「概率」那五行、本体库扫盘）搬到这里。
+# 上提的判据与 `overlay-common` 那三批同一条：**分叉的症状画在屏上，不报在编译器上**。
+overlay-report = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 image-webp = { workspace = true }

@@ -35,14 +35,20 @@
 
 use overlay_common::accounting::Counters;
 
-/// 本片没链进来的那几块面的统一说法。
+/// 曾经用于"这块面还没链进来"的统一说法。**M7b 起摘要里没有任何一行打它了**（面板行是最后
+/// 一个使用者，它毕业了），留着只有一个用途：测例反向钉住"**一个字都不许再打它**"。
 ///
-/// ⚠️ 不能省成"什么都不打"：`面板` 那一行在 Wayland 是有数的，Windows 上不打
-/// 会被读成"数为 0"，而 0 与"没有这块面"是两个完全不同的结论（同一族那句"不要把'没跑到'
-/// 读成'通过'"）。已经从这个族**毕业**的有三行：`ui:`（M5e 起改打"已接/未接"两张清单，
-/// M6 起卡面进已接那半）、`菜单`（M5c 起打状态 + `menu_commits` 真数）与
-/// `字体`（M5e 起打 [`Font`] 那五个实测数 —— 菜单文字从 M5c 那一刻就真在走
-/// `overlay_common::text`，那一行当时就该是数，M5e 补上）。
+/// ⚠️ 反向断言不是形式主义。这一族的原文是"本构建未接（**M5 最小片**）"，而 M5 最小片这个
+/// 说法在 M7 之后已经是假话 ⇒ 以后哪一块面真的掉了，正确处置是**改 `ui:` 那行的未接清单**
+/// 并写明是哪一批欠的（M7f 起那半是**空的**，四族都在已接里，所以新增一欠项要连着改那句
+/// "这一行没有欠项"），不是把这行僵尸 token 请回来。
+/// 断言 count == 0 就是把"请回来"变成一次红。
+///
+/// 从这个族**毕业**的四行：`ui:`（M5e 起改打"已接/未接"两张清单，M6 卡面、M7b 面板进已接那半）、
+/// `菜单`（M5c 起打状态 + `menu_commits` 真数）、`字体`（M5e 起打 [`Font`] 那五个实测数 ——
+/// 菜单文字从 M5c 那一刻就真在走 `overlay_common::text`，那一行当时就该是数）与
+/// `面板`（M7b 起打状态 + `panel_commits` 真数；本平台无帧回调 ⇒ 看门狗那一档结构性恒 0，
+/// 与 `Deferred`/`Replay` 同一句平台理由，所以它**不**打成 0，打的是说明）。
 pub const NOT_BUILT: &str = "本构建未接（M5 最小片）";
 
 /// 三个内存读数，单位**字节**（KB 换算留给 [`memory_line`]，这样采集器不必猜口径）。
@@ -114,16 +120,34 @@ pub struct Run<'a> {
     pub cpu_reason: Option<&'a str>,
     /// 退出那一刻菜单面开没开着（M5c 接线；提交数在 `counters.menu_commits`，这一格只是状态）。
     pub menu_open: bool,
+    /// 退出那一刻面板开没开着（M7b 接线；提交数在 `counters.panel_commits`）。
+    ///
+    /// ⚠️ 它与 `menu_open` **不会同时为真**（互斥由 `App::apply_panel` 落地那一刻关菜单保证）。
+    /// 摘要不打"互斥"这一格断言：`lines()` 没有能力拒绝一对 `true`，而那条不变量属于
+    /// `app.rs` 那一侧（源级门禁 + Wine 目视），这里只是把两个状态各自说清楚。
+    pub panel_open: bool,
     /// 字体那一层的五个数（M5e 接线；采集只在 [`Font::collect`]，理由写在那儿的注释里）。
     pub font: Font,
+    /// 生效值那一行的正文 = `overlay_common::settings::Settings::summary()` 的返回值
+    /// （它自己以 `ui: ` 起头，本函数只补那两个前导空格）。M7e 接线。
+    ///
+    /// 为什么把**整行**交进来而不是 `lang` / `motion` 两个值：那一行的格式、来源标签、
+    /// `｜` 分隔符都是共用层的事实，在这里重排一遍就有了第二个格式事实源（两家的摘要
+    /// 迟早长得不一样，而验收脚本 grep 的是同一个 token）。
+    ///
+    /// ⚠️ 于是摘要里有**两行以 `ui:` 起头**（这一行与 [`lines`] 开头那条"已接/未接"清单）。
+    /// 读它的脚本与测例都要按更长的前缀取（`ui: lang =` / `ui: 已接`），只写 `ui:` 会命中
+    /// 清单那一行 —— 静默读到错的那一行，是"读错通道的尺子"那一族。Wayland 那边只有一行
+    /// （它没有已接/未接清单，那半张表是本平台随 M5 第一批长出来的）。
+    pub ui_effective: &'a str,
 }
 
 /// 摘要正文，一行一个元素。
 ///
 /// 前三行的 token 与 Wayland `report()` 逐字对齐（`overlay:` / `  核对: 五档合计` /
-/// `  surface 逻辑`），差异只在两处：**被 inline 标注的恒 0 档**与**还没链进来的那几块面**
-/// （`ui:` 那一句列的 M7 + `面板` 那一行）。`菜单` 与 `字体` 两行从 M5c / M5e 起与 Wayland
-/// 一样是真数 —— 它们共用 `overlay_common`，本来就没有"这平台量不出"这一说。
+/// `  surface 逻辑`），差异只在**被 inline 标注的恒 0 档**（`Deferred`/`Replay`/两面看门狗）。
+/// `菜单`、`字体`、`面板` 三行从 M5c / M5e / M7b 起与 Wayland 一样是真数 —— 它们共用
+/// `overlay_common`，本来就没有"这平台量不出"这一说。
 pub fn lines(run: &Run) -> Vec<String> {
     let c = run.counters;
     // 三档占比的分母：与 Wayland 同一个式子（提交 + 仅移动 + 无事，max 1 防零除）。
@@ -131,11 +155,24 @@ pub fn lines(run: &Run) -> Vec<String> {
     let pct = |n: u64| 100.0 * n as f64 / t;
 
     // `ui:` 从 M5e 起不再借用 [`NOT_BUILT`]：菜单面与换装都接完了，那一顶帽子就在屏上戴着，
-    // 而"本构建未接"会让读表的人以为这一轮什么 UI 都没测到。M6 起卡面也进"已接"，只剩面板。
+    // 而"本构建未接"会让读表的人以为这一轮什么 UI 都没测到。M6 起卡面、M7b 起面板、M7c 起点名、
+    // M7d 起换本体、M7e 起配置链都进"已接"。
+    // ⚠️ **M7e 是这一行第三次换轴、M7f 是第四次**：第一次（M7b）从"面"换到"面上的格"，第二次
+    // （M7d）从"格"换到"开关"，第三次（M7e）语言/动效随配置链毕业 ⇒ 只剩 `--probe`，第四次
+    // （**M7f**）= `--probe` 自己毕业 ⇒ **未接那半第一次是空的**。
+    // 每换一次轴都要把**两半一起重写**：只改未接那半，读者会拿"已接"那半的旧清单去对功能表，
+    // 而那条清单已经少了一整族（面板毕业那一轮踩的就是这个）。
+    // ⚠️ 空清单不等于这行没用了：它现在钉的是**另一种**东西 —— 欠项从"没接上"换成了"没量过"，
+    // 而后者不归这一行管（`AGENTS.md`：Wine 判不了的格子不许当通过，真机那一轮仍欠）。
+    // 把"未接 = 0"读成"全部通过"正是这一行最容易被误读的地方，所以那句话就写在这行里。
     let mut out = vec![
-        "  ui: 已接 = 宠物像素 + 菜单面（M5c）+ 换装（M5e）+ 卡面（M6）｜未接 = 面板（M7）"
+        "  ui: 已接 = 宠物像素 + 菜单面（M5c）+ 换装（M5e）+ 卡面（M6）+ 面板面（M7b）+ 收藏册点名（M7c）+ 换本体（M7d）+ 配置链（M7e）+ --probe 只读诊断（M7f）｜未接 = 面 / 格 / 开关 / 诊断旗四族都已清零 ⇒ 这一行没有欠项；还欠的这批读数是**没在 Windows 真机与 Wine 上量过**（M7g），那不是「没接上」"
             .to_string(),
     ];
+    // 生效值那一行排在清单之后、`overlay:` 之前 = 与 Wayland `report()` 同一个位置（摘要开头）。
+    // 它必须在**退出摘要**里再打一遍：启动那一行早就滚出屏幕了，而验收读的是 20 s/300 s 那一轮
+    // 末尾的数（"我 `--lang=en` 起的到底生效没有"要能在同一份日志里答）。
+    out.push(format!("  {}", run.ui_effective));
 
     out.push(format!(
         "overlay: {} tick / {:.1}s 墙钟；提交 {}（{:.1}%）、仅移动 {}（{:.1}%）、无事 {}（{:.1}%）、延后 {}、buffer 错误 {}、帧回调看门狗 {}（{}）",
@@ -177,8 +214,9 @@ pub fn lines(run: &Run) -> Vec<String> {
         run.dpi_path,
     ));
 
-    // 菜单行从 M5c 起是**真数**（与 Wayland 的 `菜单: N 提交` 同族同位）；`面板` 那一行才是
-    // "这块面不存在"，不是"这块面省电"。看门狗那一档写死在说明里而不是打 0：
+    // 菜单与面板两行从 M5c / M7b 起都是**真数**（与 Wayland 的 `菜单: N 提交`、
+    // `面板: N 提交 / N 看门狗` 同族同位）。两行的提交数**必须分开读**：共用一个计数就等于
+    // "面板静止时看不出它有没有在偷投帧"。看门狗那一档写死在说明里而不是打 0：
     // 本平台没有在飞帧回调，那个数与宠物那侧"帧回调看门狗"同一句结构性理由。
     out.push(format!(
         "  菜单: {}（{} 提交，静止时应当恒 0 增长；本平台无帧回调 ⇒ 看门狗结构上恒 0）",
@@ -202,7 +240,11 @@ pub fn lines(run: &Run) -> Vec<String> {
         run.font.made,
         run.font.uncached,
     ));
-    out.push(format!("  面板: {NOT_BUILT}"));
+    out.push(format!(
+        "  面板: {}（{} 提交，静止时应当恒 0 增长；本平台无帧回调 ⇒ 看门狗结构上恒 0）",
+        if run.panel_open { "开着" } else { "没开" },
+        c.panel_commits,
+    ));
 
     if let Some((state, fp)) = run.kernel {
         out.push(format!("  内核: state={state} 指纹={fp:016x}"));
@@ -384,7 +426,10 @@ mod tests {
             cpu_secs: Some(7.17),
             cpu_reason: None,
             menu_open: false,
+            panel_open: false,
             font: Font::default(),
+            // 样本行 = `Settings::summary()` 那个格式（共用层的事实，这里只借它的形状）。
+            ui_effective: "ui: lang = en（默认，自名 English）｜ motion = full（默认）",
         }
     }
 
@@ -437,17 +482,20 @@ mod tests {
         assert!(line_with(&out, "核对:").contains("结构上恒 0"));
     }
 
-    /// 没链进来的那**一块**面（面板）：一行，且**不是**空行也不是"0"。
+    /// 摘要里**没有任何一行再说"未接"**：四行全部打真数（`ui:` 打两张清单、`菜单`/`面板` 打
+    /// 状态 + 提交数、`字体` 打 [`Font`] 那五个数）。
     ///
-    /// 从这一族毕业的有三行：`ui:` 改打"已接/未接"两张清单，`菜单`（M5c）打状态 +
-    /// `menu_commits` 真数，`字体`（M5e）打 [`Font`] 那五个数。它们从"未接"变成"有数"是
-    /// 同一件事的两面 —— 菜单文字**早就**在走 `overlay_common::text`，那一行写着"未接"
-    /// 是错的，不是保守。
+    /// 它们从"未接"变成"有数"是同一件事的两面 —— 菜单文字**早就**在走 `overlay_common::text`，
+    /// 那一行写着"未接"是错的，不是保守；面板同理，M7b 那块面一上屏，`面板: 本构建未接`
+    /// 就从"保守"变成"假话"。
     ///
     /// ⚠️ `ui:` 那一行的断法是**双向**的，而且**按 `｜` 切成两半再断**：卡面从 M6 起毕业后，
     /// `卡面（M6）`这个 token 还在同一行里（挪进了"已接"那半）⇒ 拿整行 `contains` 会把"未接
     /// 清单被并进已接"这种改写读成通过。两半各查一遍，且已接的不许同时出现在未接那半。
     /// 只断"不含未接"还会放过最坏的那种改写 —— 把整行删掉。
+    ///
+    /// ⚠️ M7e 起取那一行**必须用长前缀 `ui: 已接`**：摘要里现在有两行以 `ui:` 起头（另一行是
+    /// 生效值），只写 `ui:` 会靠"谁排在前面"命中 —— 顺序一变，这条测例读的就不是它想读的那行。
     ///
     /// ⚠️ 字体那五个数断的是**交进来的那五个**，不是"某处有数"：全局采集一旦混进 `lines()`，
     /// 同一份摘要会随测例执行顺序变，而这条测例的红必须长得很像"标签写错了"而不是"运气不好"。
@@ -456,12 +504,23 @@ mod tests {
         let c = Counters::default();
         let out = lines(&run(&c));
         let all = out.join("\n");
-        assert_eq!(all.matches(NOT_BUILT).count(), 1, "{all}"); // 只剩 面板
-        let ui = line_with(&out, "ui:");
+        // M7b 起这一族在摘要里没有使用者：打它 = 说"这块面不存在"，而四块面都在。
+        assert_eq!(all.matches(NOT_BUILT).count(), 0, "{all}");
+        let ui = line_with(&out, "ui: 已接");
         let (built_half, missing_half) = ui
             .split_once("｜")
             .expect("ui: 必须是「已接 …｜未接 …」两段 ⇒ 少一半就没有可读的清单");
-        for built in ["宠物像素", "菜单面（M5c）", "换装（M5e）", "卡面（M6）"] {
+        for built in [
+            "宠物像素",
+            "菜单面（M5c）",
+            "换装（M5e）",
+            "卡面（M6）",
+            "面板面（M7b）",
+            "收藏册点名（M7c）",
+            "换本体（M7d）",
+            "配置链（M7e）",
+            "--probe 只读诊断（M7f）",
+        ] {
             assert!(
                 built_half.contains(built),
                 "已接的那块面被漏报：{built}\n{ui}"
@@ -471,32 +530,59 @@ mod tests {
                 "同一块面同时出现在未接那半 ⇒ 清单自相矛盾：{built}\n{ui}"
             );
         }
-        // 今天只剩面板未接（M7 落地那一格再回到两样）。
-        let missing = "面板（M7）";
+        // 未接那半换过**四**次轴：M7b = "哪块面不存在" → "面上的哪一格还欠"；M7d = 那一格也接
+        // 完了 ⇒ 说的是**开关**；M7e = 语言/动效随配置链毕业 ⇒ 只剩 `--probe`；M7f = 它自己毕业
+        // ⇒ 那半第一次没有欠项。
+        // ⚠️ 于是这一族的断言**方向翻了**：M7e 之前是"`--probe` 必须出现在未接"，现在是"必须
+        // 出现在已接、且不许出现在未接"。写法仍然留成列表（而不是摊平一句 `assert!`），因为这张
+        // 表还会再长；`for x in ["--probe"]` 会被 clippy 判单元素循环 ⇒ 先落成变量再遍历。
+        let graduated_switches = ["--probe"];
+        for done in graduated_switches {
+            assert!(
+                built_half.contains(done),
+                "已接的那条开关被说成未接：{done}\n{ui}"
+            );
+            assert!(
+                !missing_half.contains(done),
+                "毕业的东西还留在未接那半：{done}\n{ui}"
+            );
+        }
+        // 空欠项必须**自己说它是空的**：只断"未接那半不含旗名"会放过最坏的那一种改写 ——
+        // 把未接那半整段删掉（`｜` 少一半由上面那条 expect 挡，整段话术没了则由这一条挡）。
+        assert!(missing_half.contains("没有欠项"), "{ui}");
+        assert!(missing_half.contains("没在 Windows 真机"), "{ui}");
+        // ── 面板行：两个状态 + 提交数 + 那句结构性说明，四个断语各自独立 ──
+        let panel = line_with(&out, "面板:");
+        assert!(panel.contains("没开"), "{panel}");
+        assert!(panel.contains("0 提交"), "{panel}");
         assert!(
-            missing_half.contains(missing),
-            "未接的那块面被说成已接：{missing}\n{ui}"
-        );
-        assert!(
-            !built_half.contains(missing),
-            "未接的被写进已接那半：{missing}\n{ui}"
-        );
-        assert!(
-            line_with(&out, "面板:").contains(NOT_BUILT),
-            "缺 面板 那一行"
+            panel.contains("看门狗结构上恒 0"),
+            "面板行的看门狗那一档不能只打 0（那是平台形状，不是测量结果）：{panel}"
         );
         let menu = line_with(&out, "菜单:");
         assert!(menu.contains("没开"), "{menu}");
         assert!(menu.contains("0 提交"), "{menu}");
-        // "开着"那一档由 `menu_open` 真值驱动，不是把数打上去就算数：
+        // "开着"那一档由 `menu_open`/`panel_open` 真值驱动，不是把数打上去就算数：
         let c2 = Counters {
             menu_commits: 7,
+            panel_commits: 3,
             ..Default::default()
         };
         let mut r = run(&c2);
         r.menu_open = true;
         let menu = line_with(&lines(&r), "菜单:");
         assert!(menu.contains("开着") && menu.contains("7 提交"), "{menu}");
+        // 面板**单独**驱动一次：两行的提交数必须来自两个计数器（共用一个的话，这里会读到
+        // `7 提交`，而 `菜单` 行那一条断言照样绿 —— 那正是"两块面互相替对方放行"的形状）。
+        let mut r = run(&c2);
+        r.panel_open = true;
+        let panel = line_with(&lines(&r), "面板:");
+        let menu = line_with(&lines(&r), "菜单:");
+        assert!(
+            panel.contains("开着") && panel.contains("3 提交"),
+            "{panel}"
+        );
+        assert!(menu.contains("没开") && menu.contains("7 提交"), "{menu}");
 
         // ── 字体行：两个 face 分支 + 五个数各自到位 ──
         let mut r = run(&c);
@@ -522,6 +608,47 @@ mod tests {
         r.font.face_real = false;
         let font = line_with(&lines(&r), "字体:");
         assert!(font.contains("face=降级 5×7 点阵"), "{font}");
+    }
+
+    /// 生效值那一行（M7e 接线）：**整行原文来自共用层**，本函数只在前面补两个空格。
+    ///
+    /// 三件事各防一种漂移：① **逐字**出现 ⇒ 在这里重排格式就有了第二个格式事实源，两家的
+    /// 摘要长得不一样，而验收脚本 grep 的是同一个 token；② 位置排在"已接/未接"清单之后、
+    /// `overlay:` 之前 ⇒ 摘要开头才是人会在 300 s 那份日志末尾找的那一格（Wayland 同位）；
+    /// ③ 两行 `ui:` 不是一行打印了两次 —— 清单说的是"这块面在不在"，生效值说的是"这一档从
+    /// 哪一层来"，合并成一行就会在下一次换轴时被顺手删掉一半。
+    #[test]
+    fn the_effective_settings_line_is_verbatim_and_where_the_report_reads_it() {
+        let c = Counters::default();
+        let mut r = run(&c);
+        let sample = "ui: lang = ja（命令行，自名 日本語）｜ motion = off（config.toml）";
+        r.ui_effective = sample;
+        let out = lines(&r);
+        let at = out
+            .iter()
+            .position(|l| l == &format!("  {sample}"))
+            .expect("生效值那一行必须逐字出现在摘要里（前导两个空格 + 共用层原文）");
+        let listed = out
+            .iter()
+            .position(|l| l.trim_start().starts_with("ui: 已接"))
+            .expect("清单那一行也得在");
+        let overlay = out
+            .iter()
+            .position(|l| l.starts_with("overlay:"))
+            .expect("overlay 计数那一行也得在");
+        assert!(
+            listed < at && at < overlay,
+            "顺序必须是 清单 → 生效值 → overlay 计数：\n{}",
+            out.join("\n")
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|l| l.trim_start().starts_with("ui:"))
+                .count(),
+            2,
+            "以 `ui:` 起头的行现在恰好两行，多一行 = 有第三个事实源：\n{}",
+            out.join("\n")
+        );
     }
 
     /// 占比的分母是三档之和，不是 tick 总数（与 Wayland 同式）。
@@ -592,7 +719,13 @@ mod tests {
         r.kernel = None;
         let all = lines(&r).join("\n");
         assert!(!all.contains("内核: state="), "{all}");
-        assert!(all.contains(NOT_BUILT), "{all}");
+        // 内核不在，UI 那三行**照打**（M7b 前这里断的是 `NOT_BUILT` 还在，因为面板那一行
+        // 靠它占位；现在没有占位符可断了，改成断"面板行仍然带着数在场"）。
+        let panel = line_with(&lines(&r), "面板:");
+        assert!(
+            panel.contains("没开") && panel.contains("0 提交"),
+            "{panel}"
+        );
     }
 
     /// `--test-rect` 那一档不接内核 ⇒ 指纹那一行**整行消失**，而不是打成 `0000…`。

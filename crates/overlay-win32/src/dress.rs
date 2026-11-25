@@ -1,11 +1,25 @@
-//! 换装的**库与资产**那一半：连库、落库、扫盘、解码（第二批 M5e）。
+//! 换装的**资产**那一半：落库、扫盘、解码（第二批 M5e）。
+//!
+//! ## M7-b0（2026-11-24）从这里拿走了什么
+//!
+//! 原来标题里还有"连库"两个字：`Gacha`（连库 + 装目录 + `balance` + `pull`）当时是本文件里
+//! 手写的一份，注释写着"与 Wayland `Gacha::pull` 同一份语义，逐条对齐"。**对齐是人做的事**，
+//! 而分叉的症状先出现在屏上、不报在编译器上 ⇒ 那一份已删，两家现在点同一个
+//! [`overlay_report::Gacha`]。同一层还带上了收藏册的行生产者、本体库扫盘（
+//! [`overlay_report::bodies::check_body`]）与「概率」那五行，Windows 侧 M7 的面板直接复用。
+//!
+//! ⚠️ 下面"两处平台形状差异"讲的都是**配件**（本文件仍自己扫），而**配件与本体在这一格上
+//! 不对称是有意的**：配件侧本平台确实没有独立轮廓对象（第 1 条），所以那边是 3 道；本体侧的
+//! 扫盘要产出 `regions` 给 Wayland 用，Windows 只是**读不到它**而不是不需要它 ⇒ 共用的那一份
+//! 保留第 ④ 道（取舍与理由写在 `overlay-report/src/bodies.rs` 模块头）。
 //!
 //! ## 为什么这个模块不带 `#[cfg(windows)]`
 //!
 //! [`crate::app`] 顶上那一节解释了"Windows 那一整块收进 `#[cfg(windows)] mod win`"：宿主上
 //! 看不见的代码必须在类型系统层面也不存在，否则 clippy 的未使用导入会红。那个理由在这里
 //! **不成立**，因为这一文件用到的类型没有一个是 Windows 的：
-//! `Store` / `Catalog` / `AccessoryManifest` / [`Atlas`] / [`Worn`] 全跨平台。
+//! `AccessoryManifest` / [`Atlas`] / [`Worn`] / [`Gacha`] 全跨平台（`Gacha` 来自
+//! `overlay-report`，M7-b0 之后它是**两家共用**的那一份，本文件只留调用点）。
 //!
 //! 于是这一层是**唯一能把换装判据打到红的地方**。`App` 要连 Windows 才构造得起来（`Client::open`
 //! 是第一步），而本项目对"屏上 A、记忆里 B"这一族形状的取证手段从来是**自动化断言 + 源级门禁**
@@ -27,122 +41,14 @@ use std::path::{Path, PathBuf};
 
 use petcore::assets::{AccessoryManifest, Manifest};
 use petcore::behavior::AssetKey;
-use petcore::gacha::{Catalog, Currency, GachaParams, ItemKind, Rarity};
-use petstore::Store;
+use petcore::gacha::ItemKind;
 use petstore::paths::AssetRoot;
 
 use overlay_common::atlas::Atlas;
-use overlay_common::l10n::Lang;
-use overlay_common::menu;
+
+use overlay_report::Gacha;
 
 use crate::stage::Worn;
-
-/// 库与目录成对出现（`connect` 一起建、一起失败），所以没有"有库没目录"的中间态。
-///
-/// M5e 起它从 `app::win` 搬到这里，只有一个理由：`app::win` 是 `#[cfg(windows)]`-only，
-/// 而 [`write_equip`] 要它 ⇒ 不搬就得让"演示态不落库"这条判据在宿主上没有读数。
-/// Wayland `app.rs` 那个同名的 `Gacha` 还留在原处 —— 那边整块本来就能在宿主上编译（layer-shell
-/// 的测试靠 `--probe` 之外的那条构造路径），不需要这一刀。
-pub struct Gacha {
-    pub store: Store,
-    /// 公示目录。`connect` 已经把它装进库了，这里留一份是为了**显示名**（[`Gacha::pull`]
-    /// 查 `item_id → name`）—— 与 Wayland 那份 `Gacha` 同一个字段、同一个理由。
-    catalog: Catalog,
-}
-
-impl Gacha {
-    /// 连库 + 装目录。`None` = 内存库（一条文件都不产生，UI 全程打 DRYRUN 标）。
-    ///
-    /// 与 Wayland `Gacha::connect` 逐字同构（含"不做 canonicalize：它要求文件已存在，
-    /// 第一次运行必然失败，反而把'能建库'这条正路堵死"那条处置）。
-    pub fn connect(db: Option<&str>) -> Result<Self, String> {
-        let mut store = match db {
-            None => Store::in_memory().map_err(|e| format!("内存库建不起来: {e}"))?,
-            Some(p) => Store::open(Path::new(p)).map_err(|e| format!("打不开存档 {p}: {e}"))?,
-        };
-        let catalog = Catalog::default_v1().map_err(|e| format!("公示目录读不出来: {e}"))?;
-        store
-            .install_catalog(&catalog)
-            .map_err(|e| format!("装目录失败: {e}"))?;
-        Ok(Self { store, catalog })
-    }
-
-    /// 碎片余额。`u64 → i64` 只在天文数字上饱和 —— 宁可显示封顶，也不许把余额读成负数。
-    pub fn balance(&self) -> i64 {
-        self.store
-            .shards(Currency::Shards)
-            .ok()
-            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
-            .unwrap_or(0)
-    }
-
-    /// 抽 `count` 次并落库，返回菜单要的三样：结果卡行、最高档、抽完的余额（M6）。
-    ///
-    /// 与 Wayland `Gacha::pull` 同一份语义，逐条对齐：
-    /// · **错误只是一条给人看的字**（进菜单错误行），调用方不许因为它而停环（硬约束 3）；
-    /// · 显示名 = catalog 里的**中文**名，查不到回退 `item_id` ⇒ **绝不留白**（四 locale 一律
-    ///   显示目录中文，那条取舍 = §7-R12，不在这里重新讨论）；
-    /// · `lang`/`scale` 在**这一刻**烤进字符串 ⇒ 已经挂着的卡不会被后来的语言/缩放切换重排
-    ///   （§7-R10，那条测例 `baked_lines_keep_the_language_they_were_pulled_in` 在共用层）。
-    ///
-    /// ⚠️ **seed 不在参数面上**，而且这不是漏接线：库里那一枚 `meta.seed` 第一次播种走的是
-    /// 系统随机源（`Store::bootstrap`），而 `--seed` 喂的是**行为内核**的骰子。把 `--seed`
-    /// 接成 `Store::reseed` 会**清空账本与库存**（那函数自己的注释就写着"留着旧历史，链锚点
-    /// 就和新的 seed 对不上，`audit verify` 必然红"），GUI 里一次点击抹掉用户的历史是不许
-    /// 发生的事 ⇒ 两家客户端都不做。计划里那句"同 `--seed` 跑两次 ⇒ 卡面逐同"因此**在 GUI
-    /// 这条路上不成立**，Windows 侧的确定性改由本文件测试里那条
-    /// `real_archive_is_written_and_replays_the_chain` 与真机上的 `audit verify` 出（M8 的回报表
-    /// 按这两格填）。
-    pub fn pull(
-        &mut self,
-        count: u32,
-        dry_run: bool,
-        lang: Lang,
-        scale: f32,
-    ) -> Result<(Vec<String>, Rarity, i64), String> {
-        let report = self
-            .store
-            .pull_for(
-                &GachaParams::V1,
-                &self.catalog,
-                petstore::DEFAULT_BANNER,
-                petstore::DEFAULT_PROFILE,
-                count,
-            )
-            .map_err(|e| format!("PULL {count}: {e}"))?;
-        let items: Vec<(String, Rarity, bool)> = report
-            .outcomes
-            .iter()
-            .map(|o| {
-                let name = self
-                    .catalog
-                    .find(&o.item_id)
-                    .map(|i| i.name.clone())
-                    .unwrap_or_else(|| o.item_id.clone());
-                (name, o.rarity, o.duplicate)
-            })
-            .collect();
-        let lines = menu::report_lines(
-            &report.counts,
-            &items,
-            u64::from(report.shards_gained),
-            lang,
-            scale,
-        );
-        let best = menu::best_rarity(&report.counts).unwrap_or(Rarity::N);
-        let balance = self.balance();
-        eprintln!(
-            "gacha: 抽 {count} ⇒ N={} R={} SR={} SSR={} 碎片 +{} 余额 {balance}（{}）",
-            report.counts[0],
-            report.counts[1],
-            report.counts[2],
-            report.counts[3],
-            report.shards_gained,
-            if dry_run { "DRYRUN" } else { "已落库" }
-        );
-        Ok((lines, best, balance))
-    }
-}
 
 /// 穿着这件事**落不落库**的唯一判据（P3）。两个动作共用一条理由：屏上穿的与库里记着的
 /// 必须是同一件事，否则重启回到另一顶帽子，而"重启后还穿着"（J3）就成了一句注释。
@@ -402,6 +308,11 @@ pub fn decode(cand: &Candidate) -> Result<Worn, String> {
 mod tests {
     use overlay_common::dress::plan_restore;
     use overlay_common::l10n::Key;
+    // `Gacha` 上提 `overlay-report`（M7-b0）之后，这几个名字只剩**测试**在读：生产行的路
+    // 径在共用层，本文件的 lib 侧不点名它们 ⇒ 显式提到这里而不是顶层。
+    use overlay_common::l10n::Lang;
+    use petcore::gacha::{Catalog, Currency, Rarity};
+    use petstore::Store;
 
     use super::*;
 
@@ -734,6 +645,37 @@ mod tests {
 
     // ── ⑤ 源级门禁：像素与账在两家客户端里各只有一个落点 ──────────────────────────
 
+    /// `app.rs` 的**非测试**部分，两条源级门禁共用。
+    ///
+    /// 本平台今天没有 `mod tests`（`App` 构造不起来 ⇒ 写了也跑不了），但门禁自己的字面量
+    /// 就写在下面这些函数里 ⇒ 切掉测试模块才不数到自己（以后谁给 `app.rs` 加测例，这条照旧成立）。
+    fn app_code() -> &'static str {
+        let src = include_str!("app.rs");
+        match src.find("\nmod tests {") {
+            Some(at) => &src[..at],
+            None => src,
+        }
+    }
+
+    /// 取某个函数的**体**（从 `fn name(` 起，到下一个同级 `fn` 或本函数收尾的 `}`）。
+    ///
+    /// 缩进 8 空格 = `#[cfg(windows)] mod win { impl App { … } }` 三层之内。找不到就 panic
+    /// "这条门禁白跑" —— 门禁自己必须能被"函数改名/搬走"这件事打断，否则它断言的是一个
+    /// 已经不存在的形状（同族：`cli.rs` 的 `every_flag_advertised_in_usage_exists`）。
+    fn fn_body(code: &str, name: &str) -> String {
+        let at = format!("fn {name}(");
+        let start = code
+            .find(&at)
+            .unwrap_or_else(|| panic!("找不到 `{at}` ⇒ 这条门禁白跑"));
+        let rest = &code[start..];
+        let end = rest[at.len()..]
+            .find("\n        fn ")
+            .or_else(|| rest[at.len()..].find("\n        }"))
+            .map(|d| at.len() + d)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
     /// **"改了像素"与"记进 equipped"在源码里必须是同一个动作**（P3 的接线门禁）。
     ///
     /// Wayland 那一条（`pixels_and_the_ledger_are_written_by_one_function_only`）不是洁癖，是
@@ -743,31 +685,14 @@ mod tests {
     ///
     /// 与 `cli.rs` 的 `every_flag_advertised_in_usage_exists` 同族。**读源码文本的门禁天生脆**，
     /// 所以只数最小的几件事，每条都带"为什么是这一条"；重构改名会红，那是**要人来看一眼**的红。
+    ///
+    /// ⚠️ 数的是**代码形状**而不是散文：needle 一律带上 `(` 或 `=`，注释里提到同一个函数名
+    /// 不会被数进来（这一条在 M7b 那扇门上差点踩到 —— 面板的字段注释里就写着
+    /// `panel::rects(kind, rows)`）。
     #[test]
     fn the_pixels_and_the_ledger_are_written_by_one_function_each() {
-        let src = include_str!("app.rs");
-        // 只数测试模块**之外**的代码。本平台今天没有这个模块（构造不起来 ⇒ 写了也跑不了），
-        // 但这条门禁自己的字面量就在下面这几行里 ⇒ 以后谁给 `app.rs` 加了测例，切掉它才不数到自己。
-        let code = match src.find("\nmod tests {") {
-            Some(at) => &src[..at],
-            None => src,
-        };
-
-        // 函数体 = 从 `fn name(` 起，到下一个同级 `fn` 或本函数收尾的那个 `}`。
-        // 缩进 8 空格 = `#[cfg(windows)] mod win { impl App { … } }` 三层之内。
-        let body = |name: &str| -> String {
-            let at = format!("fn {name}(");
-            let start = code
-                .find(&at)
-                .unwrap_or_else(|| panic!("找不到 `{at}` ⇒ 这条门禁白跑"));
-            let rest = &code[start..];
-            let end = rest[at.len()..]
-                .find("\n        fn ")
-                .or_else(|| rest[at.len()..].find("\n        }"))
-                .map(|d| at.len() + d)
-                .unwrap_or(rest.len());
-            rest[..end].to_string()
-        };
+        let code = app_code();
+        let body = |name: &str| -> String { fn_body(code, name) };
 
         // ① 把配件放上身的赋值**全文件只许有一处**，而那一处必须在 `wear` 里。
         let worn_some = code.matches("self.worn = Some(").count();
@@ -787,14 +712,18 @@ mod tests {
             "`wear` 里没有 `persist_worn` ⇒ 三处装载全都不记账，而宿主测不出来"
         );
 
-        // ③ 三个装载点都真的走 `wear`：穿上（`equip`）/ 换一件（`cycle_accessory`）/ 启动恢复
-        //    （`restore_worn`）。少一个 = 那条路又自己写了一遍像素。
-        //    ⚠️ 与 Wayland 那个 5 的差 = 本平台没有收藏册点名（P4，M7）与换本体（P5）⇒
-        //    **这两块面接进来时这个数要跟着涨**，红的时候先看是不是那一格落地了。
+        // ③ 五个装载点都真的走 `wear`：穿上（`equip`）/ 换一件（`cycle_accessory`）/ 启动恢复
+        //    （`restore_worn`）/ 收藏册点名（`pick_and_wear`，M7c）/ 换本体后重穿幸存那件
+        //    （`swap_body`，M7d）。少一个 = 那条路又自己写了一遍像素。
+        //    ⚠️ **4 → 5 是 P5（换本体）那一格逼出来的，与 Wayland 那个 5 同一条理由**：换完本体后
+        //    `candidates` 是**新可见集**，旧帽子如果还在里面，它的下标已经不是身上那格的旧下标
+        //    ⇒ 只能按 id 重认一次再走 `wear`。在这条路上自己写那四行赋值 = 屏上戴着帽子而
+        //    `equipped` 记的是上一只本体的那一件（= 变异 G 那一族，只是换了主语）。
         let calls = code.matches("self.wear(").count();
         assert_eq!(
-            calls, 3,
-            "`wear` 应当被 穿上 / 换一件 / 启动恢复 三处共用，实际调用点 {calls} 个"
+            calls, 5,
+            "`wear` 应当被 穿上 / 换一件 / 启动恢复 / 收藏册点名 / 换本体后重穿幸存那件 五处共用，\
+             实际调用点 {calls} 个"
         );
 
         // ④ 释放像素也只有一个落点（`take_worn`），而"脱下"必须把账一起删掉。
@@ -811,15 +740,275 @@ mod tests {
 
         // ⑤ 落库那两个 IO 各只有一个调用者（`persist_worn` / `persist_unworn`）⇒ 演示态那一档
         //    不可能被某条新路径绕过去。
+        //    ⚠️ **`write_equip` 从 1 变 2 是 M7d 的 `persist_body`**（本体那一行也走同一个 IO），
+        //    两处的形状必须仍是"只有一行 `match write_equip(…)`、三档结论各自出声" ⇒ 判据仍然只有一份。
+        //    Wayland 那侧同一条计数也是 2（`persist_body` + `persist_worn`），两家用同一判据不靠约定。
         assert_eq!(
             code.matches("write_equip(").count(),
-            1,
-            "`write_equip` 有了第二个调用者 ⇒ 演示态的判据出现了第二份实现"
+            2,
+            "`write_equip` 的调用者不是恰好 `persist_worn` + `persist_body` 这两个转发 ⇒ \
+             有人在函数外自己落库，演示态那一档就有了第二份实现"
+        );
+        let persist_worn = fn_body(code, "persist_worn");
+        let persist_body = fn_body(code, "persist_body");
+        assert!(
+            persist_worn.contains("write_equip(") && persist_body.contains("write_equip("),
+            "那两处都必须在 `persist_*` 里面（在外面 = `dress_exempt_for` 那三档结论被复制了一份）"
         );
         assert_eq!(
             code.matches("clear_equip(").count(),
             1,
             "`clear_equip` 有了第二个调用者 ⇒ 同上，方向反过来"
+        );
+    }
+
+    // ── ⑤b 面板接线（M7b）源级门禁：每件事只有一扇门 ──────────────────────────────
+
+    /// 第三块 surface 的接线门禁。
+    ///
+    /// **为什么必须有、而且必须读源码文本**：`App` 整个在 `#[cfg(windows)]` 里 ⇒ 宿主写不出
+    /// 构造测例，交叉编译只证类型与链接（"能编译"不许被引用成"通过"，D5）。面板比菜单多的
+    /// 风险恰好是三件"错了也不会红"的事：① 建窗/关窗各只有一扇门（多一扇 = 有一处绕开互斥，
+    /// 屏上两块面而 `panel_commits` 只数其中一块）；② 派发期间不许碰 `Client`（`Events` 回调
+    /// 发生在 `pump` 内部，那时 client 正被借用 —— 那是 UB 边界，不是风格）；③ 命中表与行
+    /// 同生同改（`69fd158` 那一族：点的是这一屏的行、画的是另一屏的字）。
+    ///
+    /// ⚠️ ⑧/⑨ 两族里那些"恰好是 N"的计数是**约定而不是测量**：M7c 落地时 ⑧ 从欠账变成正向断言，
+    /// M7d 落地时 ⑨ 从 0 改成 1（同时 `self.wear(` 4 → 5、`write_equip(` 1 → 2）。以后每接一块
+    /// 面就同一处置：**把数改对并写下为什么**，不许删断言。
+    #[test]
+    fn the_panel_is_wired_through_one_door_each() {
+        let code = app_code();
+
+        // ① 建窗与关窗各一处，而且各自落在该落的那个函数里。
+        assert_eq!(
+            code.matches("spawn(SurfaceKind::Panel").count(),
+            1,
+            "面板建窗有第二处 ⇒ 有一处绕开 `apply_panel`，而互斥（开面板先关菜单）只写在那里"
+        );
+        assert_eq!(
+            code.matches("close(SurfaceKind::Panel").count(),
+            1,
+            "面板关窗有第二处 ⇒ `panel: Option<…>` 会与真实窗口分家"
+        );
+        let apply = fn_body(code, "apply_panel");
+        let close_now = fn_body(code, "close_panel_now");
+        assert!(
+            apply.contains("spawn(SurfaceKind::Panel")
+                && close_now.contains("close(SurfaceKind::Panel"),
+            "两处窗口动作必须分别在 `apply_panel`（环外落地）与 `close_panel_now` 里"
+        );
+
+        // ② 互斥的唯一守卫在 `apply_panel`：开那一面之前先关菜单。
+        assert!(
+            apply.contains("self.close_menu(client)"),
+            "`apply_panel` 不再先关菜单 ⇒ 同层两块面同屏，而它们的堆叠序没有任何定义"
+        );
+
+        // ③ 派发侧不许碰窗口：回调在 `pump` 里跑，那时没有安全的 `&mut Client`。
+        for name in ["dispatch_menu", "dispatch_panel"] {
+            let body = fn_body(code, name);
+            assert!(
+                !body.contains("client"),
+                "`{name}` 里出现了 client ⇒ 有人在派发期间动窗口（`App` 文档头那条线性借用纪律）。\
+                 正解是记旗，由 `round` 落地"
+            );
+        }
+        // 旗必须被 `round` 落地，否则"记了旗而没人办"就是点了没反应的假按钮。
+        let round = fn_body(code, "round");
+        assert_eq!(
+            round.matches("self.apply_panel(client)").count(),
+            1,
+            "`pending_panel` 没有在事件环里落地 ⇒ 面板永远开不出来"
+        );
+        assert_eq!(
+            round.matches("self.update_panel(client)").count(),
+            1,
+            "`update_panel` 没被每轮调 ⇒ 面板建了窗却一帧都不画"
+        );
+
+        // ④ present 与计数器各一个落点（`panel_commits` 必须与 `menu_commits` 分开数）。
+        assert_eq!(
+            code.matches("present(SurfaceKind::Panel").count(),
+            1,
+            "面板 present 有第二处 ⇒ 有一处绕过 `panel::content_sig` 那道闸门（静止恒 1 提交的判据作废）"
+        );
+        assert_eq!(
+            code.matches("counters.panel_commits += 1").count(),
+            1,
+            "`panel_commits` 有两个 +1 ⇒ 摘要里那一行不再说明任何事"
+        );
+        assert!(
+            fn_body(code, "update_panel").contains("counters.panel_commits += 1"),
+            "那个 +1 必须在 `update_panel` 里（与 `draw` 的返回值同处），别处记都是双记"
+        );
+
+        // ⑤ 命中表只有两个出生地：`PanelState::new` 的字段初始化、`set_lines` 的换行。
+        assert_eq!(
+            code.matches("items: panel::rects(").count()
+                + code.matches("self.items = panel::rects(").count(),
+            2,
+            "命中表的出生地不是恰好两处（`PanelState::new` 的字段初始化 + `set_lines`）⇒\
+             多一处 = 有人绕过换行入口，少一处 = 有一条路只改 `rows`/`kind` 不改表（`69fd158`）"
+        );
+        let set_lines = fn_body(code, "set_lines");
+        assert!(
+            set_lines.contains("self.items = panel::rects(")
+                && set_lines.contains("self.rows = rows")
+                && set_lines.contains("self.kind = kind"),
+            "`set_lines` 必须一次改齐 kind/rows/items（少一样 = 屏上与命中表分家）"
+        );
+        assert!(
+            !set_lines.contains("force_draw"),
+            "原地换行不该置 `force_draw`：kind/lang/行文本/错误行全进 `panel::content_sig`"
+        );
+
+        // ⑥ 分派只走 `panel::press`（把关在命中侧），摆位只走 `panel::placement`。
+        assert_eq!(
+            code.matches("panel::press(").count(),
+            1,
+            "第二处命中判定 ⇒ 有人在客户端自己实现「actionable」，共用层那条门禁就管不到这里了"
+        );
+        assert_eq!(
+            code.matches("panel::placement(").count(),
+            1,
+            "第二处摆位 ⇒ 面板与菜单不再共享「placement」那一份\"屏上装得下\"的保证"
+        );
+
+        // ⑦ 右键的第三臂：面板开着时右键**关面板**，不是去开菜单。
+        assert!(
+            fn_body(code, "toggle_menu").contains("} else if self.panel.is_some()"),
+            "第三臂掉了 ⇒ 面板开着时右键会去开菜单，正好把互斥破掉（症状：右键面板弹出菜单）"
+        );
+
+        // ⑧ 收藏册那一本（M7c 落地）：逐件屏只有一个生产者，而点名的那一臂只有一条路。
+        //    `album_screen` 的两个调用者是**有意的两份**（`panel_rows` 给"面板已经开着、跟着
+        //    语言/动画档重算"，`collection_album` 给"从菜单或翻页进来、顺带把同一批字打进
+        //    stderr"），第三个调用者就意味着有人绕过了页码归一。
+        assert_eq!(
+            code.matches("self.album_screen(").count(),
+            2,
+            "逐件屏的生产者不是两处（实际 {} 处）⇒ 多出来的那一处绕过 `album_page` 的页码归一，\
+             屏上会漂页；少掉的那一处意味着有一本退回汇总行",
+            code.matches("self.album_screen(").count()
+        );
+        assert!(
+            fn_body(code, "collection_panel").contains("self.collection_album(page)"),
+            "Owned 那一本没有岔给 `collection_album` ⇒ 菜单进来的收藏册又是汇总行，\
+             而 `panel::PanelItem::More` 与 `Wear(i)` 从此产不出来"
+        );
+        assert!(
+            fn_body(code, "dispatch_panel").contains("self.pick_and_wear(i)"),
+            "`Wear(i)` 那一臂没有走 `pick_and_wear` ⇒ 点名要么静默不动，要么自己实现了一遍穿法"
+        );
+        assert_eq!(
+            code.matches("self.pick_and_wear(").count(),
+            1,
+            "点名的调用点不是 1 处 ⇒ 有第二条路在写 `picked` 而它不经那道所有权闸"
+        );
+
+        // ⑨ P5（M7d 落地）：换本体这一族的"唯一落点 + 九步次序"，逐条照 Wayland
+        //    `pixels_and_the_ledger_are_written_by_one_function_only` 的 ⑥/⑦/⑥′，只改两处主语：
+        //    · `self.swap_body(` 那边是 **2**（`on_panel_press` 的 `Body` 臂 + §3.12 的
+        //      `ipc_apply`），本平台是 **1** —— 控制套接字仍在 `cli::REFUSED`（第三批），
+        //      **接它那天这个数要跟着涨**，与上面 `self.wear(` 那条同一族约定；
+        //    · 母本第 3 步"换穿透轮廓"在这里不存在（本平台没有 `Regions` 消费者），所以那条
+        //      半换形状不需要断言，而 `self.manifest = ` 那一处仍然是唯一写入点。
+        assert_eq!(
+            code.matches("self.swap_body(").count(),
+            1,
+            "`swap_body` 只许有 `dispatch_panel` 的 `Body` 臂这一个调用点（§3.12 接进来时改成 2），\
+             实际 {} 处 ⇒ 多出来的那份会自己决定这八步的次序",
+            code.matches("self.swap_body(").count()
+        );
+        assert_eq!(
+            code.matches("self.persist_body(").count(),
+            1,
+            "`equipped` 的 `body` 行只许在 `swap_body` 末尾写一次（先像素后账），实际 {} 处",
+            code.matches("self.persist_body(").count()
+        );
+        assert_eq!(
+            code.matches("self.manifest = ").count(),
+            1,
+            "本体清单只有一个写入点（`swap_body` 第 4 步）⇒ 第二处赋值就是\"清单是新的而 atlas \
+             是旧的\"那个半换状态的另一半（实际 {} 处）",
+            code.matches("self.manifest = ").count()
+        );
+        // ⚠️ needle 带 `&`：`atlas.reload(` 这个字面量在 [`App::swap_body`] 那条**文档注释**里
+        // 也出现过（它把这条门禁的口径写在注释上），不带 `&` 会数到文档而不是代码。
+        assert_eq!(
+            code.matches("atlas.reload(&").count(),
+            1,
+            "原地重载只许有一处 ⇒ 写成 load-then-swap（先 `Atlas::load` 再换掉）峰值就是**两只\
+             本体 + 一顶帽 ≈147 MB，而它落在 ≤200 MiB 门禁内 ⇒ 什么都不会红**，只有这一条 + \
+             验收那一次 `VmHWM` 能抓（实际 {} 处）",
+            code.matches("atlas.reload(&").count()
+        );
+
+        // ⑨′ **八步的次序**（本轮最承重的一族）。`reload` 是不可回头的那一条线，所以：
+        //    判定与"卸下旧帽"排在它**前**（失败时屏上还是原来那只、账一个字不动），
+        //    记账、`drawn_cell = None`、`candidates` 重跑排在它**后**。
+        //    · 删掉 `drawn_cell = None` = 那边变异 G 的 P5 版：四份产物的行表逐字节相同 ⇒
+        //      `cell != drawn_cell` 那道门永不开 ⇒ 五百多条全绿而真机失败（屏上静默不变）。
+        //      ⇒ 这一行**只有**下面这条 textual 读数，真机上唯一的读数是一张截图。
+        let swap = fn_body(code, "swap_body");
+        let said = |needle: &str| {
+            swap.find(needle)
+                .unwrap_or_else(|| panic!("`swap_body` 里没有 `{needle}` ⇒ 那八步被拆了"))
+        };
+        assert!(
+            said("plan_swap_body(") < said("atlas.reload(&"),
+            "判定排在解像素之后 ⇒ 被拒的那一次已经改过图集，而日志说的是\"没换\""
+        );
+        assert!(
+            said("self.take_worn()") < said("atlas.reload(&"),
+            "旧帽没先卸下就去解新本体 ⇒ 峰值 = 本体 + 旧帽 + 新本体（那边 M1 档的 148,076 kB）"
+        );
+        assert!(
+            said("atlas.reload(&") < said("self.persist_body("),
+            "账排在像素之前 ⇒ 解码失败那一轮库里记着一只屏上没有的本体"
+        );
+        assert!(
+            said("atlas.reload(&") < said("self.drawn_cell = None"),
+            "`drawn_cell` 的复位没排在 `reload` 之后 ⇒ 换本体是一次屏上静默不变（变异 G 的 P5 版）"
+        );
+        assert!(
+            said("discover_accessories(") < said("let fresh = self.dress_view()"),
+            "`picked` 在 `candidates` 重跑之前被改写 ⇒ 拿旧下标去索引新表，点下去是另一件"
+        );
+        // 母本 ⑥′：**第 5 步那个库位置**。11-07 那边交互主轮实测抓到的一刀，而它**不在**上面任何
+        // 一条的射程里（次序全对、只是根取错了）：`swap_body` 写成 `pet_root()` ⇒ 配件库被扫成
+        // 本体库那个目录 ⇒ 换完本体帽子当场掉。它连注释都不许出现那个函数名 = 这一刀在文本里的
+        // 形状就是"有人准备这么写"，而注释是给人看的，判据不区分注释与代码。
+        assert!(
+            !swap.contains("pet_root(") && !swap.contains("discover_pets("),
+            "`swap_body` 里出现了本体库的扫盘调用 ⇒ 重扫配件用的是本体库的根，换完本体配件全灭"
+        );
+
+        // ⑩ 收藏册**接线**（不是判据）：`album_screen` 必须把两张表都交给共用层。
+        //     这一条防的是 M7c 那一批的中间形状悄悄回来 —— 本体那两参写成 `&[], &[]` 时屏上
+        //     宠物行全部退化成只读，而宿主这 76 条与共用层几百条**一条都不会红**（那边同一格的
+        //     读数 `the_album_routes_pets_to_the_body_index_space` 测的是**判据**，这条测**接线**）。
+        let album = fn_body(code, "album_screen");
+        assert!(
+            album.contains("let pet_view = self.pet_view();")
+                && album.contains(
+                    "&g.album_entries(&owned, &ids, &view.visible, &pet_ids, &pet_view.visible)"
+                ),
+            "`album_screen` 没有把本体那两张表喂进 `album_entries` ⇒ 收藏册的宠物行又变回只读\
+             （屏上看不出、测例读不到，只有这一条有读数）"
+        );
+        assert!(
+            !album.contains("&[], &[]"),
+            "`album_screen` 里出现了空表实参 ⇒ 就是上面那条恒空的写法回来了"
+        );
+        assert!(
+            fn_body(code, "dispatch_panel").contains("self.swap_body(i)"),
+            "`Body(i)` 那一臂没有走 `swap_body` ⇒ 点名本体要么静默不动，要么自己实现了一遍换法"
+        );
+        assert!(
+            !code.contains("M7 面板接线"),
+            "菜单那六行的占位臂（\"点了只出声\"）不许复活：入口现在真的开面板"
         );
     }
 

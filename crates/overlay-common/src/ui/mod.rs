@@ -18,8 +18,11 @@
 //! - [`text`] —— 文字层：入库 CFF 子集栅格化（`FONT_BYTES` = `include_bytes!`，资产在
 //!   `crates/overlay-common/assets/fonts/`）。
 //! - [`font`] —— `text` 之前的旧字体兜底路径，保留是因为它仍被引用。
-//! - [`settings`] —— `Motion`/`Lang` 生效值的**类型与预检**（读 `petstore::config` 的
-//!   优先级链留在各家客户端的 `settings.rs` 里 —— 链条各家用自己的配置装载面喂它）。
+//! - [`settings`] —— `Motion`/`Lang` 的档位、来源标签与**生效值优先级链本体**
+//!   （`--lang` > 文件 > `LC_ALL`/`LANG` > 默认）。2026-11-24（M7）整条从 `overlay-wayland`
+//!   提上来，覆盖 2026-11-22 拍板③那句"解析链留在各家客户端"；链的输入是本模块的
+//!   [`settings::FileUi`]（两个字符串）而**不是** `petstore::config::UiKeys` —— 各家客户端
+//!   只留"读哪条路径、读哪个环境变量"那一层搬运。
 //!
 //! 资产门禁在 `tests/font_assets.rs`（随资产一起搬上来：`include_bytes!("../assets/…")`
 //! 的相对深度没变）。

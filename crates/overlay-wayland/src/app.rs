@@ -17,18 +17,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use petcore::assets::{AccessoryManifest, Grid, Manifest};
+use petcore::assets::{AccessoryManifest, Manifest};
 use petcore::behavior::AssetKey;
 use petcore::behavior::config::{Action, BehaviorConfig};
 use petcore::behavior::machine::Command;
-use petcore::gacha::{
-    Catalog, Currency, DEFAULT_RATES_JSON, GachaParams, ItemKind, Owned, Rarity, RatesFile, Slot,
-};
 use petcore::geom::{Rect, Vec2};
 use petcore::intent::{PresentationIntent, SURFACE_MARGIN};
 use petcore::sim::{Sim, TICK_HZ};
 use petcore::world::{Monitor, World, WorldEvent};
-use petstore::Store;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::delegate_compositor;
@@ -86,10 +82,22 @@ use overlay_common::dress::{
     BODY_SLOT, DressView, PickWear, dress_exempt_for, plan_pick_wear, plan_restore, split_body_row,
 };
 
+// 报表与库扫描层（M7-b 前置上提，2026-11-24，理由写在新 crate 的 `lib.rs` 顶上）。
+// 这一族名字**原来就住在本文件**（`Gacha` 492、`Album*`/`album_rows` 878、`SwapBody`/
+// `plan_swap_body` 1003、`published_rates_lines` 1057、`pet_root`/`BodyCandidate`/`check_body`/
+// `discover_pets` 1622）⇒ 上提走的是整段，调用点一个字不改，`mod tests` 那几十条门禁
+// （它们走 `use super::*`）跟着名字一起回来，总数守恒。
+// M7-d（2026-11-25）又添一批：`db_body_row`/`BodyChoice`/`plan_body_override`（起点本体那一行
+// 的读数与判定）—— Windows 那侧要读同一行、判同一件事 ⇒ 判据不许有第二个实现。
+use overlay_report::{
+    BodyCandidate, BodyChoice, Gacha, SwapBody, album_rows, db_body_row, discover_pets, pet_root,
+    plan_body_override, plan_swap_body, published_rates_lines,
+};
+
 use crate::atlas::Atlas;
 use crate::card;
 use crate::ipc;
-use crate::l10n::{self, Key, Lang};
+use crate::l10n::Lang;
 use crate::menu::{self, CARD_H, CARD_W, ItemRect, MenuAnim, RectI};
 use crate::panel::{self, CollectionTab, PanelKind};
 use crate::region::{CellRect, Regions};
@@ -260,85 +268,6 @@ fn clear_equip(gacha: &mut Option<Gacha>, dry_run: bool, slot: &str) -> Result<W
     Ok(WornWrite::Written)
 }
 
-/// 启动那一步读库里的 `body` 行（拍板③ 唯一的读数）。
-///
-/// **只在 `--db` 给了的时候**开库，读完这个 `Store` 就随函数返回一起 drop ⇒ 无 `--db` 那一轮
-/// 一个文件字节都不碰（与"演示态一律放行、也不记本体这一笔"同一条口径）。
-///
-/// 代价明写：带 `--db` 的这一轮库会被开**两次**（这里一次只读、[`App::ensure_gacha`] 一次）。
-/// 选它而不是选"半个初始化的 `App`"：`App` 的构造点排在 surface 之后，而起点本体必须排在
-/// surface **之前**（`logical` / `set_size` / `set_destination` / `SlotPool` 都从清单的格子算），
-/// 让本体去等 surface 就得把清单字段换成 `Option` 并给每一处补一份"还没有清单"的形状 ——
-/// 那比一次 sqlite 打开大得多。**以后若有第三个读取者，先问它能不能并入 `ensure_gacha`。**
-///
-/// 三条出口合成一个 `Option`：**没有那一行**与**读失败**都是 `None`（= 老库、今天的行为逐字节
-/// 不变），而读失败**必须**先点名一行 ⇒ 静默退化成兜底就是假门禁（`--cell` 假开关那一族）。
-///
-/// ⚠️ 它读的是 [`Store::equipped_slot`] 那一条 SQL（`WHERE profile_id = ?1 AND slot = ?2`），
-/// 而 [`split_body_row`] 读的是 [`Store::equipped`] 的整表 ⇒ 同一张表两个读法。它们对
-/// "多于一条 `body` 行"给同一个答案（两条都按 `ORDER BY slot, item_id` 取首条），所以这不是
-/// 两个事实源；合成一条读法的代价是"启动多开一次库"或"恢复侧先跑起来才能拿到本体"那条循环。
-fn db_body_row(db: Option<&str>) -> Option<String> {
-    let path = db?;
-    match Store::open(std::path::Path::new(path))
-        .and_then(|s| s.equipped_slot(petstore::DEFAULT_PROFILE, BODY_SLOT))
-    {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!(
-                "body: 读 `equipped` 的 {BODY_SLOT} 行失败（{e}）⇒ 这一轮用 `--manifest` 那只（兜底）"
-            );
-            None
-        }
-    }
-}
-
-/// [`plan_body_override`] 的结论。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BodyChoice {
-    /// 覆盖成立 = 起点本体换成**启动扫盘交出来的表**里那一格（调用方拿它去 `bodies[i]`）。
-    ///
-    /// ⚠️ 判据来自发现表 ⇒ **覆盖天然同档**（[`check_body`] 第 ② 道已经按 `--manifest` 的
-    /// `Grid` 过滤过）。所以"启动允许跨档"这一句今天是**协议层面的陈述**（surface 尚未建，
-    /// 改尺寸合法），不是这条路径的读数：跨档的那一只在这里落到 `Keep(理由)` 而屏上从来
-    /// 不需要改尺寸。真要支持跨档，改的是发现那道过滤（把它做成启动/运行时两套），不是这里。
-    Override(usize),
-    /// 不覆盖。`Keep(None)` = 库里压根没有那一行（老库、以及一切没换过本体的库）⇒ **一个字
-    /// 都不打**，因为那是常态而启动噪音要留给"出事了"。`Keep(Some(理由))` 必须点名。
-    Keep(Option<&'static str>),
-}
-
-/// "库里那一行能不能当起点本体"的**纯**判定（拆出来的唯一理由 = 让 J3 那条读数在 headless
-/// 里也量得到：外层要开库、要解码、要 compositor，这里三样都不需要）。
-///
-/// 只认**发现表里有的**那一只，而且只按 `id` = 目录名认（库存与 `equipped` 记账用的就是它）。
-/// 那句 `Keep` 的文案要说清"为什么不覆盖"有两个不同的原因（目录不存在 / 档不同被扫盘挡掉），
-/// 而**不**把它们合并成"读不到"：这一行报的是"你上次换的那只现在这只机器上装不上"，
-/// 用户下一步该去找产物，不是去查数据库。
-///
-/// ⚠️ `start_id` 那一条是 11-07 真机 E 轮实测出来的：库里那一行写的就是 `--manifest` 已经给的
-/// 那一只时，旧版无条件走 `Override` ⇒ stderr 打出「起点本体从 cat_shiro 换成这只」而**什么也没
-/// 换**。拍板③ 的原话是"**覆盖发生时必须打一行点名**"，读到的那一行不等于覆盖发生 ⇒ 这一臂今天
-/// 走 `Keep(None)`（静默 = 常态），而它的读数是下面那条真值表里的第 ③⑤ 两格（后者是"发现表为空
-/// 而起点正是它"那一面 —— 判据必须排在 `position()` 之前，否则那台机器上会平白多一行假点名）。
-fn plan_body_override(row: Option<&str>, pet_ids: &[String], start_id: &str) -> BodyChoice {
-    let Some(id) = row else {
-        return BodyChoice::Keep(None);
-    };
-    // **先问"是不是本来就在身上"**，再问它在不在发现表里：那一行就是起点那只时这一轮什么都没
-    // 换，而"没有本体库 / `--test-rect`"的机器上发现表是空的 ⇒ 把这条判据放在 `position()`
-    // 之后会得到一句假点名（"上次换的那只装不上"）—— 它装得上，它就是身上这只。
-    if id == start_id {
-        return BodyChoice::Keep(None);
-    }
-    match pet_ids.iter().position(|p| p == id) {
-        Some(i) => BodyChoice::Override(i),
-        None => BodyChoice::Keep(Some(
-            "库里那一行指的本体不在启动扫盘交出来的表里（目录不存在、清单或产物坏了，或格子档与 `--manifest` 那只不同）",
-        )),
-    }
-}
-
 /// 装备中的一件配件（D16 路线 B = **运行时逐格叠加**）。内存档 **M1 = 一次一件**，
 /// 所以"有没有穿"就是这一个 `Option`：穿了 ⇒ 它的 sheet 在内存里；脱了 ⇒ 整个丢掉。
 ///
@@ -489,613 +418,6 @@ pub struct App {
     restore_pending: bool,
 }
 
-/// 库与目录成对出现（`connect` 一起建、一起失败），所以没有"有库没目录"的中间态。
-///
-/// 这一层**不含任何 wayland 类型**（和 `menu.rs`/`card.rs` 同族约束）：好处不是整洁，
-/// 而是"落库这条路"能在 headless 里被测 —— 抽取的入口是鼠标，而我绝不注入点击。
-struct Gacha {
-    store: Store,
-    catalog: Catalog,
-}
-
-impl Gacha {
-    /// 连库 + 装目录。`None` = 内存库（一条文件都不产生，UI 全程打 DRYRUN 标）。
-    ///
-    /// 不做 canonicalize：它要求文件已存在，第一次运行必然失败，反而把"能建库"这条正路
-    /// 堵死。绝对路径的要求由 `Store::open` 自己把关（相对路径取决于 cwd，而宠物可能被
-    /// systemd user service 起），口径与 CLI 一致。
-    fn connect(db: Option<&str>) -> Result<Self, String> {
-        let mut store = match db {
-            None => Store::in_memory().map_err(|e| format!("内存库建不起来: {e}"))?,
-            Some(p) => {
-                Store::open(std::path::Path::new(p)).map_err(|e| format!("打不开存档 {p}: {e}"))?
-            }
-        };
-        let catalog = Catalog::default_v1().map_err(|e| format!("公示目录读不出来: {e}"))?;
-        store
-            .install_catalog(&catalog)
-            .map_err(|e| format!("装目录失败: {e}"))?;
-        Ok(Self { store, catalog })
-    }
-
-    /// 碎片余额。`u64 → i64` 只在天文数字上饱和 —— 宁可显示封顶，也不许把余额读成负数。
-    fn balance(&self) -> i64 {
-        self.store
-            .shards(Currency::Shards)
-            .ok()
-            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
-            .unwrap_or(0)
-    }
-
-    /// 抽 `count` 次并落库，返回菜单要的三样：结果卡行、最高档、抽完的余额。
-    /// 错误只是一条给人看的字（进菜单错误行），调用方不许因为它而停环。
-    ///
-    /// `lang`/`scale` 都在**这一刻**烤进字符串：文案由 `l10n` 按语言选，截断按当前缩放
-    /// 换算的像素预算算（§4.5）。⇒ 之后切语言/换显示器都不会重刷已经挂着的卡，这是语义
-    /// 而不是缺陷（"当前显示的卡永远与生成它时的语言一致"，§7-R10）。
-    fn pull(
-        &mut self,
-        count: u32,
-        dry_run: bool,
-        lang: Lang,
-        scale: f32,
-    ) -> Result<(Vec<String>, Rarity, i64), String> {
-        let report = self
-            .store
-            .pull_for(
-                &GachaParams::V1,
-                &self.catalog,
-                petstore::DEFAULT_BANNER,
-                petstore::DEFAULT_PROFILE,
-                count,
-            )
-            .map_err(|e| format!("PULL {count}: {e}"))?;
-        // 显示名 = catalog 里的**中文**名（`蓝帽`），查不到回退 `item_id` ⇒ **绝不留白**。
-        // 四 locale 一律显示目录中文，英文界面配中文物品名是明写的取舍（§7-R12：给目录加
-        // `name_en` 要动 `petcore::gacha::catalog` 的 `deny_unknown_fields` schema，本轮不做）。
-        let items: Vec<(String, Rarity, bool)> = report
-            .outcomes
-            .iter()
-            .map(|o| {
-                let name = self
-                    .catalog
-                    .find(&o.item_id)
-                    .map(|i| i.name.clone())
-                    .unwrap_or_else(|| o.item_id.clone());
-                (name, o.rarity, o.duplicate)
-            })
-            .collect();
-        let lines = menu::report_lines(
-            &report.counts,
-            &items,
-            u64::from(report.shards_gained),
-            lang,
-            scale,
-        );
-        let best = menu::best_rarity(&report.counts).unwrap_or(Rarity::N);
-        let balance = self.balance();
-        eprintln!(
-            "gacha: 抽 {count} ⇒ N={} R={} SR={} SSR={} 碎片 +{} 余额 {balance}（{}）",
-            report.counts[0],
-            report.counts[1],
-            report.counts[2],
-            report.counts[3],
-            report.shards_gained,
-            if dry_run { "DRYRUN" } else { "已落库" }
-        );
-        Ok((lines, best, balance))
-    }
-
-    /// 「已获得」那一屏的行：每档各拿到几种 / 该档共几种，最后一行是总数 + 重复 + 余额。
-    ///
-    /// **纯读**：不掷骰、不花钱、不改库 —— 这是它能进菜单而 `redeem_ssr`（花掉 120 碎片、
-    /// 不可回退，而这块 surface 没有对话框，D14）不能进的分界。
-    ///
-    /// 分母取 **catalog** 而不是库存行数 ⇒ "还缺多少"这件事在这一行就读得出来（`n/total`），
-    /// 而库存自己只能回答"有什么"。重复数按 `count − 1` 累加：第一件不算重复，哪怕它躺在
-    /// 库存里 —— 这是 §3.6 的折算口径（第 2 件起才折碎片），不是我在省一次查询。
-    ///
-    /// ⚠️ **每一串字都只用「字体子集里已有的字」**（`l10n` 标签 + ASCII + catalog 名）：
-    /// 这一批的字现在**同时**是屏上那一行和 stderr 那一行（[`App::gacha_panel`] 一条路径出两边），
-    /// 而 32 px 档的字号竞技场只剩 ≈7 个字形。代价**明写而不是藏起来**：原先那句
-    /// 「共 3/30 · 重复 5 · 碎片 120」的中文散文没了，读者要认 `DUP` / `Shards` 这类标签；
-    /// 换来的是"屏幕上读到的与日志里打到的是同一串字"，一个口径。
-    fn collection_lines(&self, lang: Lang) -> Result<Vec<String>, String> {
-        let owned = self.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
-        let mut lines = Vec::with_capacity(Rarity::ALL.len() + 1);
-        let mut dup = 0u64;
-        let mut kinds = 0usize;
-        let mut total = 0usize;
-        for r in Rarity::ALL {
-            let mut have = 0usize;
-            let mut all = 0usize;
-            for item in self.catalog.items_of(r) {
-                all += 1;
-                if owned.contains(&item.id) {
-                    have += 1;
-                    let n = self
-                        .store
-                        .item_count(&item.id)
-                        .map_err(|e| format!("读 {} 的件数失败: {e}", item.id))?;
-                    dup += n.saturating_sub(1);
-                }
-            }
-            kinds += have;
-            total += all;
-            lines.push(format!("{} {have}/{all}", r.as_str()));
-        }
-        lines.push(format!(
-            "{kinds}/{total} {} {dup} {} {}",
-            lang.t(Key::Dup),
-            lang.t(Key::Shards),
-            self.balance()
-        ));
-        Ok(lines)
-    }
-
-    /// 「已获得」那一本的**逐件**行（P4 = 收藏册点名 → 直接穿上）。
-    ///
-    /// ⚠️ **遍历的是 `catalog ∩ owned`（稀有度序 + catalog 内序），不是 `candidates`** —— 后者
-    /// 只有磁盘上真的有产物那几件（裸开发树 30 件里只有 1 件），拿它当列表而汇总行读的是
-    /// `catalog ∩ owned`，屏上就是"汇总说 12 件而列表只有 1 行"，两个事实自己打自己。
-    /// 同一个集合还有一条好处：名字一律来自 catalog，所以不需要 `recent_lines` 那种"catalog
-    /// 不认就退化成 id"的分支（那一条读的是账本，账本可以记着目录里没有的 id）。
-    ///
-    /// 三档**可点/只读**由 [`AlbumEntry::target`] 一格表示，而它的判据是别人给的（不是这里自己算的）：
-    /// `ids` = [`App::candidates`] 的目录名表，`visible` = [`App::dress_view`] 跑完库存那道之后
-    /// 的可见下标集。⇒ "抽到但磁盘没产物""磁盘有但库存不认""本体不匹配"三种形状都落在
-    /// `target = None`，屏上那一行**没有强调条**（画师读的正是可点性，见 [`card::paint_panel`]），
-    /// 用户看得见地能分辨，而我不用为这三种形状各造一个新字形或新标记。
-    ///
-    /// ⚠️ P5 把"宠物永远只读"这一条**换成了第二个判据源**：`pet_ids` / `pet_visible` 是
-    /// [`App::bodies`] 的目录名表与 [`App::pet_view`] 的可见集，形状与上面那一对**完全同构**（同一
-    /// 个 [`DressView::select`]，只是喂的表不同）。所以本体现在有三档路由：配件格 ⇒
-    /// [`AlbumTarget::Accessory`]、宠物格 ⇒ [`AlbumTarget::Body`]、两表都查不到 ⇒
-    /// [`AlbumTarget::None`]。**"没有强调条"这一档对三类原因仍然只有一句实现**（未拥有 / 磁盘没
-    /// 产物 / 跨档出局），跨档那一只在 [`check_body`] 第 ② 道就被扫盘挡掉 ⇒ 它压根不在
-    /// `pet_ids` 里 ⇒ 落到同一支 `None`（= 只读，而不是"点了被拒"，拍板② 的验收形状）。
-    ///
-    /// `dup` 的折算口径与 [`Self::collection_lines`] **同一个**（`item_count − 1`：第一件不算
-    /// 重复），否则逐件行加起来与汇总那一行对不上，就成了"两本账"。
-    ///
-    /// `owned` 由调用方给（[`App::album_screen`] 一次点击只读一遍库存 ⇒ 逐件那几张行与
-    /// 汇总行问的是**同一份**答案，不是"各问了一遍然后祈祷它们相同"）。
-    fn album_entries(
-        &self,
-        owned: &Owned,
-        ids: &[String],
-        visible: &[usize],
-        pet_ids: &[String],
-        pet_visible: &[usize],
-    ) -> Result<Vec<AlbumEntry>, String> {
-        let mut out = Vec::new();
-        for r in Rarity::ALL {
-            for item in self.catalog.items_of(r) {
-                if !owned.contains(&item.id) {
-                    continue;
-                }
-                let kind_pet = item.kind == ItemKind::Pet;
-                // **两张表各查各的**，而且"查得到 + 过得了那道闸"两个条件都要成立。
-                // 反查一次而不是把下标带进来看起来像"顺手"，其实是要紧的：**id 是唯一入口**，
-                // 下标在这里是查出来的结果 ⇒ catalog 的顺序与磁盘的顺序谁变了都不影响路由。
-                let target = if kind_pet {
-                    pet_ids
-                        .iter()
-                        .position(|c| c == &item.id)
-                        .filter(|i| pet_visible.contains(i))
-                        .map_or(AlbumTarget::None, AlbumTarget::Body)
-                } else {
-                    ids.iter()
-                        .position(|c| c == &item.id)
-                        .filter(|i| visible.contains(i))
-                        .map_or(AlbumTarget::None, AlbumTarget::Accessory)
-                };
-                let n = self
-                    .store
-                    .item_count(&item.id)
-                    .map_err(|e| format!("读 {} 的件数失败: {e}", item.id))?;
-                out.push(AlbumEntry {
-                    target,
-                    name: item.name.clone(),
-                    rarity: item.rarity,
-                    slot: item.slot,
-                    kind_pet,
-                    dup: n.saturating_sub(1),
-                });
-            }
-        }
-        Ok(out)
-    }
-
-    /// 「还缺」那一屏的行：catalog 里还没拿到的**名字**，按档分组，**每档最多一行**。
-    ///
-    /// 名字来自 catalog ⇒ 这些字**已经在字体子集里**（`everything_the_ui_can_render_is_in_the_
-    /// codes_list` 那条门禁把 catalog 也纳进去了），所以这一屏是换装页那条"配件名盖不住"的反面：
-    /// 它真的能上卡片。
-    ///
-    /// ⚠️ **宽度是量出来的，不是猜的**（这条是这一批新加的，而它本来就该在产行侧）：一行的预算
-    /// = [`panel::ROW_TEXT_W`]（只读行让位后的矩形）经 [`menu::budget_for`] 换算，装不下的名字
-    /// 折进尾标 [`l10n::line_more`]（`+N 更多`，四语言都已经在子集里 ⇒ 零新字形）。
-    /// **不靠 `card` 的 `fit` 兜底**：那一层截出来的是一个 `…`，读者会以为"缺的就这些"，
-    /// 而真正缺的还有 9 件 —— 一行只读报表把数量说错，和把金额说错是同一条红线。
-    /// 精确计数另有一行（`have/all`），这一屏给的是"缺哪些名字"的线索 + 几个没列出。
-    ///
-    /// ⚠️ **"放不下"必须问 [`menu::fit_to`] 本身，不能拿 [`menu::line_width`] 自己算**（这条
-    /// 是新门禁实测逼出来的，别再改回去）：`fit_to` 决定截点用的是**逐 char +1 px 的逻辑上界**
-    /// （`menu::advance_bound_log`，为了"三档截在同一个字上"可证），`line_width` 量的是**实际**
-    /// 画宽 ⇒ 按后者产行、按前者截行 = 生产者和排版各有各的预算，实测在 1× 少一个字，
-    /// 产出的行被排版截成 `…`，正好落进上面那条红线。问同一个函数 ⇒ 这一屏的结论**按构造**
-    /// 就是屏幕上会被原样画出来的那行。
-    fn missing_lines(&self, lang: Lang, scale: f32) -> Result<Vec<String>, String> {
-        let owned = self.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
-        let budget = menu::budget_for(panel::ROW_TEXT_W, scale);
-        let fits = |s: &str| menu::fit_to(s, budget, scale) == s;
-        let mut lines = Vec::new();
-        for r in Rarity::ALL {
-            let names: Vec<&str> = self
-                .catalog
-                .items_of(r)
-                .filter(|i| !owned.contains(&i.id))
-                .map(|i| i.name.as_str())
-                .collect();
-            if names.is_empty() {
-                continue;
-            }
-            let all = format!("{} {}", r.as_str(), names.join(" "));
-            if fits(&all) {
-                lines.push(all);
-                continue;
-            }
-            // 从"少折一个"往下减，第一个 `fits` 的就收 —— 名字位数最多影响上界里一个 char，
-            // 而这里量的是**成品整行**，所以不存在"列完才发现尾标挤不下"那种改判。
-            let mut line = format!("{} {}", r.as_str(), l10n::line_more(lang, names.len()));
-            for k in (1..names.len()).rev() {
-                let cand = format!(
-                    "{} {} {}",
-                    r.as_str(),
-                    names[..k].join(" "),
-                    l10n::line_more(lang, names.len() - k)
-                );
-                if fits(&cand) {
-                    line = cand;
-                    break;
-                }
-            }
-            lines.push(line);
-        }
-        if lines.is_empty() {
-            lines.push(format!("0 {}", lang.t(Key::Missing)));
-        }
-        Ok(lines)
-    }
-
-    /// 「最近」那一屏的行：账本最后 `n` 次抽取。**只读 `gacha_pull`，一个字都不写**。
-    ///
-    /// ⚠️ **不印时间**：`ts` 是 unix 秒，而这个 crate 没有任何日期格式化依赖（引一个只为把
-    /// 一串数字变好读，代价是 `Cargo.lock` 与 D8 那条许可证核对）。印 `seq` 而不是 `ts`：
-    /// 序号是账本自己的顺序、可重放、可和 `audit verify` 的 `len` 对上，而墙钟秒数在屏幕上
-    /// 也读不出"几点"。
-    ///
-    /// 一次全表读（`rows` 没有 LIMIT）换来的是"这一条路径与 `audit verify` 走的是同一个
-    /// 查询" ⇒ 少一个口径。点击驱动、不是每 tick 轮询（§4 那条禁止）。
-    fn recent_lines(&self, lang: Lang, n: usize) -> Result<Vec<String>, String> {
-        let rows = self
-            .store
-            .rows(petstore::DEFAULT_PROFILE, petstore::DEFAULT_BANNER)
-            .map_err(|e| format!("读账本失败: {e}"))?;
-        if rows.is_empty() {
-            return Ok(vec![format!("0 {}", lang.t(Key::Recent))]);
-        }
-        let from = rows.len().saturating_sub(n);
-        Ok(rows[from..]
-            .iter()
-            .map(|r| {
-                let name = self
-                    .catalog
-                    .find(&r.item_id)
-                    .map(|i| i.name.as_str())
-                    .unwrap_or(r.item_id.as_str());
-                let dup_tag = if r.duplicate {
-                    format!(" {}", lang.t(Key::Dup))
-                } else {
-                    String::new()
-                };
-                format!(
-                    "#{seq} {rar} {name}{dup_tag} +{shards}",
-                    seq = r.seq,
-                    rar = r.rarity.as_str(),
-                    shards = r.shards_gained,
-                )
-            })
-            .collect())
-    }
-
-    /// 「复核」那一屏的两行：审计链全链校验 + 用**库里的** seed 与公示参数重放。
-    ///
-    /// `Store::verify` 只读 ⇒ 这一行不需要确认步骤（同 [`Self::collection_lines`] 那条分界）。
-    /// 报红的时候**只报错**，不报"通过了一半"：一条链要么自洽要么不自洽，中间态不存在。
-    ///
-    /// 档位计数那行借 [`l10n::line_tiers`]：它与结果卡用的是同一个生产者 ⇒ 同一批字，
-    /// 而 `line_tiers` 只列非零档 ⇒ 空账本那行是光秃秃一个 `OK`，这是事实而不是排版事故。
-    ///
-    /// ⚠️ **链头在这块屏上只能是前缀，而前缀必须自己说它是前缀**（这条同样是新门禁逼出来的：
-    /// 原先那行 `复核 {len} {64 位十六进制}` 实测在 1× 被 `fit_to` 截成
-    /// `复核 10 d2427b64ac70b454da557…` —— 一个被悄悄切短的哈希比不印哈希更坏，读者会拿它去
-    /// 和 CLI 的输出逐字比，而"少了 39 位"这件事一行像素门禁都看不见）。所以这里
-    /// **先数出装得下的位数、把它写进正文**（`{k}/64`，纯 ASCII ⇒ 零新字形），再按同一口径
-    /// 用 [`menu::fit_to`] 挑最长的那一版。完整的 64 位不在屏上也不在日志里：权威出处是
-    /// `opet audit verify --db … --account …`（它打的就是同一个 `head_hex`）。
-    /// k=0（行窄到一位都装不下）就整个字段不印 ⇒ 那一行只剩 `复核 {len}`，是少说，不是说错。
-    fn verify_lines(&self, lang: Lang, scale: f32) -> Result<Vec<String>, String> {
-        let report = self
-            .store
-            .verify(
-                &self.catalog,
-                petstore::DEFAULT_PROFILE,
-                petstore::DEFAULT_BANNER,
-            )
-            .map_err(|e| format!("复核不过: {e}"))?;
-        let budget = menu::budget_for(panel::ROW_TEXT_W, scale);
-        let fits = |s: &str| menu::fit_to(s, budget, scale) == s;
-        let head = report.head_hex();
-        let base = format!("{} {}", lang.t(Key::Verify), report.len);
-        let mut shown = String::new();
-        for k in (1..=head.len()).rev() {
-            let cand = format!("{base} {k}/{} {}", head.len(), &head[..k]);
-            if fits(&cand) {
-                shown = cand;
-                break;
-            }
-        }
-        if shown.is_empty() {
-            shown = base;
-        }
-        Ok(vec![
-            shown,
-            format!("OK {}", l10n::line_tiers(&report.counts)),
-        ])
-    }
-
-    /// 收藏册三个 tab 的**唯一**行生产者：菜单那三行、面板里点标题带换 tab、切语言后重建行
-    /// 三条路都从这里过 ⇒ 不存在"屏上是这一个 tab 的字、stderr 打的是另一个"。
-    ///
-    /// `Recent` 的条数 = [`panel::MAX_ROWS`] 减一（一屏正好装下，见
-    /// [`panel::collection_rows`] 那条"正解在调用方"的注释）；给多了不报错而是截断补
-    /// 「+N 更多」，那条分支是保险，不是主路径。
-    ///
-    /// `scale` 只有 `Missing` 那一支读（[`Gacha::missing_lines`] 按宽度折名字），另外两支
-    /// 的行与缩放无关。它和 [`Gacha::pull`] 的 `scale` 是同一个口径：**生产行的那一刻就知道
-    /// 自己要上哪块屏**，而不是画的时候再猜。
-    fn tab_lines(&self, tab: CollectionTab, lang: Lang, scale: f32) -> Result<Vec<String>, String> {
-        match tab {
-            CollectionTab::Owned => self.collection_lines(lang),
-            CollectionTab::Missing => self.missing_lines(lang, scale),
-            CollectionTab::Recent => self.recent_lines(lang, panel::MAX_ROWS - 1),
-        }
-    }
-}
-
-/// 逐件收藏册里**一件**要说的事（还没变成能画的行）。
-///
-/// 它刻意不是 `CatalogItem` 的引用：一件"装包来的池外件"（catalog 不认的 id）也要能进这张表，
-/// 而那时只有 id 字符串可说。
-///
-/// 一行点下去要去**哪张表**（P5 = 这一面第一次同时出现两套下标空间）。
-///
-/// 为什么不写成 `Option<usize>` 加一个"这是宠物还是配件"的布尔：那样能表示
-/// `{ index: Some(3), kind: Accessory }` 而 `candidates[3]` 其实是另一件东西 —— 也就是把"这个数字
-/// 属于哪张表"交给**旁表**去说，而旁表要跨 `show_panel` / `refresh_panel_rows` / `album_screen`
-/// 保持对齐（[`panel::PanelItem::Wear`] 那条注释立的同一条纪律，本项目为它付过学费）。判别式让
-/// "哪张表"和"下标"**必须一起写**，写错一张表就是编译错误而不是运行时的一次错穿。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AlbumTarget {
-    /// [`App::candidates`] 的下标 ⇒ 点它走 [`App::pick_and_wear`]。
-    Accessory(usize),
-    /// [`App::bodies`] 的下标 ⇒ 点它走 [`App::swap_body`]。⚠️ 与上面那个数字**不是同一个空间**。
-    Body(usize),
-    /// 只读行：未拥有 / 磁盘没产物 / 不 `fits` 本体 / 跨档在本体侧出局。
-    None,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AlbumEntry {
-    /// 这一行**此刻**点得动吗、点下去去哪张表。`None` = 只读行，屏上没有强调条（画师读的可点性
-    /// 正是这一格，见 [`card::paint_panel`]）。
-    target: AlbumTarget,
-    /// catalog 里的名字；catalog 不认这个 id 时退化成 id 本身（ASCII）—— 与
-    /// [`Gacha::recent_lines`] **同一个既有口径**，不是新洞。
-    name: String,
-    rarity: Rarity,
-    slot: Option<Slot>,
-    /// `kind == Pet` ⇒ 行尾打一个 ASCII `pet` 标。
-    ///
-    /// ⚠️ 它**不参与路由**（路由看 [`AlbumEntry::target`]）：P4 那一轮它同时是"为什么这一行永远
-    /// 不给下标"的理由（那时 `wear()` 解的是配件三件套，传一个宠物 id 进去在类型上合法而屏上什么
-    /// 都没有），P5 之后宠物有了自己的下标空间，这一格就只剩**排版**职责（行尾那个 `pet` 字）。
-    /// 留着一个不参与判定的布尔而它恰好和判别式同真是巧合不是约束 ⇒ 所以这里的注释要说清它不管什么。
-    kind_pet: bool,
-    /// 重复数 = `item_count − 1`，与 [`Gacha::collection_lines`] 同一个折算口径。
-    dup: u64,
-}
-
-/// 逐件那一本的行文本 = **一行一件**，宽度纪律立在产行的这一刻（[`Gacha::missing_lines`]
-/// 那条同族理由：必须问 [`menu::fit_to`] 本身，不许拿 [`menu::line_width`] 自己算）。
-///
-/// ⚠️ **预算按可点/只读分两档**：可点行让出左端那条强调条 ⇒ [`panel::ROW_LABEL_W`]（209），
-/// 只读行是 [`panel::ROW_TEXT_W`]（216）。**用错一档就是"生产者和排版各有各的账"**：按 216
-/// 裁出来的可点行送到 `menu::label_rect` 手里就差出一个汉字，被排版截成 `…`，而"这件叫什么"
-/// 是用户点它的唯一依据。
-///
-/// 装不下时**按 `dup` → `slot` 的顺序丢词**，最后只剩 `{RAR} {name}`，**绝不让 `card` 截成
-/// `…`**：丢掉的两个词都是"能从别处再读到"的信息（重复数在汇总那一行、挂点在换装页），
-/// 而一个 `…` 说的是"这件的名字我不知道"，那是假信息。
-/// 极端情况（名字本身就超预算）无词可丢 ⇒ 只能交给排版，那一条由
-/// `every_panel_row_is_sayable_and_never_truncated` 用**真 catalog 真三档缩放**当场量红，
-/// 不是靠这句注释保证。
-///
-/// 这里**不需要 `lang`**：token 全是 ASCII（`Rarity::as_str` / `Slot::as_str` /
-/// `ItemKind::as_str` / `x{dup}`）加上本来就在子集里的 catalog 名 ⇒ 逐件那几张行**与语言无关**，
-/// 而"签名里有、函数体不读"是本项目反复抓的形状（见 [`panel::collection_rows`] 那条同一纪律）。
-fn album_rows(entries: &[AlbumEntry], scale: f32) -> Vec<panel::PanelRow> {
-    entries
-        .iter()
-        .map(|e| {
-            let actionable = !matches!(e.target, AlbumTarget::None);
-            let width = if actionable {
-                panel::ROW_LABEL_W
-            } else {
-                panel::ROW_TEXT_W
-            };
-            let budget = menu::budget_for(width, scale);
-            let slot = e.slot.map(Slot::as_str);
-            let dup = if e.dup > 0 {
-                Some(format!("x{}", e.dup))
-            } else {
-                None
-            };
-            // 从"信息最全"往下退：① 全量 ② 丢重复数 ③ 再丢挂点 ④ 只剩档名 + 名字。
-            let render = |with_slot: bool, with_dup: bool| {
-                let mut s = String::from(e.rarity.as_str());
-                if with_slot {
-                    if let Some(sl) = slot {
-                        s.push(' ');
-                        s.push_str(sl);
-                    }
-                }
-                s.push(' ');
-                s.push_str(&e.name);
-                if e.kind_pet {
-                    s.push(' ');
-                    s.push_str(ItemKind::Pet.as_str());
-                }
-                if with_dup {
-                    if let Some(d) = &dup {
-                        s.push(' ');
-                        s.push_str(d);
-                    }
-                }
-                s
-            };
-            let ladder = [
-                render(true, true),
-                render(true, false),
-                render(false, false),
-            ];
-            let mut text = ladder[ladder.len() - 1].clone();
-            for cand in &ladder {
-                if menu::fit_to(cand, budget, scale) == *cand {
-                    text = cand.clone();
-                    break;
-                }
-            }
-            panel::PanelRow {
-                item: match e.target {
-                    AlbumTarget::Accessory(i) => panel::PanelItem::Wear(i),
-                    AlbumTarget::Body(i) => panel::PanelItem::Body(i),
-                    AlbumTarget::None => panel::PanelItem::Info,
-                },
-                text,
-            }
-        })
-        .collect()
-}
-
-/// 「点中一只宠物」要判的四档结论（**纯**版本；方法论与 [`PickWear`] 同一条：`App` 在没有
-/// compositor 的机器上构造不起来 ⇒ 判定必须先改写成写得出来、也测得出来的形状）。
-///
-/// 比配件那一族多一档 `Same` 而少一档 `AlreadyWorn` 的写法差别不是审美：**"身上已经是这只"
-/// 是一个不需要"穿着"这个前提的状态**（本体永远在，`worn` 那格才可能是 `None`），所以它的判据
-/// 是 `id` 而不是下标 —— 下标是`Body` 那套（[`App::bodies`]），而"当前是哪只"记在
-/// [`App::body_id`]。用下标比就会有两个"当前本体是谁"。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SwapBody {
-    /// 四道都过 ⇒ 走 [`App::swap_body`] 那九步。
-    Switch,
-    /// 点的就是当前这只 ⇒ 不解像素、不重投帧、**账也不写**（写一次 `body` 行等于给"没发生的
-    /// 那次换"留一条重启读数）。
-    Same,
-    /// 某一道没过 ⇒ 一个字都不动。带**那道的名字**，因为三道的文案是不同的事实：
-    /// "这一格根本没有这只"、"档不同所以运行时换不了"、"库存没验过拥有"是三句不同的回答。
-    Refused(&'static str),
-}
-
-/// [`SwapBody`] 的判定本体，四道的**顺序 = 便宜的、以及"错了会更贵"的在前**。
-///
-/// ⚠️ `same_grid` 排在库存那道**之前**，理由不是"更便宜"而是"更贵的那个错"：`atlas.reload`
-/// 自检的是"新 sheet 的像素尺寸 == `cols×cell_w, rows×cell_h`"，而那三个数仍是**旧**本体的
-/// （[`App::atlas`] 只在构造时由清单算出，`reload` 不动它们）。所以在档不同的时候，失败关闭
-/// 的形状是"白付一次读盘 + 一次解码尝试 + 一句几何错误"，而**赌赢**（两份 WebP 尺寸恰好相同）
-/// 的形状是"新像素配旧行表 ⇒ 屏上是一堆没人能解释的格子"。后者正是本项目反复要杀的静默。
-///
-/// 这一道的现实读数在扫盘那一步（[`check_body`] 第 ② 道 ⇒ 跨档的那只压根进不了
-/// [`App::bodies`]，收藏册里是只读行、点不到）。留在这里是**第二道保险**：唯一合法走到它的
-/// 调用者是"以后有人绕过发现直接往 `bodies` 里塞一只"，而那件事的读数只能来自单测。
-///
-/// `same_id` 排在最后（与 [`plan_pick_wear`] 把 `AlreadyWorn` 排在 `Refused` 之后同一个理由）：
-/// 三道门禁里任何一道没过都不该给出"已经是这一只"这句**听起来像成功**的话 —— 那会把"我为什么
-/// 点不动它"回答成一个不需要回答的问题。
-fn plan_swap_body(in_range: bool, gate_passes: bool, same_id: bool, same_grid: bool) -> SwapBody {
-    if !in_range {
-        return SwapBody::Refused("这一格不在本体库里（启动扫盘之后库被改过？）");
-    }
-    if !same_grid {
-        return SwapBody::Refused(
-            "格子档与当前本体不同 ⇒ 运行时不动 surface 尺寸 / 目标尺寸 / shm 池，跨档只能重启",
-        );
-    }
-    if !gate_passes {
-        return SwapBody::Refused(
-            "库存那道没过（未拥有，或给了 --db 而这一轮读不出库存）⇒ 没验过拥有不换",
-        );
-    }
-    if same_id {
-        return SwapBody::Same;
-    }
-    SwapBody::Switch
-}
-
-/// 「概率」那一屏要上屏的**五行整**：一行图例 + 四档各一行。
-///
-/// ⚠️ **这条路不碰库**，而且是故意的：它读的是编译期就嵌进二进制的 `rates.json`
-/// （`DEFAULT_RATES_JSON` = `RATES_ASSET` 那份，与 `catalog rates --out` 写的是同一个产物），
-/// 回答的是"承诺了什么"而不是"这次抽到了什么"。所以它**不需要** `ensure_gacha()` ——
-/// 让它去连库就等于"内存库的玩家读不到公示"，而公示对每个人都一样。
-///
-/// `Published::check` 是硬约束 #2（"概率必须与公示一致"）的守门人：文件与代码不一致时
-/// 这一行报**不一致**，而不是把那份已经在说谎的文件念给用户听。宁可不答，不可答错。
-///
-/// **五行 = `panel::MAX_ROWS - 1`**，一格余量都不留：这一面第六格固定是 `Close`，多一行
-/// 就得靠 `panel::collection_rows` 那条截断补「+N 更多」，而"你还没看到的第四档概率"被
-/// 截成一句话是这一屏最坏的失败形状。
-///
-/// 两处口径是明写的取舍（不是遗漏）：
-/// - **两位小数**（`{:.2}`）而不是 `percent_str` 的四位：`SSR 60.0000>57.0147` 一定超 240 px
-///   那一行的排版预算（§4 那次量化）。四位那一份没消失，它就在 `rates.json` 里。
-/// - 原先那行"公示口径 method=/视界=/format="**不再上屏也不进日志**：五行装不下它，而点
-///   「概率」要问的是"某一档多大概率"，不是"这份公示用什么口径推的"。
-///
-/// 写成**自由函数**（`Gacha` 与 `App` 都不碰）是为了让面板那两条门禁能直接吃到它：
-/// 这一批第一次把「概率」的字送进像素，而"每一行都画得出来而且不破版"这件事的入口是鼠标，
-/// 我绝不注入点击 ⇒ 它必须在 headless 里可调用。挂在 `App` 上就等于把自动化让给了真机。
-fn published_rates_lines(lang: Lang) -> Result<Vec<String>, String> {
-    let published = RatesFile::read(DEFAULT_RATES_JSON)?;
-    let effective = published.check(&GachaParams::V1)?;
-    // 百万分位 → 百分数。这里**只有**显示用的格式化碰浮点：`petcore` 里那份
-    // `percent_str` 走整数是为了公示字符串逐字符可复现（硬约束 #8），而这一行不进任何
-    // 重放契约，`{:.2}` 换来的排版余量才是这一屏要付的代价。
-    let pct = |w: u32| w as f64 / 10_000.0;
-    let mut lines = vec![format!("{} b>c", lang.t(Key::Rates))];
-    for r in Rarity::ALL {
-        lines.push(format!(
-            "{} {:.2}>{:.2}",
-            r.as_str(),
-            pct(published.base.weight(r)),
-            pct(effective.weight(r))
-        ));
-    }
-    Ok(lines)
-}
-
 pub fn run(opts: Options) -> Result<(), String> {
     // 设置只在**启动时读一次**（设计书 §4 禁止定时轮询 ⇒ 不做 watcher）。顺序固定：
     // 先说文件本身怎么样（坏语法要抢在生效值前面），再说生效值和它来自哪一层。
@@ -1104,8 +426,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     eprintln!("ui: 配置 {}", cfg.describe());
     // CLI 那两级开关此刻真的传进来了：`--lang`/`--motion` 给错值 = 报错退出（不是静默变默认），
     // 文件/环境变量给错值 = 出声后跳过那一级的 notice（两条路的区别与理由见 `settings.rs` 模块头）。
-    let settings =
-        settings::Settings::from_process(opts.lang.as_deref(), opts.motion.as_deref(), &cfg)?;
+    let settings = settings::from_process(opts.lang.as_deref(), opts.motion.as_deref(), &cfg)?;
     settings.announce();
 
     // 把本轮生效的语言写回 config，于是"首轮取系统语言、此后取上次退出语言"两条同时成立：
@@ -1613,190 +934,6 @@ fn discover_accessories(
         found.len(),
         if found.is_empty() {
             "（「穿上」不会有效果；把 `pack.py --accessory` 的三件套放进这里）"
-        } else {
-            ""
-        }
-    );
-    found
-}
-
-/// 本体库在哪 —— **只由环境决定**，与 [`accessory_root`] 是同一根规则的两个分支
-/// （`petstore::paths::AssetRoot`：`OPET_PETS` → `$XDG_DATA_HOME/opet/pets` →
-/// `$HOME/.local/share/opet/pets`）。**没有 `--pets` 命令行入口**：`--accessory` 已被用户删过
-/// 的那条先例（"配件不是应该由菜单选择吗"），本体侧同理，库位置是装机事实不是用户意图。
-fn pet_root() -> Option<std::path::PathBuf> {
-    petstore::paths::AssetRoot::resolve(ItemKind::Pet).map(|r| r.path)
-}
-
-/// 收藏册里一只**换得上去**的本体 = 一个通过全部发现门禁的目录（**一像素未解**）。
-///
-/// 与 [`Candidate`] 同族，但多一个 `leaked`：`Sim<'m>` 与 [`App::manifest`] 的类型是
-/// `&'static Manifest`，而这张表是**自己拥有**清单的 `Vec` ⇒ 借用活不到那一刻。
-/// `load_manifest`（`:1390`）那边是直接 `Box::leak` 一份，这里照同一条策略，但**延到第一次
-/// 真要换上它时才泄**并通过 [`BodyCandidate::leaked`] 缓存 ⇒ 一份进程内每只不同的宠物只泄一份
-/// （几 KB），不是每次换都泄一份。
-/// （不可行的另一条路：把清单存进一个 self-referential arena —— `QueueHandle<App>` 要求
-/// `App: 'static`，任何"挂在 `App` 里的借用"都构造不出来。）
-struct BodyCandidate {
-    /// 库存那一侧的身份 = **库目录名**（与 [`Candidate::id`] 同一条既有裁定：`inventory.item_id`、
-    /// P1 的 INV 门禁、`AssetDir::locate`、`equipped` 的 `body` 行认的都是这一个）。
-    id: String,
-    /// 清单里的 `slug` = `fits` 比的那个名字。⚠️ 它与 [`Self::id`] **可以不相等**，见
-    /// [`discover_pets`] 那行 ⚠（今天四份 @192 产物里三份的 slug 写着 `cat_shiro` 就是这一格）。
-    slug: String,
-    dir: std::path::PathBuf,
-    grid: Grid,
-    manifest: Manifest,
-    /// 本体自己的穿透轮廓（发现第 ④ 道解的，见 [`check_body`]）。
-    ///
-    /// **存下来而不是换的时候再解一次**：`App::swap_body` 的第 3 步于是没有任何 IO、不可能失败，
-    /// "新清单 + 旧轮廓"这个半换形状就构造不出来。代价是每只几 KB，相对一张 sheet 的 45 MiB 是零。
-    regions: Regions,
-    leaked: Option<&'static Manifest>,
-}
-
-impl BodyCandidate {
-    /// 第一次真要换上它时才 `Box::leak`，之后返缓存（字段说明里那三条理由）。
-    fn leaked(&mut self) -> &'static Manifest {
-        match self.leaked {
-            Some(m) => m,
-            None => {
-                let m: &'static Manifest = Box::leak(Box::new(self.manifest.clone()));
-                self.leaked = Some(m);
-                m
-            }
-        }
-    }
-
-    /// 那只本体的 sheet 路径（`Atlas::reload` 的唯一输入，**在**门禁之内**不在**扫盘里读）。
-    fn sheet(&self) -> std::path::PathBuf {
-        self.dir.join("sheet.webp")
-    }
-}
-
-/// [`discover_pets`] 的内层：一个目录 → 一只可换的本体，或一句点名它错在哪的说明。
-///
-/// 门禁按**便宜**排序（清单 → 档 → 存在性 → 轮廓），一像素都不解。与 [`check_accessory`]
-/// 同族，**两处故意不同**：
-///
-/// ② **格子档整块比较**（`Grid: PartialEq` 逐字段含 `cols/rows/w/h`），判据不是只比 `w/h`：
-///    `rows` 决定解码缓冲大小与 polygon 面，`cols` 决定寻址。跨档在**扫盘这一步**出局 ⇒
-///    收藏册那一行是只读、没有强调条（= P4 立好的形状，不是新发明）。为什么不在点击时报错：
-///    `layer.set_size` / `viewport.set_destination` / `SlotPool` 那三处只在 `run()` 里发生一次，
-///    运行时换档要走一遍 configure 往返；**启动允许跨档（surface 还没建），运行时不允许** ——
-///    这条不对称是协议限制不是数据模型限制。
-///
-/// ④ **没有**配件侧那道 `first_missing` 逐格轮廓覆盖检查。本体的 `region_rects` 有设计好的
-///    "整格兜底"，缺一格只是"点击面积稍大"；配件缺格是"帽子画在 region 外"。在这里照抄过来
-///    就是又一条**假门禁**（它会拒绝一堆画得对的本体）。
-fn check_body(dir: &std::path::Path, cur: &Grid) -> Result<BodyCandidate, String> {
-    let path = dir.join("pet.json");
-    let name = path.to_str().ok_or("本体清单路径不是 UTF-8")?;
-    // ① 清单本身。`Manifest::validate` 已覆盖 format / slug / `cols==8` / 格像素 / sheet 像素 /
-    //    `idle` 必在 / 状态名 / rows 越界 / fps / `anchor.feet` 在框内 / `outfit_anchors` /
-    //    `input_polygon` / facing ⇒ 这里不重复任何一道。
-    let manifest = Manifest::load(name).map_err(|e| format!("清单 {name} 加载失败: {e}"))?;
-    // ② 格子档（拍板② 的落点）。
-    if manifest.grid != *cur {
-        let (a, b) = (cur, &manifest.grid);
-        return Err(format!(
-            "拒绝本体 {}：格子档不同（当前 {}×{}、{} 列 × {} 行；这一份 {}×{}、{} 列 × {} 行）\
-             ⇒ 运行时换本体不动 surface 尺寸，跨档只能重启",
-            manifest.slug, a.w, a.h, a.cols, a.rows, b.w, b.h, b.cols, b.rows
-        ));
-    }
-    // ③ 两件伴生产物**存在**（不读内容 ⇒ 把 `discovery_never_touches_the_sheet…` 那条扩到宠物）。
-    for what in ["sheet.webp", "polygon.json"] {
-        if !dir.join(what).is_file() {
-            return Err(format!("拒绝本体 {}：目录里没有 {what}", manifest.slug));
-        }
-    }
-    // ④ 轮廓解得开（`Regions::load` 自己会交叉核对 polygon 的格尺寸 vs 清单）。
-    let polygon = dir.join("polygon.json");
-    let regions = Regions::load(
-        polygon.to_str().ok_or("本体 polygon 路径不是 UTF-8")?,
-        manifest.grid.w,
-        manifest.grid.h,
-        SURFACE_MARGIN,
-    )
-    .map_err(|e| format!("{}: {e}", polygon.display()))?;
-    Ok(BodyCandidate {
-        // 身份 = **目录名**，与配件侧同一条裁定（理由见 [`Candidate::id`] 那段）。
-        id: dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| format!("{} 的目录名不是合法 UTF-8 ⇒ 无法与库存对齐", dir.display()))?
-            .to_string(),
-        slug: manifest.slug.clone(),
-        dir: dir.to_path_buf(),
-        grid: manifest.grid,
-        regions,
-        leaked: None,
-        manifest,
-    })
-}
-
-/// 启动时扫一遍本体库 ⇒ 收藏册里**点得动**的那些宠物行（元数据 + 轮廓，一像素未解）。
-///
-/// 与 [`discover_accessories`] 同一条最要紧的语义：**这里一个 `Err` 都不出**。库里一只坏本体的
-/// 后果是"少一只可换"，不是"宠物起不来"（硬约束 3），每条跳过打一行点名它错在哪道的 stderr。
-///
-/// ⚠️ 起点本体**不要求**在这张表里：`--manifest` 仍是硬要求（`cli.rs:80` 不动），它退化成
-/// "库里没那一行时用什么"（拍板③）。所以这张表空 ⇒ 收藏册的宠物行全部只读，那是**正确行为**。
-fn discover_pets(root: &std::path::Path, cur: &Grid) -> Vec<BodyCandidate> {
-    let mut found: Vec<BodyCandidate> = Vec::new();
-    let entries = match std::fs::read_dir(root) {
-        Ok(rd) => rd,
-        Err(e) => {
-            eprintln!(
-                "pets: 库 {} 打不开（{e}）⇒ 收藏册里的宠物行点了不会有效果",
-                root.display()
-            );
-            return found;
-        }
-    };
-    // 排序理由与配件侧逐字相同：`read_dir` 的顺序由文件系统给，两次启动可能不同。
-    let mut dirs: Vec<std::path::PathBuf> = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.join("pet.json").is_file())
-        .collect();
-    dirs.sort();
-    for dir in dirs {
-        match check_body(&dir, cur) {
-            Ok(cand) => {
-                // 与配件侧同一行 ⚠（`:1557`）：不一致就是"库存按 A 记账、屏上叫 B"，而
-                // "为什么这只我抽到了却不让我换"问不出来。**拒绝文案点的是 `fits` 或档，不是这个。**
-                if cand.id != cand.slug {
-                    eprintln!(
-                        "pets:   ⚠ 目录名 {} 与清单 slug {} 不一致 ⇒ 库存按 {} 记账、屏上叫 {}",
-                        cand.id, cand.slug, cand.id, cand.slug
-                    );
-                }
-                eprintln!(
-                    "pets:   {}（{}）换得上去 · {}×{} {}列×{}行 · 轮廓 {} 格 · sheet 未解（点上才读）",
-                    cand.id,
-                    cand.slug,
-                    cand.grid.w,
-                    cand.grid.h,
-                    cand.grid.cols,
-                    cand.grid.rows,
-                    cand.regions.frame_count()
-                );
-                found.push(cand);
-            }
-            Err(err) => eprintln!(
-                "pets: 跳过 {}（{}）⇒ 这一只在收藏册里是只读行，其余不受影响",
-                dir.display(),
-                err
-            ),
-        }
-    }
-    eprintln!(
-        "pets: 库 {} ⇒ {} 只可换{}",
-        root.display(),
-        found.len(),
-        if found.is_empty() {
-            "（宠物行全部只读；把 `tools/pack.py` 的三件套放进这里）"
         } else {
             ""
         }
@@ -5319,6 +4456,17 @@ delegate_registry!(App);
 mod tests {
     use super::*;
 
+    // 报表层上提 `overlay-report`（M7-b0）之后，这一族名字**只剩测试在读**：生产它们的代码
+    // 不在本文件了，而 lib 里的调用点靠类型推断、不点名。留在顶层 `use` 会报 unused ⇒
+    // 显式提到这里，等于把"这些是门禁的仪器，不是产品的路径"写在形状上。
+    use crate::l10n::Key;
+    use overlay_report::{AlbumEntry, AlbumTarget, check_body};
+    // M7-d 起 `Store` 也从 lib 转到这里：`db_body_row` 上了共用层，lib 不再点名它，
+    // 而 `real_archive_is_written_and_replays_the_chain` 要按 `Store` 重开存档。
+    use petcore::assets::Grid;
+    use petcore::gacha::{Catalog, Currency, ItemKind, Owned, Rarity, Slot};
+    use petstore::Store;
+
     /// 从结果卡的明细行里切出**名字那一段**，切不出来返回 `None`。
     ///
     /// 行形状 = `"{档} {name} {tag}"`（`l10n::line_item`），而 `menu::fit` 可能把尾巴截成一个
@@ -5746,12 +4894,20 @@ mod tests {
         // （`swap_body` 里算 `same_grid` 那一句）。放松任何一处的后果都不是"报错"而是
         // **换上一只像素错位的新本体**（`rows` 决定解码缓冲长度，`cols` 决定寻址），
         // 而那在屏上是一只能看的宠物 —— 只有这两条 + `atlas.reload` 的长度自检能红。
+        //
+        // ⚠️ **M7-b0 起那两处文本不在同一个文件里了**：`check_body` 随报表层上提
+        // `overlay-report`（两家客户端共用同一条扫盘），所以第一条读的是**那边**的源码文本。
+        // 走 `include_str!` 而不是 `fs::read_to_string`：路径写错 = **编译不过**，
+        // 而运行时读文件失败会让这条门禁静默变成"只查剩下那一条"—— 那正是本项目对假绿
+        // 的处置口径（要另开一条更严的，不是放宽）。两条仍然必须在**同一处**并排，
+        // 分开放就等于把"两道"这条判据交给记忆。
+        let scan = include_str!("../../overlay-report/src/bodies.rs");
         assert_eq!(
-            code.matches("manifest.grid != *cur").count(),
+            scan.matches("manifest.grid != *cur").count(),
             1,
             "扫盘那道档门禁不是整块 `Grid` 比较了（实际 {} 处）⇒ 判据放松成 `w/h` 的那一天，\
              行表不同的本体会被放进来",
-            code.matches("manifest.grid != *cur").count()
+            scan.matches("manifest.grid != *cur").count()
         );
         assert_eq!(
             code.matches("b.grid == self.manifest.grid").count(),

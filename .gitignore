@@ -32,5 +32,9 @@
 # CLI 会话在本项目目录里落的工作产物，与代码无关
 /.qoder/
 
+# 真机/Wine 试验轮的临时存档与配置（Wine 走 Z:\home\jun\...\scratch\m7g.db 这种形制路径），
+# 与 dist/ 同理：证据已经归档在 ~/.local/share/opet/scratch 的日志里，二进制存档不入库
+/scratch/
+
 # Python 字节码：tools/*.py 是入库脚本，编译检查或 import 会就地生成 __pycache__
 __pycache__/

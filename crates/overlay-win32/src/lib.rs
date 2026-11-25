@@ -36,6 +36,8 @@
 //! | [`windx`] | 否（`lParam` 的打包与 UTF-16 都只碰 `isize` / `i32` / `Vec<u16>`；入口那个 `isize` 是 `LPARAM` 的本体，第 8 步实测：windows-sys 0.60 的 `LPARAM` **就是** `isize` 而不是指针） | 有符号 `GET_X_LPARAM`、NUL 终止符、零填充字段截断、坏码元 lossy 不 panic |
 //! | [`dress`] | **否** —— `Store` / `AssetRoot` / `Atlas` 全跨平台 | **换装那一族的落库与扫盘**：演示态一个字都不写、真库写下而屏上是同一件、库里那一行被删/被手工塞坏的处置、配件三件套的门禁与排序（M5e 把 `Gacha` 从 `app::win` 搬进来，就是为了这一段有读数） |
 //! | [`summary`] | **只在两个采集函数里**（`HANDLE` / `FILETIME` / `PROCESS_MEMORY_COUNTERS_EX`，都不点名窗口类型） | **摘要正文全套测例**：三根 grep token、恒 0 档的 inline 标注、"没链进来"不许写成 `0`、占比分母 |
+//! | [`settings`] | **否** —— 只搬 `petstore::config` 的那两个字符串与两个环境变量 | **生效值链的装载面**：四个语言码 / 三个动画码写下去再读回来是不是同一个值、reader 落点是 Windows 那条三档阶梯而**不是** unix 链 |
+//! | [`probe`] | **只在 `collect` 的 Windows 支里**（`GetModuleHandleW`/`GetProcAddress`/`GetDpiForSystem` + `monitor::enumerate`） | **报表正文与判据全套**：四节顺序、留白那一节复用启动自己那份数学、"读不到"不许写成 `0`、DPI 档由符号表而不版本号定、判定行那三个独立输入 |
 //! | `window` / `monitor` / `app` | **是** | 只到 `cargo check --target x86_64-pc-windows-gnu` |
 //!
 //! ⚠️ [`dress`] 是这一张表**唯一因"测试看得见"而存在**的新块：`app.rs` 整块 `#[cfg(windows)]`
@@ -63,13 +65,24 @@
 //! 是进程计数（`HANDLE`/`FILETIME`）—— 两者都**不碰窗口**，且各自整个待在 `#[cfg(windows)]`
 //! 里，所以"业务模块拿不回宿主"这条防线没有被削弱：`summary.rs` 的**格式化**部分照样在
 //! Linux 上跑（上表那一行）。⇒ 判"有没有破规矩"的方法是问"这个 OS 类型是不是窗口/合成类的"，
-//! 不是数文件名。
+//! 不是数文件名。`probe.rs` 同一条判据下是干净的：它查的是"`UpdateLayeredWindow` 这个名字在不在
+//! `user32` 的导出表里"（`GetProcAddress` + 字节串）⇒ **读符号存在性，不链接它**，所以它既不碰
+//! 窗口，也没有给 DLL 导入表添一个新名字。
 //!
 //! ## 范围之外（别在这里找）
 //!
-//! 第二批已接进来的是：右键菜单（M5c）、配件换装（M5e）与抽卡 + 结果卡面（M6，见 [`dress`]）。
-//! 剩下的**收藏册面板**与 `--lang`/`--motion`/`--probe` 转真（M7）、托盘、`opet ctl` 控制面
-//! —— 用户 2026-11-21 第 2 条拍板把它们排除在本批之外。它们的**命令行入口也没有**，而且不是
+//! 已经接进来的是：右键菜单（M5c）、配件换装（M5e）、抽卡 + 结果卡面（M6，见 [`dress`]）、
+//! **面板那块面**（M7b：设置页 + 收藏册三本，与菜单互斥，`app.rs` 的 `PanelState` 那一节）、
+//! 收藏册上那两格动作（M7c 点名 P4 = `pick_and_wear`、M7d 换本体 P5 = `swap_body` +
+//! `--allow-unowned-pets` 转真），以及 **`--lang`/`--motion` 那一条配置链**（M7e：[`settings`]
+//! 装载 → 共用层 [`overlay_common::settings`] 那条唯一优先级链 → 点一行当场 `write_ui_key` 写回
+//! Windows 那条三档阶梯，退出摘要里那一行 `ui: lang = …` 就是它的生效值）、
+//! **`--probe` 那份只读诊断**（M7f：[`probe`] 的四节 = 监视器 / DPI / 留白 / 分层窗口符号，
+//! 答的是"这台机器画得出分层窗口的宠物吗"，而不是"这里有没有 layer-shell"）。
+//! **屏上从此没有"点了不会办事"的格子。**
+//! 剩下的是 [`probe`] 在真机上的那一轮读数（M7f 的**代码**已落地，四格读数在 Wine/Win11 上还欠）
+//! 与安装面：托盘、NSIS、`opet ctl` 控制面、命中滞回
+//! —— 用户 2026-11-21 第 2 条拍板把最后一族排除在那一批之外。它们的**命令行入口也没有**，而且不是
 //! 忘了：[`cli`] 里那张 `REFUSED` 表逐条点名理由，绝不"能解析、没人读"
 //! （`--cell` 那一族假开关是本项目登记过的债）。
 
@@ -77,6 +90,8 @@ pub mod app;
 pub mod cli;
 pub mod dress;
 pub mod layout;
+pub mod probe;
+pub mod settings;
 pub mod stage;
 pub mod summary;
 pub mod windx;

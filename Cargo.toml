@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/petcore",
     "crates/overlay-common",
+    "crates/overlay-report",
     "crates/overlay-wayland",
     "crates/overlay-win32",
     "crates/petstore",
@@ -107,6 +108,10 @@ windows-sys = { version = "=0.61.2", features = [
 petcore = { path = "crates/petcore" }
 petstore = { path = "crates/petstore" }
 overlay-common = { path = "crates/overlay-common" }
+# 报表与库扫描层（M7-b 前置上提）：`petcore` + `petstore` + `overlay-common` 的下游，零平台绑定。
+# 它不能并进 overlay-common（那边只允许 petcore + 排版那几个，`rusqlite` 一进来就破"零 IO"），
+# 也不能并进 petstore（那一层不该知道 `menu::fit_to` 与词表）。
+overlay-report = { path = "crates/overlay-report" }
 overlay-wayland = { path = "crates/overlay-wayland" }
 # 图集解码。**版本收在 workspace 一处**的理由与 overlay-common 的立身之本同一条：
 # 编解码器换一版 = 换一份解码字节 = 各平台屏上的像素漂移，而没有任何门禁会替你说"两边不同了"。

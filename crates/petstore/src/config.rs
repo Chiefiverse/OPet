@@ -6,9 +6,9 @@
 //! 库来做，自写 writer 会把用户手写的注释刷平。两边不是同一套实现，正是那条往返测试要钉的东西。
 //!
 //! 值一律**原样返回字符串**，本模块不解释语义。`lang` 认不认得由
-//! [`overlay_wayland::l10n::Lang::parse`] 判，`motion` 由
-//! [`overlay_wayland::settings::Motion::parse`] 判 —— 反过来（这里就解释值）会让
-//! `petstore` 依赖 UI 侧的枚举，而 UI 侧已经依赖 `petstore`。
+//! `overlay_common::l10n::Lang::parse` 判，`motion` 由
+//! `overlay_common::ui::settings::Motion::parse` 判（两个都在绘制层，2026-11-22 上提）——
+//! 反过来（这里就解释值）会让 `petstore` 依赖 UI 侧的枚举，而 UI 侧已经依赖 `petstore`。
 //!
 //! ## 为什么"绝不静默"是这一条的主线
 //!
@@ -22,10 +22,19 @@
 //!
 //! ## 路径回退与 `paths.rs` 同一条规则
 //!
-//! `$XDG_CONFIG_HOME/opet/config.toml` → `$HOME/.config/opet/config.toml`。**相对值的
-//! `XDG_CONFIG_HOME` 按 XDG 规范等于没设**，继续回退 —— 与 [`crate::DbPath`] 完全一致，
-//! 刻意由测试 `config_path_follows_the_same_xdg_rule_as_the_archive` 钉住两边同形，
-//! 免得将来一处改了另一处没改（那就是"两套 XDG 语义"）。
+//! **unix 链**：`$XDG_CONFIG_HOME/opet/config.toml` → `$HOME/.config/opet/config.toml`。
+//! **Windows 链**（M7e 起）：`%LOCALAPPDATA%\opet\config.toml` → `%APPDATA%\opet\config.toml` →
+//! `%USERPROFILE%\opet\config.toml`。两条链与 [`crate::DbPath`] / [`crate::AssetRoot`] 完全同族：
+//! 目录变量必须是**该平台形制的绝对路径**才算，相对值等于没设，继续回退。
+//! ⚠️ **Windows 那三档查的是 `paths::is_windows_absolute`（盘符 / UNC），不是
+//! `Path::is_absolute`** —— 后者在 unix 上判 `C:\x` 为假、在 Windows 上判 `/tmp/x` 为真，
+//! 用它就让"哪一档赢"变成"在哪个平台上编译"的函数，而那件事在 [`Config::read_on`] 是**参数**。
+//! 由测试 `config_path_follows_the_same_xdg_rule_as_the_archive`（unix 侧）与
+//! `the_windows_config_chain_is_a_strict_ladder`（Windows 侧）钉住两边各自同形。
+//!
+//! 分岔只有 [`Config::read`] / [`write_ui_key`] 这两处（各写一次 `cfg!(windows)`），其余入口
+//! (`read_in` / `read_windows_in` / `read_on`) 都吃显式平台参数 —— 与 `paths.rs` 那条
+//! "分岔本身是参数，所以宿主测例钉得住"的纪律逐字同形。
 //!
 //! ⚠️ **回写走 [`write_ui_key`]，且只回写 `[ui] lang` / `[ui] motion` 这两个键**。写的时候
 //! 一次只碰那一个键、把它的 decor 原样摘贴回去，所以用户手写的注释与不认识的段都不动。
@@ -82,10 +91,20 @@ impl UiKeys {
 }
 
 /// 一次解析所需的环境变量快照（注入式，理由同 `paths::Env`：进程环境是并行测试的雷区）。
+///
+/// ⚠️ 这张表**不点名平台**（与 [`crate::paths::Env`] 同一条纪律）：unix 链读前两个、
+/// Windows 链读后三个，各自只看自己那几个 ⇒ "同一份快照在两个平台上各落到哪个文件"
+/// 在宿主上就测得到（见 `the_windows_config_chain_is_a_strict_ladder`）。
 #[derive(Clone, Debug, Default)]
 pub struct ConfigEnv {
     pub xdg_config_home: Option<String>,
     pub home: Option<String>,
+    /// `%LOCALAPPDATA%`（Windows 链第一档；unix 上恒 `None`，读了也不进 unix 链）。
+    pub local_appdata: Option<String>,
+    /// `%APPDATA%`（roaming）。
+    pub appdata: Option<String>,
+    /// `%USERPROFILE%`（Windows 的"家"，与 unix 的 `home` **各读各的变量**）。
+    pub userprofile: Option<String>,
 }
 
 impl ConfigEnv {
@@ -94,14 +113,29 @@ impl ConfigEnv {
         Self {
             xdg_config_home: grab("XDG_CONFIG_HOME"),
             home: grab("HOME"),
+            // 三条 Windows 变量在 unix 上恒 None ⇒ 无条件读，不为不存在的变量写 cfg 分支。
+            local_appdata: grab("LOCALAPPDATA"),
+            appdata: grab("APPDATA"),
+            userprofile: grab("USERPROFILE"),
         }
     }
 
-    /// 只给路径回退用的环境变量（测试注入形状）。
+    /// 只给 unix 链那两级回退用的环境变量（测试注入形状）。
     pub fn with(xdg: Option<&str>, home: Option<&str>) -> Self {
         Self {
             xdg_config_home: xdg.map(String::from),
             home: home.map(String::from),
+            ..Self::default()
+        }
+    }
+
+    /// 只给 Windows 链那三级回退用的环境变量（同一族的测试注入形状）。
+    pub fn with_windows(local: Option<&str>, app: Option<&str>, user: Option<&str>) -> Self {
+        Self {
+            local_appdata: local.map(String::from),
+            appdata: app.map(String::from),
+            userprofile: user.map(String::from),
+            ..Self::default()
         }
     }
 }
@@ -117,12 +151,31 @@ pub struct Config {
 }
 
 impl Config {
+    /// 按**当前平台**的链读那份文件（`cfg!(windows)` 在本文件里只出现两次：这里与
+    /// [`write_ui_key`]）。测试一律走 [`read_in`](Self::read_in) /
+    /// [`read_windows_in`](Self::read_windows_in)，把平台做成显式入参而不是依赖编译目标。
     pub fn read() -> Self {
-        Self::read_in(&ConfigEnv::from_process())
+        Self::read_on(&ConfigEnv::from_process(), cfg!(windows))
     }
 
+    /// unix 链：`$XDG_CONFIG_HOME/opet/config.toml` → `$HOME/.config/opet/config.toml`。
     pub fn read_in(env: &ConfigEnv) -> Self {
-        let path = config_path(env);
+        Self::read_at(config_path(env))
+    }
+
+    /// Windows 链：`%LOCALAPPDATA%` → `%APPDATA%` → `%USERPROFILE%`（见 [`config_path_windows`]）。
+    pub fn read_windows_in(env: &ConfigEnv) -> Self {
+        Self::read_at(config_path_windows(env))
+    }
+
+    /// **分岔本身是参数**：与 [`crate::paths::DbPath::resolve_on`] 同一个形状、同一个理由 ——
+    /// 分岔写错在真机上的形状是"Windows 去读了一棵 unix 拼法的树"，而它编译得过。
+    pub fn read_on(env: &ConfigEnv, on_windows: bool) -> Self {
+        Self::read_at(config_path_on(env, on_windows))
+    }
+
+    /// 两条链的**共同**读法：路径已由链定好，这里只管"存在 / 不存在 / 读不出来"三档。
+    fn read_at(path: PathBuf) -> Self {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let (ui, notices) = parse(&text, &path);
@@ -189,6 +242,46 @@ fn config_path(env: &ConfigEnv) -> PathBuf {
         .join("config.toml")
 }
 
+/// Windows 链，与 [`crate::paths::DbPath::resolve_windows_in`] /
+/// [`crate::AssetRoot::resolve_windows_in`] 同一条三档阶梯：
+/// `%LOCALAPPDATA%\opet\config.toml` → `%APPDATA%\opet\config.toml` →
+/// `%USERPROFILE%\opet\config.toml`。
+///
+/// 为什么 Windows 上配置文件与资产/存档**同一个根族**而不是 `%APPDATA%` 优先：这三个东西是
+/// 同一件事的三面（这台机器上这个用户的 OPet 状态），分散到两处会让"备份我的宠物设置"变成
+/// 两句回答。而 `%LOCALAPPDATA%` 打头 = 与 `opet.db`、`pets/` 同一档，用户在资源管理器里
+/// 打开一个目录就能看全。
+///
+/// ⚠️ 与 unix 链的**唯一**不对称：这里**没有** `~/.config` 那一形。Windows 上 `$HOME` 不存在
+/// （Wine 会造一个，但那是 Wine 的事，见 `docs/DESIGN.md` 里"D5 Wine 判不了"那条纪律），
+/// 拿 unix 拼法兜底只会建出一棵没人读的树。三档全不可用 ⇒ 兜底是 `%USERPROFILE%` 的空值拼法，
+/// 路径变成**相对**的 `opet\config.toml`，而 [`Config::describe`] 照样把它打出来 —— 那一行就是
+/// 用户看出"这台机器上根没解析出来"的唯一入口（同 `DbPath` 的 `UserProfile` 兜底档）。
+fn config_path_windows(env: &ConfigEnv) -> PathBuf {
+    for value in [
+        env.local_appdata.as_ref(),
+        env.appdata.as_ref(),
+        env.userprofile.as_ref(),
+    ] {
+        if let Some(v) = value.filter(|v| crate::paths::is_windows_absolute(v.as_str())) {
+            return PathBuf::from(v).join("opet").join("config.toml");
+        }
+    }
+    PathBuf::from(env.userprofile.clone().unwrap_or_default())
+        .join("opet")
+        .join("config.toml")
+}
+
+/// 选链 = 参数（理由见 [`Config::read_on`]）。`cfg!` 只在 [`Config::read`] 与
+/// [`write_ui_key`] 两处出现。
+fn config_path_on(env: &ConfigEnv, on_windows: bool) -> PathBuf {
+    if on_windows {
+        config_path_windows(env)
+    } else {
+        config_path(env)
+    }
+}
+
 /// 对账时要读回的那一个键。抽出来是因为 writer 里有**两处**都要问同一个问题（落盘前的
 /// 字节、落盘后的磁盘），两处各写一遍 `match` 早晚漂移成两个键。
 fn reads_back(key: &str, ui: &UiKeys) -> Option<String> {
@@ -198,12 +291,34 @@ fn reads_back(key: &str, ui: &UiKeys) -> Option<String> {
     }
 }
 
-/// 写回 `[ui]` 的一个键，**用进程环境**（与 [`Config::read`] 对称）。
+/// 写回 `[ui]` 的一个键，**按当前平台的链**（与 [`Config::read`] 对称：读的是哪个文件，
+/// 写的就是哪个文件 —— 两条链各算各的会写出"设置存到 A、下次从 B 读"那对幽灵）。
 pub fn write_ui_key(key: &str, value: &str) -> Result<PathBuf, String> {
-    write_ui_key_in(&ConfigEnv::from_process(), key, value)
+    write_ui_key_on(&ConfigEnv::from_process(), cfg!(windows), key, value)
 }
 
-/// 写回 `[ui] lang` / `[ui] motion`，其余一概不碰（设计书 §9.2 第 19 条）。
+/// unix 链的写回（`$XDG_CONFIG_HOME` → `$HOME/.config`）。
+pub fn write_ui_key_in(env: &ConfigEnv, key: &str, value: &str) -> Result<PathBuf, String> {
+    write_ui_key_at(config_path(env), key, value)
+}
+
+/// Windows 链的写回（`%LOCALAPPDATA%` → `%APPDATA%` → `%USERPROFILE%`）。
+pub fn write_ui_key_windows_in(env: &ConfigEnv, key: &str, value: &str) -> Result<PathBuf, String> {
+    write_ui_key_at(config_path_windows(env), key, value)
+}
+
+/// 选链 = 参数（同 [`Config::read_on`]）。
+pub fn write_ui_key_on(
+    env: &ConfigEnv,
+    on_windows: bool,
+    key: &str,
+    value: &str,
+) -> Result<PathBuf, String> {
+    write_ui_key_at(config_path_on(env, on_windows), key, value)
+}
+
+/// 写回 `[ui] lang` / `[ui] motion`，其余一概不碰（设计书 §9.2 第 19 条）。两条链的**共同**
+/// 写法：`path` 已经由链定好，这里不再算路径。
 ///
 /// 五条规则，每一条都是"违反了就等于把用户的文件弄坏"：
 /// · **只改那一个键**：注释、空行、`[render]` 那些本轮不生效的段必须逐行活着 ⇒ 所以读改写
@@ -214,11 +329,13 @@ pub fn write_ui_key(key: &str, value: &str) -> Result<PathBuf, String> {
 /// · **落盘前先用我们的 reader 判一次**那串要写出的字节（[`parse`]）：读不回同一个值就**在碰
 ///   磁盘之前**退出 ⇒ 那条报错说"文件未改动"是真话。抓的是 `ui = { lang = "zh" }` 这种
 ///   TOML 合法而我们的 reader 不认的形状；
-/// · **落盘后再从磁盘读回来对账**（[`Config::read_in`]，**两处都绝不用 `toml_edit` 再 parse
-///   一遍自验** —— 那等于用写它的库证明它写对了）。第二次判的东西和第一次不同：同目录里被
+/// · **落盘后再从**那个文件**读回来对账**（[`Config::read_at`]，**两处都绝不用 `toml_edit` 再
+///   parse 一遍自验** —— 那等于用写它的库证明它写对了）。第二次判的东西和第一次不同：同目录里被
 ///   并发改写、rename 没换成功，只有"真在文件上的字节"这一侧看得见，而那一次已经改过文件 ⇒
 ///   所以它的报错只能说"已写出而读不回"，不能说"原样"。
-pub fn write_ui_key_in(env: &ConfigEnv, key: &str, value: &str) -> Result<PathBuf, String> {
+///   ⚠️ M7e 起这里读的是**传进来的那个 `path`**，不是"再按环境算一次路径"：链有了两条，
+///   重算一次就可能读到另一条链的文件，那句"从磁盘读回来"于是变成假话。
+fn write_ui_key_at(path: PathBuf, key: &str, value: &str) -> Result<PathBuf, String> {
     if !UI_KEYS.contains(&key) {
         return Err(format!(
             "`{key}` 不是 [{SECTION_UI}] 的键（本轮只认 {UI_KEYS:?}）⇒ 没有写任何东西"
@@ -229,7 +346,6 @@ pub fn write_ui_key_in(env: &ConfigEnv, key: &str, value: &str) -> Result<PathBu
             "`{key}` 的值为空 ⇒ 拒绝写回（空值会被 reader 判成\"未设置\"并出声，写进去只是把用户原来的设置抹掉）"
         ));
     }
-    let path = config_path(env);
     let at = path.display().to_string();
 
     // 已存在的文件读不出来 = 拒绝，不是"当没有文件重写一份"。
@@ -292,9 +408,11 @@ pub fn write_ui_key_in(env: &ConfigEnv, key: &str, value: &str) -> Result<PathBu
         format!("{at}: 落盘失败（{e}）⇒ 原文件未改动")
     })?;
 
-    // 再从**磁盘**读回一次：前面那次判的是"要写的字节"，这一次判的是"真在那个文件上的字节"
-    // （同一目录里被别人同时改写、rename 语义、临时文件没换成功，都只有这一侧看得见）。
-    let back = Config::read_in(env);
+    // 再从**磁盘上那个文件**读回一次：前面那次判的是"要写的字节"，这一次判的是"真在那个文件
+    // 上的字节"（同一目录里被别人同时改写、rename 语义、临时文件没换成功，都只有这一侧看得见）。
+    // ⚠️ 读的是 `path` 而**不是**"再按环境算一次"：链有了两条之后，重算可能落到另一个文件，
+    // 那一句"从磁盘读回来"就变成假话（M7e 加 Windows 链时改的就是这一格）。
+    let back = Config::read_at(path.clone());
     let got = reads_back(key, &back.ui);
     if got.as_deref() != Some(value) {
         return Err(format!(
@@ -403,7 +521,7 @@ fn parse(text: &str, path: &Path) -> (UiKeys, Vec<String>) {
             ));
             continue;
         }
-        // 认到的键**故意不打印**（生效值与来源由 `overlay_wayland::settings` 那一条摘要出）；
+        // 认到的键**故意不打印**（生效值与来源由 `overlay_common::ui::settings` 那一条摘要出）；
         // 这里只记行数，用来点名重复键打架的两行。
         if !ui.set(&key, value) {
             notices.push(format!(
@@ -527,6 +645,140 @@ mod tests {
             rel.path,
             db.path
         );
+    }
+
+    /// Windows 链是一条**严格阶梯**：四个档位各问一次"谁赢"。
+    ///
+    /// ⚠️ 这一族是**纯字符串**断言，样本是假路径（`C:\Users\…`）。宿主上**不许**伪造一个
+    /// "看着能跑"的真写盘：`tempdir()` 是 `/tmp/…` 而 `is_windows_absolute` 判它不算 ⇒ 链会
+    /// 落到兜底档，测的就不是那一档了；UNC 拼法更会在仓库 cwd 里长出反斜杠目录。
+    /// **`%LOCALAPPDATA%` 上真长出字节那一格登记给 Wine 轮（M7-g），不在这里当通过。**
+    /// 比较一律走"两边同一个 `join` 建出来的 `PathBuf`"而**不比字符串** ⇒ unix / Windows
+    /// 宿主同绿（分隔符是宿主的事，不是这条规则的事）。
+    #[test]
+    fn the_windows_config_chain_is_a_strict_ladder() {
+        let local = r"C:\Users\jun\AppData\Local";
+        let roam = r"C:\Users\jun\AppData\Roaming";
+        let user = r"C:\Users\jun";
+        let at = |root: &str| PathBuf::from(root).join("opet").join("config.toml");
+
+        assert_eq!(
+            config_path_windows(&ConfigEnv::with_windows(
+                Some(local),
+                Some(roam),
+                Some(user)
+            )),
+            at(local),
+            "三档齐 ⇒ %LOCALAPPDATA% 赢（与 `opet.db`、`pets/` 同一个根）"
+        );
+        assert_eq!(
+            config_path_windows(&ConfigEnv::with_windows(None, Some(roam), Some(user))),
+            at(roam),
+            "缺 %LOCALAPPDATA% ⇒ 退 %APPDATA%"
+        );
+        assert_eq!(
+            config_path_windows(&ConfigEnv::with_windows(None, None, Some(user))),
+            at(user),
+            "只剩 %USERPROFILE%"
+        );
+        assert_eq!(
+            config_path_windows(&ConfigEnv::with_windows(Some(""), Some(roam), Some(user))),
+            at(roam),
+            "空串 = 没设 ⇒ 不许拼出 `\\opet\\config.toml` 这种无根路径"
+        );
+    }
+
+    /// 判"什么算绝对"用的是 [`crate::paths::is_windows_absolute`] 而**不是**
+    /// `Path::is_absolute`。这个区别不是风格：后者在 unix 上认 `/home/jun` 绝对、在 Windows 上
+    /// 不认 `C:\…` 绝对 ⇒ "哪一档赢"会变成"在哪个平台编译"的函数，而 `petstore` 两边都要编。
+    /// 与库根/存档共用同一条判据（`paths::resolve_windows_in`），两处各写一遍迟早漂移成
+    /// "库在 %LOCALAPPDATA% 而配置在别处"。
+    #[test]
+    fn the_windows_chain_only_accepts_values_that_are_windows_absolute() {
+        let unc = r"\\nas\opet";
+        let user = r"C:\Users\jun";
+        // 盘符相对（`C:foo`）随"该盘的当前目录"变，绝不能当根
+        assert_eq!(
+            config_path_windows(&ConfigEnv::with_windows(
+                Some("C:foo"),
+                Some(unc),
+                Some(user)
+            )),
+            PathBuf::from(unc).join("opet").join("config.toml"),
+            "`C:foo` 不算 ⇒ 让给下一档（UNC 算）"
+        );
+        // unix 形制（Wine 会造一个 $HOME，真 Windows 不会）在这条链上不算
+        assert_eq!(
+            config_path_windows(&ConfigEnv::with_windows(
+                Some("/home/jun"),
+                None,
+                Some(user)
+            )),
+            PathBuf::from(user).join("opet").join("config.toml"),
+            "`/home/…` 不是 Windows 绝对 ⇒ 退 %USERPROFILE%"
+        );
+    }
+
+    /// 三档全不可用 ⇒ 兜底**保留** `%USERPROFILE%` 的原始值（哪怕它不成绝对路径），而不是静默
+    /// 变成空串。理由：[`Config::describe`] 打的那一行是用户看出"这台机器上根没解析出来"的唯一
+    /// 入口，抹平它 = 症状消失而病还在（同 `DbPath` 的 `UserProfile` 兜底档）。
+    #[test]
+    fn the_windows_fallback_keeps_the_unusable_value_instead_of_silently_emptying_it() {
+        let p = config_path_windows(&ConfigEnv::with_windows(
+            Some("Local"),
+            Some("Roaming"),
+            Some("C:relative"),
+        ));
+        assert_eq!(
+            p,
+            PathBuf::from("C:relative").join("opet").join("config.toml"),
+            "兜底要用 %USERPROFILE% 的原值，不许换成空串或 `opet\\config.toml`"
+        );
+        assert!(
+            !crate::paths::is_windows_absolute(&p.to_string_lossy()),
+            "这一格测的就是'它确实不可用'：兜底档不是 Windows 绝对 ⇒ 只能靠 describe 出声"
+        );
+        assert_eq!(
+            config_path_windows(&ConfigEnv::with_windows(None, None, None)),
+            PathBuf::from("").join("opet").join("config.toml"),
+            "三个变量全无 = 相对 `opet\\config.toml`（同 DbPath 的空兜底）"
+        );
+    }
+
+    /// 选链是**参数**不是编译目标：同一份 `ConfigEnv`（五种变量全填）喂 `read_on` 的两边，
+    /// 必须各拿各的文件。`cfg!(windows)` 在本文件里只许出现在 [`Config::read`] 与
+    /// [`write_ui_key`] 两处 ⇒ 除此之外任何"平台自己决定"的路径都是没接线的第三条链。
+    #[test]
+    fn the_two_chains_are_one_env_apart_and_nothing_else() {
+        let env = ConfigEnv {
+            xdg_config_home: Some("/xdg".into()),
+            home: Some("/home/jun".into()),
+            local_appdata: Some(r"C:\Users\jun\AppData\Local".into()),
+            appdata: Some(r"C:\Users\jun\AppData\Roaming".into()),
+            userprofile: Some(r"C:\Users\jun".into()),
+        };
+        let unix = Config::read_on(&env, false);
+        let win = Config::read_on(&env, true);
+        assert_eq!(
+            unix.path,
+            PathBuf::from("/xdg").join("opet").join("config.toml"),
+            "unix 链看 XDG/$HOME，不许被 Windows 三档污染"
+        );
+        assert_eq!(
+            win.path,
+            PathBuf::from(r"C:\Users\jun\AppData\Local")
+                .join("opet")
+                .join("config.toml"),
+            "Windows 链看三档，不许回落 `$HOME/.config`（那棵树在真 Windows 上没人读）"
+        );
+        assert_ne!(
+            unix.path, win.path,
+            "两条链必须真的分岔，一样 = 有一边没接线"
+        );
+        // 两份都不存在 ⇒ 同一种沉默（Absent + 零出声），平台不该改变出声行为
+        assert_eq!(unix.source, ConfigSource::Absent);
+        assert_eq!(win.source, ConfigSource::Absent);
+        assert!(unix.notices.is_empty() && win.notices.is_empty());
     }
 
     #[test]

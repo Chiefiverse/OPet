@@ -19,13 +19,15 @@ use std::path::PathBuf;
 
 /// 一次运行的全部输入（由 [`crate::cli`] 解析并做完所有语义拒绝后交过来）。
 ///
-/// 与 Wayland 那份 `app::Options` **有意不同形**：少了 `lang` / `motion` / `no_cursor`
-/// / `ipc` / `allow_unowned_pets`（本片的范围，理由逐条在 [`crate::cli::REFUSED`]），
+/// 与 Wayland 那份 `app::Options` **有意不同形**：少了 `no_cursor` / `ipc`（本片的范围，
+/// 理由逐条在 [`crate::cli::REFUSED`]），
 /// 而 [`Options::panel_top`] / [`Options::panel_bottom`] 从 `f32` 变成了 `Option<f32>`。
 /// 那一条不是整理，是**语义换档**，见字段注释。
 /// （`db` 曾经也在"少了"那一列，第二批 M4 起它转真了 —— 但形状仍与 Wayland 不同：
 /// 那边不给 = 内存库 + DRYRUN 水印，这边不给 = **兜底档**，见 [`Options::db`]。
-/// `allow_unowned_accessories` 同样在 M5e 转真；`allow_unowned_pets` 仍拒 = 这一片不换本体。）
+/// `allow_unowned_accessories` 在 M5e 转真，`allow_unowned_pets` 在 M7d 随换本体转真，
+/// `lang` / `motion` 在 **M7e** 随配置链转真 ⇒ 这一族只剩 `ipc` 还欠着，而它欠的不是开关，
+/// 是"Windows 侧的控制面传输怎么设计"那一整格。）
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     /// `pet.json` 路径；与 [`Options::test_rect`] 二选一（both / neither 由 `cli` 那一层拒掉）。
@@ -50,7 +52,7 @@ pub struct Options {
     /// 不在解析层猜）。两个读取者，各办各的事：
     /// - 启动：[`petstore::paths::DbPath::resolve`] 第一档 ⇒ `Store::open_at` **开了即关**
     ///   —— 证明这套 schema 能在 Windows（交叉编译产物 + Wine 先验）上首次建库（M4 的冒烟）；
-    /// - UI 那一刻：`ensure_gacha` → [`crate::dress::Gacha::connect`] 的**惰性真连接**，活着到退出，
+    /// - UI 那一刻：`ensure_gacha` → [`overlay_report::Gacha::connect`] 的**惰性真连接**，活着到退出，
     ///   余额、（M5e 起）换装读的那几行、（M6 起）抽取都走它 —— 启动那一发不代替它，那一发只证 schema。
     ///
     /// 不给 ⇒ 打印兜底档实解位置（`%LOCALAPPDATA%\opet\opet.db` 那一条链），**一个字节都不写**，
@@ -88,6 +90,16 @@ pub struct Options {
     pub panel_bottom: Option<f32>,
     /// 行为内核的种子。同种子必须逐位重放（硬约束 #8）。
     pub seed: u64,
+    /// `--lang` 的**原始字符串**（M7-e 转真）。解释不在这里：合法性由
+    /// [`crate::settings::validate_cli`] 判（`cli.rs` 据此报错退出），语义由
+    /// [`overlay_common::settings`] 那条唯一的链判（`--lang` > `config.toml` > 环境变量 > 默认）。
+    ///
+    /// ⚠️ 类型是 `Option<String>` 而**不是** `Lang`：解析层一旦归一化成枚举，`None`（"让下一级
+    /// 说话"）和`Some(zh)`（"我显式说了中文"）就合并成同一个值，config.toml 与环境变量两级
+    /// 永久失效。原样交到底，是这条链能存在的前提。
+    pub lang: Option<String>,
+    /// `--motion` 的**原始字符串**，同 [`Options::lang`] 那两条理由（三档 full/reduce/off）。
+    pub motion: Option<String>,
     /// `--allow-unowned-accessories`：把"这一件我在库存里有没有"那道闸门整个放开。
     ///
     /// 第二批 M5e 起它转真了（消费者 = [`overlay_common::dress::DressView::select`] 的
@@ -98,6 +110,15 @@ pub struct Options {
     /// ⚠️ 与 `dry_run` 的组合由 `dress_exempt_for` 一处判：**无 `--db` 时这一位不生效**
     /// （内存库里根本没有"拥有"这件事可查），不是"打开了但看不出来"。
     pub allow_unowned_accessories: bool,
+    /// M7-d 转真：豁免收藏册里**宠物那一行**（未拥有也当场可换）。
+    ///
+    /// ⚠️ 它与 [`Options::allow_unowned_accessories`] **是两个开关而判据共用一条函数**
+    /// （[`overlay_common::dress::dress_exempt_for`]）：拍板④ 说得很清楚 —— 配件那一档在帽子页
+    /// 标题打了 `*`，而本体这一档**故意没有屏上记号**（那一页的列表里没有宠物，把记号合并过去
+    /// 必然出现"标打了而没放行"）。所以两条不许合成一条。
+    ///
+    /// 无 `--db` 时它同样不生效（内存库没有"拥有"可查 ⇒ 一切照旧放行），判据仍在那一处。
+    pub allow_unowned_pets: bool,
 }
 
 impl Default for Options {
@@ -112,22 +133,25 @@ impl Default for Options {
             panel_top: None,
             panel_bottom: None,
             seed: 1,
+            lang: None,
+            motion: None,
             allow_unowned_accessories: false,
+            allow_unowned_pets: false,
         }
     }
 }
 
 impl Options {
-    /// 一行把九个字段全打出来，供宿主桩与 Windows 的启动行共用。
+    /// 一行把十二个字段全打出来，供宿主桩与 Windows 的启动行共用。
     ///
-    /// 它存在的第二个理由更硬：**这里读到每一个字段** ⇒ 谁加了第九个字段而忘了在下面列出来，
+    /// 它存在的第二个理由更硬：**这里读到每一个字段** ⇒ 谁加了第十三个字段而忘了在下面列出来，
     /// 只有 [`crate::cli`] 那条平权测试会红（`Options` 多一个字段而 `parse` 不产它 = 那个字段
     /// 恒 `None` = 屏上有东西没人能开）。结构体字面量在这里是**全字段**的，所以漏字段会在
     /// 编译期炸 —— 那是比测试更快的一道。
     pub fn describe(&self) -> String {
         let yes_no = |b: bool| if b { "是" } else { "否" };
         format!(
-            "manifest={:?} 矩形档={} 存档={:?} 秒数={:?} 显示器={:?} 顶部留白={:?} 底部留白={:?} 种子={} 未拥有配件放行={}",
+            "manifest={:?} 矩形档={} 存档={:?} 秒数={:?} 显示器={:?} 顶部留白={:?} 底部留白={:?} 种子={} 语言={:?} 动效={:?} 未拥有配件放行={} 未拥有本体放行={}",
             self.manifest,
             yes_no(self.test_rect),
             self.db,
@@ -136,7 +160,10 @@ impl Options {
             self.panel_top,
             self.panel_bottom,
             self.seed,
+            self.lang,
+            self.motion,
             yes_no(self.allow_unowned_accessories),
+            yes_no(self.allow_unowned_pets),
         )
     }
 }
@@ -176,20 +203,32 @@ mod win {
 
     use overlay_common::accounting::{Counters, Source, Tick, attribute_of, classify_tick};
     use overlay_common::atlas::{ALPHA_HIT_THRESHOLD, Atlas};
-    use overlay_common::dress::{DressView, dress_exempt_for, plan_restore, split_body_row};
+    use overlay_common::dress::{
+        DressView, PickWear, dress_exempt_for, plan_pick_wear, plan_restore, split_body_row,
+    };
     use overlay_common::menu::{self, CARD_H, CARD_W, MenuAnim, MenuItem, RectI};
+    // 面板那一族只引命名空间与四个类型名：`PanelItem` 的各臂一律写成 `panel::PanelItem::X`
+    // （与 Wayland 母本同形，也是为了分派臂上"这一格属于共用层"这件事在源码里可读）。
+    use overlay_common::panel::{self, CollectionTab, PanelKind, PanelRow, RowRect};
     use overlay_common::{card, l10n::Lang, settings::Motion};
 
     use crate::dress::{
-        Candidate, Gacha, WornWrite, accessory_root, clear_equip, decode, discover_accessories,
+        Candidate, WornWrite, accessory_root, clear_equip, decode, discover_accessories,
         start_body_id, write_equip,
     };
+    // `Gacha` 在 M7-b0 上提到 `overlay-report`（两家同一份，判据不许有第二个实现）⇒ 这里
+    // 不再从 `crate::dress` 拿它。
     use crate::layout::{
         Frame, Insets, PhysMon, describe_inset, kernel_monitor, resolve_insets, to_phys,
     };
+    use crate::settings;
     use crate::stage::{Stage, Worn};
     use crate::summary;
     use crate::window::{Client, DpiPath, Events, SurfaceKind, TimerPath, Wake};
+    use overlay_report::{
+        BodyCandidate, BodyChoice, Gacha, SwapBody, album_rows, db_body_row, discover_pets,
+        pet_root, plan_body_override, plan_swap_body, published_rates_lines,
+    };
 
     use super::Options;
 
@@ -375,6 +414,159 @@ mod win {
         }
     }
 
+    /// 面板面（M7b）= 第三块 surface 的业务状态，[`MenuState`] 的同形物。
+    ///
+    /// **去掉的字段与在场的字段同样有意**（判据本体在 Wayland 那份 `PanelState` 的模块头，
+    /// 这里是同一套理由的第二份实现，不是第二个说法）：没有 `anim`（这一面没有开箱相位
+    /// ⇒ `card::paint_panel` 压根不接 `&MenuAnim`）、没有 `page`（"翻页"是 [`PanelKind`] 里
+    /// 那个 tab，而且只有收藏册有）、没有 `balance`（余额只留在菜单 footer 那一行：同一次
+    /// 会话里同一个数印两处 = 两个事实源，而两处的刷新时刻还不一样）、**`motion` 有意不是
+    /// 字段**（[`panel::settings_rows`] 已经把 `motion.code()` 烘进行文案，而行文案进签名
+    /// ⇒ 再存一份平行字段就是"字段存在、签名不读它、画师也不读它"那一族漂移源）。
+    ///
+    /// 本平台还额外没有 Wayland 那八项协议/在飞帧字段（`layer`/`surface`/`viewport`/`pool`/
+    /// `frame_pending`/`pending_since`/`active_region`/`configured`）：前四项在分层窗口这边
+    /// 塌成 `Client` 注册表里的一扇窗 + 一块自己 `alloc` 的 `canvas`，后四项是"等 compositor
+    /// 的帧回调回执"那一族，在同步 `UpdateLayeredWindow` 上**结构上不可达**（与 `classify_tick`
+    /// 恒传 `frame_pending=false` 同一条理由）。所以这一面**没有看门狗**：`panel_watchdogs`
+    /// 在本平台恒 0 是平台形状，不是"这一面没在跑"。
+    struct PanelState {
+        /// 现在哪一本（收藏册第几 tab / 设置）。它决定标题带写什么字、点标题带是什么动作
+        /// ⇒ 既进签名，也被画师读到。
+        kind: PanelKind,
+        /// 这一面的内容。**唯一的一份**：签名比它、命中表由它派生、像素画它，三者同源。
+        rows: Vec<PanelRow>,
+        /// 命中表 = `panel::rects(kind, rows)`，与 `kind`/`rows` **同生同改** —— 写它们的
+        /// 只有 [`PanelState::new`] 与 [`PanelState::set_lines`] 两处，两处都一次改齐三个字段。
+        /// 分成两条路径改（"换 tab 只改 kind"、"换行只改 rows"）就是 `69fd158` 那一族：
+        /// 点的是这一屏的行、画的是另一屏的字。
+        items: Vec<RowRect>,
+        /// 从 [`App::lang`] 抄来。与 [`MenuState::lang`] 同族：运行中可变 ⇒ 进签名、被画师读到。
+        lang: Lang,
+        /// 上一次 present 的内容签名 ⇒ 静止时**一个 present 都不发**（`panel_commits` 不随
+        /// 轮次增长是这一面唯一的省电判据，而它与 `menu_commits` 必须分开读）。
+        last_sig: Option<u64>,
+        force_draw: bool,
+        /// 左上角，**舞台局部逻辑**坐标 = `panel::placement` 的输出，打开后不再挪（同 [`MenuState`]）。
+        at_logical: (i32, i32),
+        /// 上一次绘制时的生效缩放；与 [`App::scale`] 不一致 ⇒ 换窗口尺寸 + 重建 canvas + 重画。
+        scale: f32,
+        /// 物理窗口/buffer 尺寸（`panel::CARD_W/H × scale`，与 `canvas`、窗口三者同生共死）。
+        phys: (i32, i32),
+        canvas: Vec<u8>,
+    }
+
+    impl PanelState {
+        /// 建状态**并算好那一屏的一切**（行由调用方给：这一条不碰库、不读行，见
+        /// [`App::open_panel`] 与 [`App::show_panel`] 的分工）。
+        fn new(
+            at_logical: (i32, i32),
+            scale: f32,
+            kind: PanelKind,
+            rows: Vec<PanelRow>,
+            lang: Lang,
+        ) -> Self {
+            let phys = (
+                to_phys(panel::CARD_W as f32, scale).max(1),
+                to_phys(panel::CARD_H as f32, scale).max(1),
+            );
+            Self {
+                kind,
+                items: panel::rects(kind, &rows),
+                rows,
+                lang,
+                last_sig: None,
+                force_draw: true,
+                at_logical,
+                scale,
+                phys,
+                canvas: vec![0u8; (phys.0 * phys.1 * 4) as usize],
+            }
+        }
+
+        /// 面板局部**物理**像素 → 这一点有没有我们自己的不透明像素（与 [`MenuState::hit`]
+        /// 同一个阈值、同一句"屏上像素是唯一真值"）。
+        fn hit(&self, x: i32, y: i32) -> bool {
+            let (w, h) = self.phys;
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return false;
+            }
+            let idx = ((y * w + x) * 4 + 3) as usize;
+            u32::from(self.canvas[idx]) > ALPHA_HIT_THRESHOLD
+        }
+
+        /// 局部物理像素 → 局部**逻辑**坐标（`panel::press` 读的是命中表口径 = 逻辑）。
+        fn local_logical(&self, px: i32, py: i32) -> (f32, f32) {
+            (px as f32 / self.scale, py as f32 / self.scale)
+        }
+
+        /// 原地换这一屏：`kind`、`rows`、`items`、`lang` **一次改齐**。
+        ///
+        /// 不置 `force_draw`：`kind`、`lang`、每行文本、错误行全在 [`panel::content_sig`] 里
+        /// ⇒ 签名自己就认得出变了（Wayland `show_panel` 那条纪律原样，那里连"换 tab"和
+        /// "从菜单进来"都合成这一条，就是为了不给 `items` 留第二条写路径）。
+        fn set_lines(&mut self, kind: PanelKind, rows: Vec<PanelRow>, lang: Lang) {
+            self.items = panel::rects(kind, &rows);
+            self.kind = kind;
+            self.rows = rows;
+            self.lang = lang;
+        }
+
+        /// 出一帧面板。返回是否真的 present 上屏了（调用方据此记 `panel_commits`）。
+        ///
+        /// **没有 `step()`**：这一面没有任何随时间自己变的像素（相位表在菜单那一面），
+        /// 所以"每轮都投一帧完全相同的 buffer"在这里连形状都不存在 —— 签名里没有随时间的量。
+        fn draw(&mut self, client: &mut Client, at: (i32, i32), error: &str) -> bool {
+            let sig = panel::content_sig(self.kind, self.lang, error, &self.rows);
+            if self.last_sig == Some(sig) && !self.force_draw {
+                return false;
+            }
+            let (kind, lang) = (self.kind, self.lang);
+            let (bw, bh) = self.phys;
+            // `scale` 先取：下面 `self.canvas` 是可变借用，同一个表达式里不能再借 self
+            let scale = self.scale;
+            card::paint_panel(
+                &mut self.canvas,
+                bw,
+                bh,
+                (bw * 4) as usize,
+                card::PanelCtx {
+                    kind,
+                    lang,
+                    rows: &self.rows,
+                    error,
+                    scale,
+                },
+            );
+            match client.present(SurfaceKind::Panel, at, &self.canvas) {
+                Ok(()) => {
+                    self.last_sig = Some(sig);
+                    self.force_draw = false;
+                    true
+                }
+                Err(e) => {
+                    // 与 [`MenuState::draw`] 同一处置：像素**没**上屏 ⇒ 不记 last_sig、
+                    // 留 force_draw 让下一轮重投（静默跳过的症状"面板停在旧内容"与
+                    // "内容本来没变"在屏上同形）。
+                    eprintln!("panel: present 失败: {e}");
+                    false
+                }
+            }
+        }
+    }
+
+    /// [`App::pending_panel`] 的载荷。**只有两个变体**，因为它们要办的只有"窗口动不动"：
+    /// 面板已经开着时的换行**不进这块旗**（那一步不需要 `Client`，回调里就地改完，见
+    /// [`App::show_panel`]），所以 `Some(Show)` 的出现条件恰好是"面板此刻没开"
+    /// ⇒ 旗与状态不会各持一份"这一面该显示什么"。
+    enum PanelRequest {
+        Show {
+            kind: PanelKind,
+            rows: Vec<PanelRow>,
+        },
+        Close,
+    }
+
     /// 一轮运行的全部业务状态。
     ///
     /// ⚠️ **`Client` 不是这里的字段**，这一条不是风格而是 UB 边界：`Client::pump` 要的
@@ -389,14 +581,26 @@ mod win {
     /// `&mut Client` 能安全拿到。重算由事件环在 `pump` 返回之后做（[`App::apply_dpi`]）。
     struct App {
         opts: Options,
+        /// 当前本体的清单。**M7d 起它是字段而不是启动局部变量**，因为换本体之后有两处要现读它：
+        /// [`App::swap_body`] 的 `same_grid` 那道（比的是**身上这一只**的档，不是兜底那一只的）与
+        /// 第 6 步重跑 `discover_accessories` 前要拿到新清单。
+        ///
+        /// `&'static` 不是风格：`Sim<'static>` 借的正是同一份（`load_manifest` 那里说明为什么必须
+        /// leak），而 `BodyCandidate::leaked` 返的也是 `&'static` ⇒ 换本体 = 换一个 `'static`，
+        /// 不需要重排任何生命周期。
+        manifest: &'static Manifest,
         atlas: Option<Atlas>,
         /// 行为内核。**它借的那份清单是 `Box::leak` 出来的 `&'static Manifest`**（`load_manifest`
-        /// 那里说明为什么必须 leak），所以这里不需要再存一份 `&Manifest` —— 存了也没人读
-        /// （`cell` 那一格是它唯一被读过的信息，已经在启动时抄成 `cell`）。
+        /// 那里说明为什么必须 leak），M7d 起换本体走 [`Sim::swap_manifest`] ⇒ 这份 `'static`
+        /// 必须同时记在 [`App::manifest`]，否则下一次重跑配件发现时无处可取。
         sim: Option<Sim<'static>>,
         stage_buf: Stage,
         frame: Frame,
-        /// 图集格尺寸，单独留着：换缩放时 `Frame` 要按它重建（清单此刻已经借不出来了）。
+        /// 图集格尺寸，单独留着：换缩放时 `Frame` 要按它重建。
+        ///
+        /// M7d 之后 [`App::manifest`] 也存着，这一格**不是**它的第二个事实源：换本体那道闸门
+        /// 保证了 `cell` 与 `manifest.grid` 永远同步（不同档的直接不换，见
+        /// [`overlay_report::plan_swap_body`] 的 `same_grid`），所以这里读的永远是身上这一只的档。
         cell: (u32, u32),
         /// 全部物理显示器 + 舞台那台的名字。DPI 变更后要靠它们重算内核几何。
         mons: Vec<PhysMon>,
@@ -426,15 +630,24 @@ mod win {
         pointer_world: Vec2,
         pending_scale: Option<f32>,
 
-        // ── UI（M5c 菜单面）──
+        // ── UI（M5c 菜单面 + M7b 面板面）──
         /// 第一次开菜单才连（[`App::ensure_gacha`]），连上就活着到退出。
         gacha: Option<Gacha>,
         /// "最近一次失败"那一行（进 `content_sig`，屏上错误行的唯一来源；成功路径负责清空）。
         ui_error: Option<String>,
-        /// 生效语言。M5c 的写入点只有菜单语言行；`--lang`/config 那一条链在 M7。
-        lang: Lang,
-        /// 动画档。菜单上唯一的入口（MotionTier 行）要开面板才有 ⇒ M7 转真，此刻恒 DEFAULT。
-        motion: Motion,
+        /// 生效值 + 各自的**来源层**（M7e 从"两个裸值"换成这一格）。
+        ///
+        /// 为什么存整条 [`settings::Settings`] 而不是 `lang` / `motion` 两个字段：启动行、
+        /// 退出摘要、还有 `--lang` 那一句"点了不会写回"都要说**这一档是从哪一层来的**，
+        /// 而 `lang_from` 只有和 `lang` 同处一格才不会说谎（Wayland 母本同一条手艺）。
+        /// 链本体在 `overlay-common`，这里存的只是它一次算完的结果 ⇒ 屏上永远只有一个真相，
+        /// 不存在"变量一份、文件一份"（`AGENTS.md` 现场事实第 16 条那一族）。
+        ///
+        /// ⚠️ 菜单与面板里的 `m.lang` / `p.lang` 是**副本**，不是第二个事实源：那两个类型
+        /// 要按"自己这一屏的像素"出图，而像素的语言必须与它被画那一刻生效的语言一致
+        /// （`baked_lines_keep_the_language_they_were_pulled_in` 同族）。换档走
+        /// [`App::apply_lang`]，它一次改齐三处（生效值、菜单副本、面板重算）。
+        ui: settings::Settings,
         /// 演示态 = 无 `--db`（Wayland 同型：内存库 + 卡片右下角 DRYRUN 水印的判据）。
         dry_run: bool,
 
@@ -444,6 +657,15 @@ mod win {
         /// 空表有**三种**成因，全都不是错误：矩形档（一行资产都不读）、`%USERPROFILE%`/`$HOME`
         /// 都读不到（没有库）、库里每一件都没过门禁（跳过那几行点名了每一件）。
         candidates: Vec<Candidate>,
+        /// 本体库（启动时扫过四道门禁、**一像素未解**的那几只）；空 = 没有第二只换得上去。
+        ///
+        /// 收藏册的宠物行点下去就是这张表里的下标（`PanelItem::Body`）。它必须不含像素，理由与
+        /// [`Self::candidates`] 那一段逐字相同：解码一张 sheet 是 45 MiB，而"浏览一下库"不该付它。
+        ///
+        /// ⚠️ 与 `candidates` 是**两套下标空间**（拍板①）：`picked` 读前者，
+        /// [`App::swap_body`] 读后者，共用一张表就是
+        /// `the_album_routes_pets_to_the_body_index_space` 那条门禁要杀的形状。
+        bodies: Vec<BodyCandidate>,
         /// 穿着中的那一件 = 第二张 sheet 的像素。`None` = 没穿。
         ///
         /// ⚠️ **只有 [`App::wear`] 写 `Some`、只有 [`App::take_worn`] 写 `None`**（红线 #16 的
@@ -457,15 +679,30 @@ mod win {
         /// 它是**下标**不是 id：可见集（[`DressView::visible`]）返回的也是下标，两者同一口径，
         /// 不会出现"选中的是哪件"有两个事实源。初值 0 与 Wayland 同（库里第一件）。
         picked: usize,
-        /// 起点本体的身份（`--manifest` 那个目录名，退化成清单 `slug`）。
+        /// 当前本体的身份（`--manifest` 那个目录名，退化成清单 `slug`；= [`Self::bodies`]
+        /// 的 `id` 同一个键）。
         ///
-        /// 唯一的读者是启动恢复那句"库里那一行 `body=X` 而屏上是 `Y`"—— 本平台**不换本体**
-        /// （`--allow-unowned-pets` 仍在 `cli::REFUSED`），所以这一行只能报不一致，不能去追它。
+        /// 两件事读它：`equipped` 的 `body` 行写它（[`App::persist_body`]）、收藏册那一行
+        /// "是不是它"的 `same_id` 判据读它（[`App::swap_body`] 第 1 步）。
+        /// ⚠️ 它**不上屏** —— 当前是哪只本体就是宠物自己那几个像素，再打一行字就是第二个事实源。
         body_id: String,
         /// 恢复上次穿着只跑**一次**的闩。`round` 环外读它（同 `pending_menu_toggle` 那条纪律：
         /// 它要 `&mut self` 并且必须在第一次 `present` **之前**生效，否则第一帧没帽子、第二帧才有）。
         restore_pending: bool,
         menu: Option<MenuState>,
+        /// 面板面（M7b）。**与 `menu` 永不同时是 `Some`** —— 互斥的唯一守卫在
+        /// [`App::apply_panel`]（落地 `Show` 那一刻先关菜单），理由照 Wayland 的 `panel`
+        /// 模块头：同层两块以上的堆叠序没有定义，而这里还多一条 —— 两块面都读同一份库存，
+        /// 叠着画就会出现"点的是上面那块的行、改的是下面那块的内容"。
+        panel: Option<PanelState>,
+        /// 面板的**延迟一拍**旗，与 [`App::pending_menu_toggle`] 同一条纪律：建窗/关窗要
+        /// `&mut Client`，而 `Events` 回调发生在 `pump` 内部（那时 client 正被借用）。
+        ///
+        /// ⚠️ 一次 `pump` 里连点两下 ⇒ 后一次覆盖前一次（不是排队）。这在屏上是无损的：
+        /// 这一面每轮最多 present 一次，只有最后一次的内容 ever 成为像素；代价只有一条，
+        /// 就是"中间那一屏"不存在（`More` 连点两下 = 同一页加两次基数相同的 1）。写在这里
+        /// 是为了下一次有人想把它改成 `Vec` 时知道现在让掉的是什么。
+        pending_panel: Option<PanelRequest>,
         /// 右键 toggle 的**延迟一拍**旗：开窗/关窗要 `&mut Client`，而 `Events` 回调发生在
         /// `pump` 内部（那时 client 正被借用）。与 Wayland"按钮回调里直接建 surface"的
         /// 差别是平台形状：那边回调手里就有 compositor，这边没有。
@@ -486,6 +723,30 @@ mod win {
         /// 之后到第一次 `present` 之前，屏上没有东西（分层窗口的像素只在 ULW 那一刻出现），
         /// 所以那一档尺寸不会被人看见，也不需要"临时画一帧"。
         fn startup(opts: Options) -> Result<(App, Client), String> {
+            // 设置只在**启动时读一次**（硬约束 5「事件驱动，禁止定时轮询」⇒ 不做 watcher）。
+            // 顺序固定，与 Wayland 母本逐字同形：先说文件本身怎么样（坏语法要抢在生效值前面），
+            // 再说生效值和它来自哪一层。`Config::read()` 里的 `cfg!(windows)` 挑的是
+            // `%LOCALAPPDATA%` 那条三档阶梯（见 `crate::settings` 模块头）。
+            let cfg = petstore::config::Config::read();
+            cfg.announce();
+            eprintln!("ui: 配置 {}", cfg.describe());
+            // CLI 那两级开关此刻真的传进来了（`cli.rs` 已在解析期把坏值判掉）：这里给错值
+            // = `Err` 退出，文件/环境变量给错值 = 出声后按链条往下走（两条路的理由在
+            // `crate::settings` 模块头，判分在共用层）。
+            let ui = settings::from_process(opts.lang.as_deref(), opts.motion.as_deref(), &cfg)?;
+            ui.announce();
+
+            // 把本轮生效的语言写回 config，于是"首轮取环境语言、此后取上次退出语言"两条同时
+            // 成立：首轮没有 config ⇒ 走 env→默认，写回后重跑时 config 优先于 env。
+            // `--lang` 例外：它是一次性覆盖，不该被锁进文件（否则下次不带开关也回不去环境语言）。
+            // ⚠️ 本平台的环境语言一般是空的（原生 Windows 没有 `LANG`，而这里刻意不调
+            // `GetUserDefaultUILanguage` —— 理由见 `crate::settings` 模块头），所以这一发在
+            // 首轮写的就是**默认档** `en`：文件会因此被创建。这是与 Wayland 同一行为的后果，
+            // 不是本平台另加的副作用（那条链的语义是"生效值落盘"，不是"用户显式设过才落盘"）。
+            if ui.lang_from != settings::ValueSource::Cli {
+                let _ = petstore::config::write_ui_key(petstore::config::KEY_LANG, ui.lang.code());
+            }
+
             let started = Instant::now();
             let mons = crate::monitor::enumerate()?;
             let stage = crate::layout::choose(&mons, opts.monitor.as_deref()).ok_or_else(|| {
@@ -505,8 +766,57 @@ mod win {
             let stage_name = stage.name.clone();
             let stage_mon = stage.clone();
 
-            let manifest = load_manifest(&opts)?;
-            let atlas = load_atlas(&opts, manifest)?;
+            let mut manifest = load_manifest(&opts)?;
+            // —— 起点本体（P5 = M7d）。本体库排在**解第一张 sheet 之前**扫一遍，因为库里那一行
+            // `body` 可能改写"第一只本体是谁"，而那一天绝不该解两张 sheet（峰值 = 两只本体
+            // ≈147 MB，它**仍落在 ≤200 MiB 门禁内 ⇒ 什么都不会红**，唯一的读数就是这段代码本身）。
+            //
+            // ⚠️ 这道 `pixels` 门槛与 [`load_atlas`] 里那两个"没有像素"的分支**是同一个条件**
+            // （`--test-rect` / 没给 `--manifest`）：先算成布尔量，是为了打断
+            // `discover_pets → load_atlas → discover_pets` 那条环（Wayland 母本 11-07 踩过）。
+            let pixels = !opts.test_rect && opts.manifest.is_some();
+            let mut bodies = match pet_root().filter(|_| pixels) {
+                Some(root) => discover_pets(&root, &manifest.grid),
+                // 本体没像素（矩形档 / 内置 fixture 那条路）⇒ 换了没东西可画；`%LOCALAPPDATA%`
+                // 与 `$XDG_DATA_HOME`/`$HOME` 都读不到 ⇒ **没有库**。两种都是"收藏册的宠物行全部
+                // 只读"，不是错误（这张表**不**参与"起不起来"的判断）。
+                None => Vec::new(),
+            };
+            // —— 拍板③：库里那一行**赢**，`--manifest` 退化成"库里没有那一行时用什么"。
+            // 老库（没有那一行）⇒ 这一整段是 `Keep(None)`，一个字都不打。
+            let row = db_body_row(opts.db.as_deref());
+            let pet_ids: Vec<String> = bodies.iter().map(|b| b.id.clone()).collect();
+            // 起点本体的身份（`id` = 目录名 = 库存与 `equipped` 认的那个键）。
+            let mut body_id = start_body_id(opts.manifest.as_deref(), &manifest.slug);
+            // 覆盖成立时要连**目录**一起换：sheet 从它取。本平台没有 polygon 的消费者
+            // （命中读的是叠完之后的像素），但 `discover_pets` 仍按三件套要求它 ⇒ 两家同一本账。
+            let mut body_dir: Option<super::PathBuf> = None;
+            match plan_body_override(row.as_deref(), &pet_ids, &body_id) {
+                BodyChoice::Override(i) => {
+                    let b = &mut bodies[i];
+                    // 这一行排在 `manifest` 被改写**之前** ⇒ `{fallback}` 念到的还是兜底那只的 `id`。
+                    eprintln!(
+                        "body: 库里那一行 {slot}={id} ⇒ 起点本体从 {fallback} 换成这只（`--manifest` 退化成\
+                         兜底；格子档与它相同 ⇒ 窗口尺寸 / buffer / DIB 一个都不必改）",
+                        slot = overlay_common::dress::BODY_SLOT,
+                        id = b.id,
+                        fallback = body_id,
+                    );
+                    // 第一次用上它才 `Box::leak`（每只进程内只泄一份清单，几 KB）。
+                    manifest = b.leaked();
+                    body_dir = Some(b.dir.clone());
+                    body_id = b.id.clone();
+                }
+                // 点名：库里明明有一行而这一轮不覆盖 ⇒ 必须说得出为什么（静默退回兜底 = 用户上次
+                // 换的本体"自己没了"而没有任何一句话解释，那是本项目反复要杀的静默）。
+                BodyChoice::Keep(Some(why)) => eprintln!(
+                    "body: 库里那一行 {slot}={id} ⇒ 不覆盖起点本体：{why} ⇒ 这一轮用 `--manifest` 那只",
+                    slot = overlay_common::dress::BODY_SLOT,
+                    id = row.clone().unwrap_or_default(),
+                ),
+                BodyChoice::Keep(None) => {}
+            }
+            let atlas = load_atlas(&opts, manifest, body_dir.as_deref())?;
             let cell = (manifest.grid.w, manifest.grid.h);
             // 配件库在启动时**只读元数据**（清单 + `fits` 本体），一像素不解 ⇒ "穿上"唯一的
             // 失败面只剩"sheet 解不开"（Wayland 同一条前提，`VmHWM` 那一档的字面要求）。
@@ -528,8 +838,6 @@ mod win {
                     }
                 }
             };
-            let body_id = start_body_id(opts.manifest.as_deref(), &manifest.slug);
-
             let probe = Frame::new(1.0, cell.0, cell.1)?;
             let (pw, ph) = probe.surface_phys();
             let mut client = Client::open((stage.left, stage.top), (pw, ph))?;
@@ -666,6 +974,7 @@ mod win {
 
             Ok((
                 App {
+                    manifest,
                     atlas,
                     sim,
                     stage_buf,
@@ -696,10 +1005,10 @@ mod win {
                     pending_scale: None,
                     gacha: None,
                     ui_error: None,
-                    lang: Lang::DEFAULT,
-                    motion: Motion::DEFAULT,
+                    ui,
                     dry_run,
                     candidates,
+                    bodies,
                     worn: None,
                     picked: 0,
                     body_id,
@@ -708,6 +1017,8 @@ mod win {
                     // 在这里预先判 = 拿启动期的参数猜运行期的库，猜错的方向是"该恢复却没试"。
                     restore_pending: true,
                     menu: None,
+                    panel: None,
+                    pending_panel: None,
                     pending_menu_toggle: false,
                     pending_menu_close: false,
                     exit_requested: false,
@@ -734,8 +1045,11 @@ mod win {
             if self.exit_requested {
                 // 照 Wayland `quit_pet` 的两步顺序：**先关自己建的面，再走退出**。
                 // "退出不依赖另一条不变量此刻成不成立"，所以这里显式 close 而不交给
-                // `Client::drop`（那条是兜底，不是这条路径的负责人）。
+                // `Client::drop`（那条是兜底，不是这条路径的负责人）。M7b 起"自己建的面"
+                // 是两块 ⇒ 两条 close 都走，顺序无关（`Client::close` 幂等，且两块面互斥
+                // 时另一条就是 `take()` 到 `None` 的空转）。
                 self.close_menu(client);
+                self.close_panel_now(client);
                 return Ok(false);
             }
             if let Some(s) = self.pending_scale.take() {
@@ -746,6 +1060,13 @@ mod win {
             }
             if std::mem::take(&mut self.pending_menu_close) {
                 self.close_menu(client);
+            }
+            if self.pending_panel.is_some() {
+                // 面板的建窗/关窗，以及"开面板必先关菜单"那一句，都落在这一格（回调里办不了，
+                // 见 [`App::pending_panel`]）。排在两个菜单旗**之后**是有意的：同一轮里既翻了
+                // 菜单又要开面板时，最终该在场的是面板；反过来排会让 `toggle_menu` 看到
+                // "面板开着"再把它关掉 ⇒ 屏上两块面都没了，而日志会说两块都关过。
+                self.apply_panel(client);
             }
             if std::mem::take(&mut self.restore_pending) {
                 // 恢复上次穿着排在**步进之前**：它做的事是"往 `worn` 里放一张 sheet + 置
@@ -787,6 +1108,10 @@ mod win {
             // 而 `menu_commits` 本来就不并进五档（accounting.rs 那段"非 tick 补画"的同一族）。
             // 没开菜单时这一句就是一次 `is_none` 检查。
             self.update_menu(client);
+            // 面板与菜单同一档：闸门是内容签名，不是轮次。没开面板时这一句就是一次 `is_none`。
+            // 顺序在菜单之后而不是之前 —— 两块面互斥（`apply_panel` 已经把菜单关掉了），
+            // 所以这一轮实际只有一块面有活干，谁先谁后不影响读数，只影响日志里两行的先后。
+            self.update_panel(client);
             Ok(true)
         }
 
@@ -1076,10 +1401,11 @@ mod win {
             )
         }
 
-        /// 右键翻转：开着 ⇒ 关，没开 ⇒ 开。
+        /// 右键翻转：**菜单开着 ⇒ 关菜单，面板开着 ⇒ 关面板，都没开 ⇒ 开菜单**。
         ///
-        /// Wayland 的 `toggle_menu` 是三路（菜单 / 面板开着各关各的）；本平台面板要到 M7，
-        /// **在那块面存在之前这一支不是被省略，是不存在**。M7 移植时这里加回第三臂。
+        /// M7b 补上第三臂（原来那句"面板要到 M7 才存在，在那块面存在之前这一支不是被省略、
+        /// 是不存在"到这一批为止）。三路而不是"一个 toggle 旗管两块面"：右键的语义是
+        /// "把我此刻看着的那块关掉"，而两块面同屏不可能（互斥），所以"此刻是哪块"有唯一答案。
         fn toggle_menu(&mut self, client: &mut Client) {
             if self.opts.test_rect {
                 eprintln!(
@@ -1089,6 +1415,10 @@ mod win {
             }
             if self.menu.is_some() {
                 self.close_menu(client);
+            } else if self.panel.is_some() {
+                // 就地关（这一条手里就有 client，不必绕旗）。`Events::right_press` 那条臂走
+                // 的才是旗 —— 两条路径汇到同一个 [`App::close_panel_now`]，"面板关了"只有一个写法。
+                self.close_panel_now(client);
             } else {
                 self.open_menu(client);
             }
@@ -1116,8 +1446,8 @@ mod win {
                 self.scale,
                 balance,
                 self.dry_run,
-                self.motion,
-                self.lang,
+                self.ui.motion,
+                self.ui.lang,
                 self.dress_exempt(),
             );
             let at = self.menu_at(&m);
@@ -1182,6 +1512,422 @@ mod win {
             self.menu = Some(m);
         }
 
+        // ───────────────────────── 面板面（M7b）─────────────────────────
+
+        /// 面板该摆的**物理屏幕**位置（[`App::menu_at`] 的同形物，理由原样：DPI 变更后
+        /// 逻辑位置不变、物理位置必变，所以每轮现算而不存死）。
+        fn panel_at(&self, p: &PanelState) -> (i32, i32) {
+            (
+                self.stage_mon.left + to_phys(p.at_logical.0 as f32, self.scale),
+                self.stage_mon.top + to_phys(p.at_logical.1 as f32, self.scale),
+            )
+        }
+
+        /// 把 [`App::pending_panel`] 落地。**这是本平台唯一会 spawn/close 面板的地方**
+        /// （另一处 `close_panel_now` 的调用点在 `toggle_menu` 与退出臂，都走同一个函数）。
+        ///
+        /// 互斥那一句就落在这里：`Show` 先关菜单，再决定"换行还是建窗"。不在 `show_panel`
+        /// 里关（那条要能被回调安全调用，而回调手里没有 client），也不在 `dispatch_menu` 里关
+        /// （那样"谁关菜单"就有两个答案）。
+        fn apply_panel(&mut self, client: &mut Client) {
+            let Some(req) = self.pending_panel.take() else {
+                return;
+            };
+            match req {
+                PanelRequest::Close => self.close_panel_now(client),
+                PanelRequest::Show { kind, rows } => {
+                    if self.menu.is_some() {
+                        self.close_menu(client);
+                    }
+                    if let Some(p) = self.panel.as_mut() {
+                        // `show_panel` 只在"没开"时置这块旗，所以正常路径到不了这里。它存在的
+                        // 理由是"面板此刻该显示什么"仍然只有 `set_lines` 一个写法 ——
+                        // 与其在这里 panic 或重建窗口，不如换行。
+                        p.set_lines(kind, rows, self.ui.lang);
+                        return;
+                    }
+                    let pet = self.pet_logical_rect();
+                    let (aw, ah) = self.stage_logical();
+                    let at_logical = panel::placement(pet, RectI::new(0, 0, aw, ah));
+                    let p = PanelState::new(at_logical, self.scale, kind, rows, self.ui.lang);
+                    let at = self.panel_at(&p);
+                    if let Err(e) = client.spawn(SurfaceKind::Panel, at, p.phys) {
+                        eprintln!("panel: 建窗失败 ⇒ 不开（{e}）");
+                        self.ui_error = Some(format!("面板建窗失败: {e}"));
+                        return;
+                    }
+                    eprintln!(
+                        "panel: 打开于逻辑 {},{}（物理 at {},{}｜{kind:?}｜宠物逻辑 {},{} {}x{}｜舞台逻辑 {aw}x{ah}）",
+                        p.at_logical.0, p.at_logical.1, at.0, at.1, pet.x, pet.y, pet.w, pet.h
+                    );
+                    self.panel = Some(p);
+                }
+            }
+        }
+
+        /// 开面板 = 现算行 → [`App::show_panel`]。收藏册那三行**不走这里**，走
+        /// [`App::collection_panel`]（同一条路还要把同一批字打进 stderr）。
+        ///
+        /// 这一条不碰库，所以它只可能因为"库还没连上"而失败于 Owned/Missing/Recent 那三本
+        /// ⇒ 失败只让错误行说话（[`App::gacha_bailed`]），面板**不**带着空行开出来。
+        fn open_panel(&mut self, kind: PanelKind) {
+            match self.panel_rows(kind) {
+                Ok(rows) => self.show_panel(kind, rows),
+                Err(msg) => self.gacha_bailed(msg),
+            }
+        }
+
+        /// 让面板显示这一组行：**开着就原地换行 + 换命中表，没开就记旗**（建窗要到 `round`）。
+        ///
+        /// 两个动作合成一条不是省事，也不是平台偷懒：「点标题带换 tab」与「从菜单进来」要办的
+        /// 是同一件事（这一面此刻该画什么），分成两条路径就会出现其中一条**忘了同步 `items`**
+        /// —— 而 `items` 是点击的唯一依据（`69fd158` 那一族"命中表与画面分家"）。
+        fn show_panel(&mut self, kind: PanelKind, rows: Vec<PanelRow>) {
+            if let Some(p) = self.panel.as_mut() {
+                p.set_lines(kind, rows, self.ui.lang);
+                return;
+            }
+            self.pending_panel = Some(PanelRequest::Show { kind, rows });
+        }
+
+        /// 回调侧的"关掉这块面" = 记旗（`Events` 回调发生在 `pump` 内部，那时动不了窗口）。
+        /// 幂等：没开过就当没事发生（`Client::close` 同口径）。
+        fn close_panel(&mut self) {
+            if self.panel.is_some() {
+                self.pending_panel = Some(PanelRequest::Close);
+            }
+        }
+
+        /// 真的关窗。**关闭打一行累计提交数**：这一批的 Wine 判卷读的是日志流，
+        /// "静止恒 1 提交"这条判据要靠这一行落地（Wayland 那侧靠摘要，不需要这行）。
+        fn close_panel_now(&mut self, client: &mut Client) {
+            if self.panel.take().is_some() {
+                if let Err(e) = client.close(SurfaceKind::Panel) {
+                    eprintln!("panel: 关窗失败: {e}");
+                    return;
+                }
+                eprintln!(
+                    "panel: 关闭（本轮累计 {} 提交）",
+                    self.counters.panel_commits
+                );
+            }
+        }
+
+        /// 每轮一遍：镜像 scale → 按签名决定要不要 present。
+        ///
+        /// **没有 `step()`**（这一面没有任何随时间自己变的像素）、**没有看门狗**（同步 ULW
+        /// 没有"在飞帧"这个状态）⇒ 静止恒 1 提交是它唯一的省电判据，而它必须与
+        /// `menu_commits` 分开读（两块面共用池子的话，这个数就不再说明任何事）。
+        fn update_panel(&mut self, client: &mut Client) {
+            let Some(mut p) = self.panel.take() else {
+                return;
+            };
+            let error = self.error_line();
+            if p.scale != self.scale {
+                // 次序照 `update_menu` 与 `apply_dpi` 那条"窗口先、缓冲后、画第三"：
+                // `present` 要求 src 字节数与窗口尺寸逐像素相等。
+                p.scale = self.scale;
+                p.phys = (
+                    to_phys(panel::CARD_W as f32, self.scale).max(1),
+                    to_phys(panel::CARD_H as f32, self.scale).max(1),
+                );
+                if let Err(e) = client.resize(SurfaceKind::Panel, p.phys) {
+                    eprintln!("panel: 换缩放后 resize 失败: {e} ⇒ 这块旧尺寸的面板不可用，关掉");
+                    self.panel = Some(p);
+                    self.close_panel_now(client);
+                    return;
+                }
+                p.canvas = vec![0u8; (p.phys.0 * p.phys.1 * 4) as usize];
+                p.force_draw = true;
+            }
+            let at = self.panel_at(&p);
+            if p.draw(client, at, &error) {
+                self.counters.panel_commits += 1;
+            }
+            self.panel = Some(p);
+        }
+
+        /// 面板**唯一**的行生产者。
+        ///
+        /// ⚠️ **不许在这里调 [`App::ensure_gacha`]**：连不上库那件事 `ensure_gacha` →
+        /// [`App::gacha_bailed`] 已经出过一次声，这里再返回 `Err` 让调用方处理一遍，就是
+        /// **同一次失败打两遍**（两条 stderr、错误行被覆写两次，而用户看不出哪条是真的）。
+        /// 所以这条只问"已经连上了没有"，连不连是调用方的责任。
+        ///
+        /// 设置页不碰库 ⇒ 它永远 `Ok`；`Err` 只可能来自收藏册那三个 tab，而那一路唯一的使用者
+        /// 是 [`App::open_panel`] 与 [`App::refresh_panel_rows`]，那里库必然已经连着。
+        ///
+        /// M7c 起 Owned 那一臂岔给 [`App::album_screen`]（逐件可点 + 分页），M7d 起宠物那一行
+        /// 也真了（`Body(i)` = [`App::swap_body`]）。两家同形，判据同一个 [`Gacha::album_entries`]。
+        fn panel_rows(&mut self, kind: PanelKind) -> Result<Vec<PanelRow>, String> {
+            let lang = self.ui.lang;
+            match kind {
+                PanelKind::Settings => Ok(panel::settings_rows(lang, self.ui.motion)),
+                PanelKind::Collection {
+                    tab: CollectionTab::Owned,
+                    page,
+                } => self.album_screen(page).map(|(_kind, rows)| rows),
+                PanelKind::Collection { tab, .. } => {
+                    let g = self
+                        .gacha
+                        .as_ref()
+                        .ok_or_else(|| "库还没连上（收藏册读不到东西）".to_string())?;
+                    Ok(panel::collection_rows(
+                        lang,
+                        &g.tab_lines(tab, lang, self.scale)?,
+                    ))
+                }
+            }
+        }
+
+        /// 「已获得」那一本的**一整屏** = 逐件行 + 汇总那五行 → 分页（Wayland 母本的同形物）。
+        ///
+        /// 为什么返回 `kind` 而不是只返回行：页码归一（末页回卷）只由 [`panel::album_page`] 做，
+        /// 而存进 [`PanelState`] 的那一格必须就是归一后的页码 —— 存原始请求值的话，
+        /// [`App::dispatch_panel`] 的 `kind.page() + 1` 会在回卷之后继续往上加，页码从此漂掉，
+        /// 屏上却永远只有那几页（"两个事实源"的又一形状）。
+        ///
+        /// ⚠️ 汇总那五行是**追加**在逐件行之后，不是被替换掉：`have/all` 与碎片余额只有那一行
+        /// 说得了，而逐件行回答的是"哪一件、能不能点"。代价（明写）= 汇总被挤到后面的页。
+        ///
+        /// 库存这一趟读了两遍（[`App::dress_view`] 内部一遍、这里一遍）：让 `DressView` 把
+        /// `Owned` 带出来会搅浑"豁免态压根不该读库"那条形状，而这一屏要的是**报表**。两遍读的
+        /// 是同一次点击之内的同一个 store ⇒ 同一个事实问了两次，不是两个事实源；代价 = 两次
+        /// sqlite 查询，而它们不在 tick 环上（§4 禁的是定时轮询）。
+        fn album_screen(&mut self, page: usize) -> Result<(PanelKind, Vec<PanelRow>), String> {
+            if self.gacha.is_none() {
+                return Err("库还没连上（收藏册读不到东西）".to_string());
+            }
+            // 名字要先取：下面 `dress_view()` 可变借用 self，不能同时留 `candidates` 的引用。
+            let ids: Vec<String> = self.candidates.iter().map(|c| c.id.clone()).collect();
+            // 本体那一张表**同形、同一条理由**（P5）：`pet_view()` 也要可变借用 self。
+            let pet_ids: Vec<String> = self.bodies.iter().map(|b| b.id.clone()).collect();
+            // 闸门只有一个所有者 = `dress_view`（这一条不许自己实现"许不许穿"）。
+            let view = self.dress_view();
+            // 本体那道闸门是它的同形兄弟（同一个 [`DressView::select`]，只是喂的表不同）⇒ 收藏册
+            // 里"这件能不能点"与"这只能不能换"问的是**同一个判据**，不是两套答案。
+            let pet_view = self.pet_view();
+            let (lang, scale) = (self.ui.lang, self.scale);
+            let g = self
+                .gacha
+                .as_ref()
+                .ok_or_else(|| "库还没连上（收藏册读不到东西）".to_string())?;
+            let owned = g.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
+            let mut rows = album_rows(
+                &g.album_entries(&owned, &ids, &view.visible, &pet_ids, &pet_view.visible)?,
+                scale,
+            );
+            rows.extend(
+                g.collection_lines(lang)?
+                    .into_iter()
+                    .map(|text| panel::PanelRow {
+                        item: panel::PanelItem::Info,
+                        text,
+                    }),
+            );
+            let screen = panel::album_page(lang, &rows, page);
+            Ok((
+                PanelKind::Collection {
+                    tab: CollectionTab::Owned,
+                    page: screen.page,
+                },
+                screen.rows,
+            ))
+        }
+
+        /// 收藏册三本与"面板里点标题带"共用的入口：读行 → 打 stderr → 上屏。
+        ///
+        /// 一条而不是两条的理由是 §4 那条口径：**屏上那几行就是日志里那几行**。分两条就会出现
+        /// "日志打了 5 行而屏上截断成 +N 更多"这种两边都自称正确的东西。
+        fn collection_panel(&mut self, tab: CollectionTab, page: usize) {
+            if tab == CollectionTab::Owned {
+                self.collection_album(page);
+                return;
+            }
+            self.gacha_panel(
+                "collection",
+                PanelKind::Collection { tab, page },
+                move |g, l, s| g.tab_lines(tab, l, s),
+            );
+        }
+
+        /// 「已获得」那一本（逐件 + 分页）的入口 = [`App::collection_panel`] 的 Owned 分支。
+        ///
+        /// `page` 是**请求的**页码，可以越界（末页点一下就是下一页）；归一在
+        /// [`panel::album_page`] 里做，而这里把它归一后的结果原样交给 [`App::show_panel_rows`]
+        /// —— 传请求值上屏就是"页码漂掉"那条形状，见 [`App::album_screen`] 那条注释。
+        fn collection_album(&mut self, page: usize) {
+            if !self.ensure_gacha() {
+                return;
+            }
+            let screen = self.album_screen(page);
+            self.show_panel_rows("collection", screen);
+        }
+
+        /// 「连库 → 读 → 上屏」的唯一路径：先 `ensure_gacha()`（惰性连库那条红线，D14）、
+        /// 失败只写错误行（[`App::gacha_bailed`]，不 panic、不置退出，硬约束 3 同族）、
+        /// 成功就把错误行清空（否则上一条失败的字一直挂着）。
+        ///
+        /// `scale` 在**这里**取而不是各分支自己取：它决定"一行的字装不装得下"，而这一条是
+        /// 三屏唯一的出口 ⇒ 读屏那一步拿到的缩放与画那块面用的是同一个数。
+        fn gacha_panel(
+            &mut self,
+            prefix: &str,
+            kind: PanelKind,
+            report: impl FnOnce(&Gacha, Lang, f32) -> Result<Vec<String>, String>,
+        ) {
+            if !self.ensure_gacha() {
+                return;
+            }
+            let (lang, scale) = (self.ui.lang, self.scale);
+            let lines = match self.gacha.as_ref() {
+                Some(g) => report(g, lang, scale),
+                None => return,
+            };
+            self.show_panel_lines(prefix, kind, lines);
+        }
+
+        /// 面板那两半的后半（行已经算好 → 打日志 → 上屏）的**行版**。
+        ///
+        /// ⚠️ 逐行打的时候**跳过 [`panel::PanelItem::Close`]**：那一格是"关闭"这个动作，不是
+        /// 一行内容，而既有那几屏的生产者最多给 5 行 ⇒ 加进 `rows` 的只有它 ⇒ 不打它就等于
+        /// 旧路径（只打日志的年代）的 stderr 文本**一个字节都不变**。
+        fn show_panel_rows(
+            &mut self,
+            prefix: &str,
+            screen: Result<(PanelKind, Vec<PanelRow>), String>,
+        ) {
+            match screen {
+                Ok((kind, rows)) => {
+                    self.ui_error = None;
+                    for r in &rows {
+                        if r.item != panel::PanelItem::Close {
+                            eprintln!("{prefix}: {}", r.text);
+                        }
+                    }
+                    self.show_panel(kind, rows);
+                }
+                Err(msg) => self.gacha_bailed(msg),
+            }
+        }
+
+        /// `Vec<String>` 那一版的适配器 = "一串字" → "全是只读行" → [`App::show_panel_rows`]。
+        ///
+        /// 留着它只有一个理由：「还缺」/「最近」/概率/复核这几屏的行**本来就没有可点的**，
+        /// 强行套进行结构会让每条报表先变成 `PanelRow` 再变回字。M7c 的收藏册不走这条。
+        fn show_panel_lines(
+            &mut self,
+            prefix: &str,
+            kind: PanelKind,
+            lines: Result<Vec<String>, String>,
+        ) {
+            let lang = self.ui.lang;
+            self.show_panel_rows(
+                prefix,
+                lines.map(|v| (kind, panel::collection_rows(lang, &v))),
+            );
+        }
+
+        /// 面板开着的行**跟着 `App::lang`/`App::motion` 重算**（点语言行、点动画行之后调）。
+        ///
+        /// 这里不置 `force_draw`：`lang` 与 `motion.code()` 都烘进行文案里，而行文案与 `lang`
+        /// 都进签名 ⇒ 闸门自己认得出（把会变的东西交给闸门去认，而不是靠调用方在每个改它的
+        /// 地方补一句"记得重画"）。重算按**当前的 `kind`**：从「概率」/「复核」借走的那一屏
+        /// 换回来的是默认五行。
+        fn refresh_panel_rows(&mut self) {
+            let Some(kind) = self.panel.as_ref().map(|p| p.kind) else {
+                return;
+            };
+            if let Ok(rows) = self.panel_rows(kind) {
+                self.show_panel(kind, rows);
+            }
+        }
+
+        /// 公示概率那五行：见 [`overlay_report::published_rates_lines`]（不碰库）。
+        fn rates_lines(&self) -> Result<Vec<String>, String> {
+            published_rates_lines(self.ui.lang)
+        }
+
+        /// 点"动画"那一行：`full → reduce → off → full`，**本进程立刻生效 + 当场写回**（M7e），
+        /// 与 [`App::cycle_lang`] 同一条路（`[ui] motion` 是 `write_ui_key` 认的两个键之一）。
+        ///
+        /// ⚠️ **不给菜单置 `force_draw`，也不是漏了**：`motion` 故意**不在** `menu::content_sig`
+        /// 里，而 `menu_pixels_ignore_the_motion_tier` 那条门禁断言的是"三档下菜单像素逐字节相同"
+        /// —— 这一行改的是**卡片动画**（burst 时长），不是此刻这张菜单。补那一句就是在
+        /// "静止菜单恒 1 提交"那块门面上重造 `69fd158`。这里只把 `MenuState::motion` 跟上新值：
+        /// 它是 `menu::after_pull` 的输入（下一次抽取的 burst 时长），不是"此刻这张菜单要重画"的理由。
+        ///
+        /// 面板反过来：设置面**确实要重算行**，因为 `settings_rows` 把 `motion.code()` 烘进那一行
+        /// 的正文，而正文进签名 ⇒ [`App::refresh_panel_rows`] 换完行，下一 tick 闸门自己放行。
+        fn cycle_motion(&mut self) {
+            let next = self.ui.motion.next();
+            let from_cli = self.ui.motion_from == settings::ValueSource::Cli;
+            self.ui.motion = next;
+            self.ui.motion_from = settings::ValueSource::MenuClick;
+            if let Some(m) = self.menu.as_mut() {
+                m.motion = next;
+            }
+            self.refresh_panel_rows();
+            eprintln!(
+                "ui: 抽卡动画 → {}（下一次抽取的 burst 才跟着变，本体动画不受它影响）",
+                next.code()
+            );
+            self.persist_ui_key(petstore::config::KEY_MOTION, next.code(), from_cli);
+        }
+
+        /// 面板被点：命中哪一格、那一格办哪件事（Wayland `on_panel_press` 的本平台版）。
+        ///
+        /// 分派**只走 [`panel::press`]**（命中 + `actionable` 把关，`Info` 在命中侧就被滤掉），
+        /// 把关放在命中侧而不是各分支里的理由那条已经付过学费（门禁
+        /// `an_info_row_is_hit_but_never_activates_...` 在共用层，两家共用）。所以这里的
+        /// `Info` 臂**不可达**，写出来是为了以后加一种行而忘了决定它点不点得着时，
+        /// `match` 会红而不是静默默认成"不可点"。
+        ///
+        /// 哪些格真、哪些格欠（M7d 口径：**这一面上没有欠的行**，逐臂写明去向）：
+        /// * `Header`（收藏册换 tab / 设置面回默认五行，也就是「概率」「复核」借走
+        ///   这一面时唯一的回程）、`More`（翻页；Owned 那一本真的产这一格，见
+        ///   [`App::album_screen`]）、`Wear(i)` = [`App::pick_and_wear`]、
+        ///   `Body(i)` = [`App::swap_body`]（M7d 的 P5）、`Lang`、`Motion`、
+        ///   `Rates`、`Verify`、`Close`。
+        ///
+        /// ⚠️ 两套下标**刻意不合并**：`Wear` 数 [`App::candidates`]（磁盘配件），`Body` 数
+        ///   [`App::bodies`]（本体库）—— 一个数字两个事实源就是
+        ///   `the_album_routes_pets_to_the_body_index_space` 要拦的形状。
+        ///
+        /// ⚠️ 这两臂都**只能在回调里做纯业务**（像素、清单、账）：动窗口要 `&mut Client`，
+        ///   而派发发生在 `pump` 内部 ⇒ 面板留在原地、行由 [`App::refresh_panel_rows`] 重算，
+        ///   那条函数走的仍是 `show_panel` 的"记旗"那一支。
+        fn dispatch_panel(&mut self, item: panel::PanelItem) {
+            let Some(kind) = self.panel.as_ref().map(|p| p.kind) else {
+                return;
+            };
+            match item {
+                panel::PanelItem::Info => {}
+                panel::PanelItem::Header => match kind.cycle().tab() {
+                    Some(tab) => self.collection_panel(tab, 0),
+                    None => self.open_panel(PanelKind::Settings),
+                },
+                panel::PanelItem::More => match kind.tab() {
+                    Some(tab) => self.collection_panel(tab, kind.page() + 1),
+                    None => self.open_panel(PanelKind::Settings),
+                },
+                panel::PanelItem::Wear(i) => self.pick_and_wear(i),
+                panel::PanelItem::Body(i) => self.swap_body(i),
+                panel::PanelItem::Lang => self.cycle_lang(),
+                panel::PanelItem::Motion => self.cycle_motion(),
+                panel::PanelItem::Rates => {
+                    let lines = self.rates_lines();
+                    self.show_panel_lines("rates", PanelKind::Settings, lines);
+                }
+                panel::PanelItem::Verify => {
+                    self.gacha_panel("verify", PanelKind::Settings, |g, l, s| {
+                        g.verify_lines(l, s)
+                    });
+                }
+                panel::PanelItem::Close => self.close_panel(),
+            }
+        }
+
         /// 第一次用到才连库，之后复用同一条连接。返回"库是否可用"，调用方据此决定余额读不读。
         ///
         /// 失败**只写错误行**：菜单照样开得出、宠物照样跑（硬约束 3 同族 —— UI 的故障不许
@@ -1216,6 +1962,48 @@ mod win {
             self.ui_error = Some(msg);
         }
 
+        /// UI 侧（非抽取）的出声处，与 [`App::gacha_bailed`] 同一条纹路：stderr + 那一行错误。
+        /// 分两个函数只为了**前缀不说谎**：配置写回的失败打成 `gacha: …` 会把排查的人支到
+        /// 数据库那边去。
+        fn ui_bailed(&mut self, msg: String) {
+            eprintln!("ui: {msg}");
+            self.ui_error = Some(msg);
+        }
+
+        /// 点设置行 = **当场写回 `config.toml`**（M7e 转真；与 Wayland 母本同一条路）。
+        ///
+        /// 本平台要额外记住的只有**那一条链**：`write_ui_key` 与 `Config::read()` 共用
+        /// `petstore::config::config_path()` 那三档阶梯（`%LOCALAPPDATA%` → `%APPDATA%` →
+        /// `%USERPROFILE%`），所以"写回哪一个文件"这句话**只能由 writer 返回的那个 `PathBuf`**
+        /// 说，不在 `App` 里重算一遍 —— 两处各算一次早晚漂移成两个文件，而用户会改哪一个全看运气。
+        ///
+        /// · **成功**只念 writer 返回的路径；消音那一条错误行是既有约定（`ensure_gacha`、
+        ///   `show_panel_lines`、`do_pull` 三处各自清空它）⇒ 这一行的语义是"最近一次失败"，
+        ///   不是"某个一直没修好的东西"；
+        /// · **失败**要把"本进程已经改了"一起说清 —— 只报"失败"会让人以为什么都没变，而屏上
+        ///   那一行此刻写的就是新值；
+        /// · **优先关系不因写回而改变**：`--lang`/`--motion` 高于文件（§4.6 那条链），从命令行
+        ///   启动的那次要明说"不带参数重启才看得见"，不然用户会以为点了等于没生效。
+        fn persist_ui_key(&mut self, key: &str, value: &str, from_cli: bool) {
+            match petstore::config::write_ui_key(key, value) {
+                Ok(path) => {
+                    self.ui_error = None;
+                    eprintln!(
+                        "ui: {key} = \"{value}\" 已写回 {}{}",
+                        path.display(),
+                        if from_cli {
+                            "（本次启动的值来自命令行参数，它高于文件 ⇒ 不带参数重启才读得到这一档）"
+                        } else {
+                            "（下次启动读这一档）"
+                        }
+                    );
+                }
+                Err(msg) => self.ui_bailed(format!(
+                    "写回 {key} 失败：{msg} ⇒ 本次会话仍然生效，下次启动不会"
+                )),
+            }
+        }
+
         fn gacha_balance(&self) -> i64 {
             self.gacha.as_ref().map(|g| g.balance()).unwrap_or(0)
         }
@@ -1239,7 +2027,7 @@ mod win {
             let dry_run = self.dry_run;
             // 语言与缩放都在这一刻取：文案与截断预算属于**这张卡**，之后切语言/换显示器
             // 不许重排已经挂着的卡（§7-R10，与 Wayland 同一句）。
-            let lang = self.lang;
+            let lang = self.ui.lang;
             let scale = self.menu.as_ref().map(|m| m.scale).unwrap_or(self.scale);
             let pulled = match self.gacha.as_mut() {
                 Some(g) => g.pull(count, dry_run, lang, scale),
@@ -1257,7 +2045,7 @@ mod win {
                 }
             };
             if let Some(m) = self.menu.as_mut() {
-                m.anim = menu::after_pull(best, lines, self.motion);
+                m.anim = menu::after_pull(best, lines, self.ui.motion);
                 m.balance = balance;
             }
             if let Some(sim) = self.sim.as_mut() {
@@ -1316,6 +2104,49 @@ mod win {
                 }
                 // 走到这里 `ensure_gacha()` 刚返回真，`gacha` 理论上是 `Some` ⇒ 这一支不该存在。
                 // 留着而不是 `expect`：不可达分支不该赌一次 panic（硬约束 3）。
+                None => None,
+            };
+            DressView::select(false, owned.as_ref(), &ids)
+        }
+
+        /// 本体这一档的**开发态豁免** = `--allow-unowned-pets` 且真的有 `--db`。
+        ///
+        /// ⚠️ 它与 [`App::dress_exempt`] **共用同一个判据函数**（[`dress_exempt_for`]），输入是
+        /// 两个不同的开关。合用一根的代价在 Wayland 那边算过：配件的屏上记号是帽子页标题的 `*`，
+        /// 而那一页的列表里**根本没有宠物** ⇒ 两根合并必然出现"标打了而没放行"。所以本体这一档
+        /// **没有屏上记号**（拍板④），只有这一处判据 + 启动/换上去那两行 stderr。
+        fn pet_exempt(&self) -> bool {
+            dress_exempt_for(self.opts.allow_unowned_pets, self.dry_run)
+        }
+
+        /// 收藏册宠物行的**库存那道** = [`App::dress_view`] 的同形兄弟，喂的是 [`App::bodies`] 的
+        /// id。判定共用 [`DressView::select`]（三档输入那一层），所以"未拥有的件不出现"与"未拥有的
+        /// 本体点不动"从头是**同一判据**，不会有两套答案。
+        ///
+        /// ⚠️ **失败关闭**：给了 `--db` 而库存读不出 ⇒ 可见集为空。宁可这一轮换不了本体而 stderr
+        /// 有一行解释，也不要"没验过拥有就换成那只"。
+        ///
+        /// ⚠️ 只在点击回调里调（收藏册那一行点下去、以及 [`App::album_screen`] 给不给下标那一刻），
+        /// 不轮询。与 [`App::dress_view`] 各自开一次库不是两个事实源：库是事实源，两次读的是同一张表。
+        fn pet_view(&mut self) -> DressView {
+            // 名字要先取：下面 `ensure_gacha()` 可变借用 self，不能同时留 `bodies` 的引用。
+            let ids: Vec<String> = self.bodies.iter().map(|b| b.id.clone()).collect();
+            if self.pet_exempt() || self.dry_run {
+                return DressView::select(true, None, &ids);
+            }
+            if !self.ensure_gacha() {
+                return DressView::select(false, None, &ids);
+            }
+            let owned = match self.gacha.as_ref().map(|g| g.store.owned()) {
+                Some(Ok(o)) => Some(o),
+                Some(Err(e)) => {
+                    eprintln!(
+                        "ui: 换本体 ⇒ 读库存失败（{e}）⇒ 未验过的本体一律不放行（库里有什么这轮读不出）"
+                    );
+                    None
+                }
+                // 走到这里 `ensure_gacha()` 刚返回真 ⇒ 这一支理论上不可达，留着而不是 `expect`
+                // （配件那侧同一条理由，写在 [`App::dress_view`]：不可达分支不该赌一次 panic）。
                 None => None,
             };
             DressView::select(false, owned.as_ref(), &ids)
@@ -1434,6 +2265,298 @@ mod win {
                     eprintln!("ui: 换一件 ⇒ 已穿上 {worn}（第 {shown}/{total} 件）{note}");
                 }
                 Err(e) => eprintln!("ui: 换一件 ⇒ 选中 {slug} 但装载失败：{e}（停在未装备态）"),
+            }
+        }
+
+        /// 收藏册点名一件 ⇒ **直接穿上**（P4 = Wayland 那边用户 11-07 拍板②，本平台同判词）。
+        /// 第 4 个 [`Self::wear`] 调用点，也是唯一一个"下标来自屏上一行"的。
+        ///
+        /// 为什么不借道 [`Self::equip`]（这条反直觉的理由在母本已经付过学费，这里整段照抄）：
+        /// `equip` 的第一条出口是"已经穿着 ⇒ 当场返回"，而它成立靠的是**"穿着的就是 `picked`
+        /// 那一件"这条不变量**。收藏册要点的是**任意一格**，那条不变量在这一条路上还没建立就
+        /// 要求它 ⇒ 借道 `equip` 的话，"身上是 A、点的是 B"会读成"已经穿着"⇒ **静默不动 +
+        /// 一句谎话**。所以顺序是：
+        ///
+        /// 1. `dress_view()` —— 所有权闸**照旧只有一个所有者**，这一条不自己实现"许不许穿"；
+        /// 2. 判 [`overlay_common::dress::plan_pick_wear`]（**比 `picked` 必须在这里，任何写入之前**）；
+        /// 3. `SelectAndWear` 时**先** [`Self::take_worn`] 释放身上那件，**再**写 `picked`、再 [`Self::wear`]。
+        ///
+        /// 3 里"先释放"是 M1 内存档的字面要求（配件 sheet 每件 45.000 MiB，11-23 的 Wine 那轮
+        /// 实测过），而"释放排在写 `picked` 之前"是为了让 2 的判据读到的还是**用户点之前**那个世界。
+        /// 用 `take_worn` 不用 [`Self::unwear`]：后者会先把库里那一格 DELETE 再写回来，白写一次
+        /// 且留一个"库里没有"的可见窗口。
+        ///
+        /// **面板不关**：[`panel::placement`] 优先右/左/上/下不压宠物 ⇒ 换的像素看得见，而关掉会
+        /// 连 `page` 一起丢（用户翻页翻到第 3 页点一件，屏跳回第一页 = 白翻）。这一条也不重画
+        /// 面板：本轮面板的行**一个字没变**（选中了什么不上屏 = 用户 11-07 拍板③）。
+        fn pick_and_wear(&mut self, i: usize) {
+            let view = self.dress_view();
+            match plan_pick_wear(
+                view.visible.contains(&i),
+                self.worn.is_some(),
+                self.picked,
+                i,
+            ) {
+                PickWear::Refused => {
+                    // 屏上这一行是 `Wear(i)` 才被点到的，而 `Wear(i)` 是产行的那一刻按同一道闸
+                    // 给的下标 ⇒ 走到这里只能是**两次点击之间**世界变了（库被另一进程改了 / 磁盘
+                    // 产物被删了）。不赌 panic，也不"顺手穿上"：失败关闭。
+                    eprintln!(
+                        "ui: 收藏册 ⇒ 点名第 {i} 格而这一轮不许穿（可穿 {} 件 · 因未拥有出局 {} 件）⇒ 不动",
+                        view.visible.len(),
+                        view.withheld
+                    );
+                }
+                PickWear::AlreadyWorn => {
+                    eprintln!("ui: 收藏册 ⇒ 身上已经是第 {i} 格这一件，不解像素、不重投帧");
+                }
+                PickWear::SelectAndWear => {
+                    if let Some((slug, bytes)) = self.take_worn() {
+                        eprintln!(
+                            "ui: 收藏册 ⇒ 先释放 {slug}（{:.3} MiB 解码）⇒ 峰值始终是一件",
+                            bytes as f64 / (1024.0 * 1024.0)
+                        );
+                    }
+                    self.picked = i;
+                    match self.wear(i) {
+                        Ok(slug) => eprintln!("ui: 收藏册 ⇒ 穿上 {slug}（点名自第 {i} 格）"),
+                        Err(e) => {
+                            eprintln!("ui: 收藏册 ⇒ 点名第 {i} 格而装载失败：{e}（停在未装备态）")
+                        }
+                    }
+                }
+            }
+        }
+
+        /// 换成另一只本体（P5 = 收藏册里点宠物行那一件事）。**唯一入口**。
+        ///
+        /// Wayland 母本（`overlay-wayland/src/app.rs` 的 `swap_body`）的九步在这里是**八步**：
+        /// 少的只有第 3 步"换穿透轮廓"。本平台没有 `Regions` 消费者（命中读的是叠完之后的
+        /// canvas alpha，见 `stage.rs` 模块头）⇒ "新清单 + 旧轮廓"这个半换形状在本平台
+        /// **没有对应的数据结构**，不是省了一步。其余每一步的位置与理由逐字继承，包括
+        /// "判定全在写入之前"和"账排最后"。
+        ///
+        /// ⚠️ **顺序就是它的全部安全性**，两条最承重的：
+        /// * [`Atlas::reload`]（第 3 步）是**不可回头的那一条线**之前唯一的写点，而它自己的
+        ///   几何自检（列×行×格）排在它第一笔像素写之前 ⇒ 半换形状构造不出来。
+        /// * 第 2 步（先释放帽子）排在第 3 步之前不是顺手：反过来就瞬间有"旧本体 + 新本体 + 帽"
+        ///   在场，而 ≈147 MB **仍落在 ≤200 MiB 门禁内 ⇒ 什么都不会红**。所以这条防线的读数是
+        ///   两处：验收量一次 `VmHWM`，以及源级门禁数 `atlas.reload(` 恰好 1 次 + `take_worn`
+        ///   排在它前面（`dress.rs` 的 `the_pixels_and_the_ledger_are_written_by_one_function_each`）。
+        ///
+        /// 非目标（写在这里以免被读宽）：**不做**"换回默认本体"这一档 ⇒ `body` 行永远只有 UPSERT、
+        /// 没有 DELETE（换本体是"换到某一只"，不是"脱下"；屏幕上任何时刻都有一只本体）。
+        fn swap_body(&mut self, i: usize) {
+            // —— 第 1 步：四道判完，**任何写入之前**（P4 在 [`Self::pick_and_wear`] 立的那条不变量）。
+            let view = self.pet_view();
+            let gate = view.visible.contains(&i);
+            let in_range = i < self.bodies.len();
+            let same_grid = self
+                .bodies
+                .get(i)
+                .is_some_and(|b| b.grid == self.manifest.grid);
+            let same_id = self.bodies.get(i).is_some_and(|b| b.id == self.body_id);
+            // 名字取在判定之前，只为让拒绝那一行点得出名（用户内容 ⇒ 只进 stderr，不上屏）。
+            let name = self
+                .bodies
+                .get(i)
+                .map(|b| b.id.clone())
+                .unwrap_or_else(|| format!("第 {i} 格"));
+            match plan_swap_body(in_range, gate, same_id, same_grid) {
+                SwapBody::Refused(why) => {
+                    eprintln!("ui: 换本体 ⇒ 拒绝 {name}：{why} ⇒ 本体、帽子、`equipped` 一律不动");
+                    return;
+                }
+                SwapBody::Same => {
+                    eprintln!("ui: 换本体 ⇒ 身上已经是 {name} ⇒ 不解像素、不重投帧、账也不写");
+                    return;
+                }
+                SwapBody::Switch => {}
+            }
+            // 四道都过 ⇒ 这一格必然在库里。仍用 `get`：取不到就多打一行后返回，不赌一次 panic
+            // （硬约束 3：宠物崩溃不能影响桌面）。
+            let Some((pet_slug, sheet)) = self.bodies.get(i).map(|b| (b.slug.clone(), b.sheet()))
+            else {
+                eprintln!("ui: 换本体 ⇒ 判定放行而 {name} 这一格取不到 ⇒ 不动（判据与库对不上）");
+                return;
+            };
+            let Some(sheet_str) = sheet.to_str().map(|s| s.to_string()) else {
+                eprintln!("ui: 换本体 ⇒ {name} 的 sheet 路径不是 UTF-8 ⇒ 本体不动");
+                return;
+            };
+
+            // —— 第 2 步：先释放帽子。身份要在这一步**之前**取全：`Worn` 只带清单（`slug`/`slot`），
+            // 而"这一件是谁"（`id` = 目录名 = 库存与 `equipped` 认的那个键）记在 [`Candidate`] 那一侧，
+            // 第 5 步重建候选表之后就查不到了。读 `candidates[picked]` 依赖的是那条既有不变量
+            // "**穿着 ⇒ 穿的就是当前选中这件**"（四个装载点共同维持，见 [`Self::pick_and_wear`]
+            // 那条注释）；`id` 取不到时第 6 步不猜，直接按"出局"处理。
+            struct WornHat {
+                id: Option<String>,
+                slot: String,
+                slug: String,
+            }
+            let worn_hat = self.worn.as_ref().map(|w| WornHat {
+                id: self.candidates.get(self.picked).map(|c| c.id.clone()),
+                slot: w.manifest.slot.to_string(),
+                slug: w.manifest.slug.clone(),
+            });
+            if let Some((slug, bytes)) = self.take_worn() {
+                eprintln!(
+                    "ui: 换本体 ⇒ 先释放帽子 {slug}（{:.3} MiB 解码）⇒ 峰值始终是一只本体 + 一顶帽",
+                    bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+
+            // —— 第 3 步：解新 sheet（母本的第 4 步）。这一步之后就没有可回头的失败了。
+            match self.atlas.as_mut() {
+                Some(atlas) => {
+                    if let Err(e) = atlas.reload(&sheet_str) {
+                        eprintln!(
+                            "ui: 换本体 ⇒ {name} 的 sheet 解不开（{e}）⇒ **本体没换**，屏上仍是 {cur}\
+                             （帽子已在第 2 步释放，库里那一行还在：点「穿上」就回来，重启也会回来）",
+                            cur = self.body_id
+                        );
+                        // ⚠️ 这里**必须**补一次重投：`take_worn` 只丢字节、不置 `force_draw`
+                        // （它的注释明写"由调用方决定用户要不要看见"），而此刻屏上留着的是**已经不在
+                        // 内存的那顶帽子**的像素 ⇒ 不重画就是"像素里有帽子而库里说没穿"那格点不到的
+                        // 状态，且它要留到下一次格子真变才被洗掉。
+                        self.force_draw = true;
+                        return;
+                    }
+                }
+                None => {
+                    // 走到这里意味着 `bodies` 非空而 `atlas` 是 `None` —— 启动里那两个条件是
+                    // 同一个（`pixels`），所以这是"以后有人绕过 `startup` 构造 App"的形状。
+                    // 报一行、不动，而不是 `unwrap`（硬约束 3）。
+                    eprintln!("ui: 换本体 ⇒ 这一轮没有图集像素（`--test-rect` 那条路）⇒ 本体不动");
+                    return;
+                }
+            }
+
+            // —— 第 4 步：提交元数据。清单的 `&'static` 在这里才泄（第一次用上它，见
+            // [`BodyCandidate::leaked`]）⇒ 一份进程内每只不同的宠物只泄几 KB，不是每次换都泄。
+            //
+            // `cell` **不动**：第 1 步的 `same_grid` 已经保证新清单的格子档与身上这一只逐字节相同
+            // （不同档在 `plan_swap_body` 就被拒了），所以 `Frame` / 窗口 / buffer 一个都不必重建。
+            let m = self.bodies[i].leaked();
+            self.manifest = m;
+            self.body_id = name.clone();
+            if let Some(sim) = self.sim.as_mut() {
+                sim.swap_manifest(m);
+            }
+
+            // —— 第 5 步：按**新本体**重跑配件发现 ⇒ `fits` 不含新 `slug` 的那几件当场出局
+            // （`AccessoryManifest::validate_against` 比的就是 `body.slug`），出局的每一件走既有的
+            // skip-and-log 点名 ⇒ 这几行就是 J4a/J4b 的唯一读数。
+            // ⚠️ 库位置是 `accessory_root()`，**不是**本体库那个根：Wayland 那边 11-07 实测错过
+            // 这一次（`accessories: 库 …/pets_p5 ⇒ 0 件可用`）⇒ **换完本体之后帽子当场掉、且这一轮
+            // 再也穿不上任何配件**，而第 6 步的按 id 重认永远查不到幸存者。那是一条 headless 读不到
+            // 的接线错，所以判据落在 `dress.rs` 那条门禁：`swap_body` 的函数体里连注释都不许写
+            // 本体库那个函数名。
+            self.candidates = accessory_root()
+                .map(|root| discover_accessories(&root, m))
+                .unwrap_or_default();
+
+            // —— 第 6 步：**按 id 重认**身上那顶（不按位置、不按旧下标）。
+            let survivor = worn_hat
+                .as_ref()
+                .and_then(|hat| hat.id.as_ref())
+                .and_then(|old_id| self.candidates.iter().position(|c| &c.id == old_id));
+            match (&worn_hat, survivor) {
+                (None, _) => {}
+                (Some(hat), Some(j)) => {
+                    self.picked = j;
+                    // 这里**不重跑库存那道**（与 [`Self::equip`] 不同），是选的：这一件本来就穿着，
+                    // 重新装上不是"批准一个未验过的请求"，而重跑会把"库这一刻读不出"那档变成**当场脱
+                    // 帽** —— 那等于把一次 IO 故障当成一条判定。
+                    match self.wear(j) {
+                        Ok(slug) => eprintln!(
+                            "ui: 换本体 ⇒ 换成 {name}；帽子 {slug} 在新本体上仍然匹配 ⇒ 重新穿上（候选第 {} 格）",
+                            j + 1
+                        ),
+                        Err(e) => eprintln!(
+                            "ui: 换本体 ⇒ 换成 {name}，而帽子 {} 重新装载失败（{e}）⇒ 停在未装备态\
+                             （库里那一行还在：{slot}={id}）",
+                            hat.slug,
+                            id = hat.id.clone().unwrap_or_default(),
+                            slot = hat.slot
+                        ),
+                    }
+                }
+                (Some(hat), None) => {
+                    let why = match &hat.id {
+                        Some(id) => format!(
+                            "{id} 不在新本体的候选里（{name} 的 `slug` = {pet_slug}，`fits` 不含它，或它的产物门禁在这只上过不了）"
+                        ),
+                        None => format!("释放前没能确定这一件是谁（{pet_slug}）⇒ 不猜"),
+                    };
+                    eprintln!(
+                        "ui: 换本体 ⇒ 换成 {name}；{why} ⇒ 当场脱帽，并删掉库里 {slot}={id} 那一行",
+                        slot = hat.slot,
+                        id = hat.id.clone().unwrap_or_default()
+                    );
+                    // 用 `persist_unworn`（只删账）而不是 [`Self::unwear`]：像素在第 2 步就释放了，
+                    // `unwear` 此刻读 `worn` 是 `None` ⇒ 它会一声不响地什么都不做，而**库里那一行必须
+                    // 删掉** —— 留着就是"重启给一只戴不上的宠物戴帽子"（屏上 A、记忆里 B 那一族）。
+                    self.persist_unworn(&hat.slot);
+                    // `picked` 不该停在一件已经不存在的格上（[`Self::cycle_accessory`] 那条同形理由：
+                    // 那正是"点了没反应"的假按钮形状）。候选表整个换了 ⇒ 重问一次**配件**那一侧的
+                    // 可见集；这一刻多开一次库不算两个事实源（同一次点击、同一张表、事件驱动）。
+                    let fresh = self.dress_view();
+                    self.picked = fresh.visible.first().copied().unwrap_or(0);
+                }
+            }
+
+            // —— 第 6′ 步：面板行要按**新的**候选表重算。收藏册里配件那一格的载荷是 `candidates` 的
+            // 下标，而上一步整张表重建过 ⇒ 不刷新就是"行上写着 A、点下去穿的是 B"（两个事实源），
+            // 而它**不进 `content_sig`**（下标故意不在签名里）⇒ 光靠签名自己认不出来。
+            self.refresh_panel_rows();
+
+            // —— 第 7 步：**本轮最承重的一行**。四份 @192 产物的行表逐字节相同 ⇒ 内核下一次给出的
+            // `{key,row,col}` 与换之前**完全相同**，而 [`Self::round`] 里 `cell != drawn_cell
+            // || force_draw` 那道门永远不开 ⇒ 删掉这两行的后果是一次**屏上静默不变**的换本体：像素与
+            // 清单都真的换了，而屏幕继续投旧格子（那边变异测试的实测形状 = 五百多条全绿而真机失败，
+            // 只有截图抓得到 ⇒ 所以这两行进了源级门禁的读数，不能只留注释）。
+            // `drawn_cell = None` 排在前：它保证"下一格无条件算作新格"，`force_draw` 保证"就算格子
+            // 没变也投一帧"。先例 = [`Self::apply_dpi`] 与 [`Self::equip`] 那条"这正是 `force_draw`
+            // 的合法领地 = 签名与 `drawn_cell` 都看不见的那些像素"。
+            self.drawn_cell = None;
+            self.force_draw = true;
+
+            // —— 第 8 步：**账排最后**（先像素后账，[`Self::persist_worn`] 同一条口径）。
+            self.persist_body(&name);
+            eprintln!(
+                "ui: 换本体 ⇒ 当前本体 = {name}（`equipped` 的 {slot} 行）",
+                slot = overlay_common::dress::BODY_SLOT
+            );
+        }
+
+        /// 把"当前本体是这只"记进库的 `body` 行。三档结论与 [`Self::persist_worn`] 完全同一套
+        /// （共用 [`write_equip]`），差别只在**槽位**和那句"重启会回到哪一只"。
+        ///
+        /// 拆成单独一条而不是把 `persist_worn` 改造成带槽位参数：后者的 `index` 是 `candidates` 的
+        /// 下标，而本体那套下标是 `bodies` 的（两个下标空间，收藏册按 `PanelItem::Body` /
+        /// `PanelItem::Wear` 两臂路由）。共用一个函数就要共用一个下标空间，那正是
+        /// `the_album_routes_pets_to_the_body_index_space` 那条门禁要杀的形状。
+        ///
+        /// ⚠️ 只有 UPSERT、没有 DELETE：见 [`Self::swap_body`] 那条"非目标"。
+        fn persist_body(&mut self, id: &str) {
+            match write_equip(
+                &mut self.gacha,
+                self.dry_run,
+                overlay_common::dress::BODY_SLOT,
+                id,
+            ) {
+                Ok(WornWrite::Written) => {}
+                Ok(WornWrite::DemoSkipped) => eprintln!(
+                    "ui: 演示态 ⇒ 本体没记进 equipped（无 `--db` = 内存库，重启必然回到 `--manifest` 那只；要留住就加 `--db`）"
+                ),
+                Ok(WornWrite::NoStore) => eprintln!(
+                    "ui: 屏上已换而 equipped 没记上 ⇒ 连不上库 ⇒ 重启会回到 `--manifest` 那只"
+                ),
+                Err(e) => {
+                    eprintln!("ui: 屏上已换而 equipped 没记上（{e}）⇒ 重启会回到 `--manifest` 那只")
+                }
             }
         }
 
@@ -1559,11 +2682,12 @@ mod win {
             // 账打"磁盘上找不到这一件"，而那句是假话（共用层那条函数的注释算过整件事）。
             let (body, accessories) = split_body_row(&rows);
             if let Some(id) = body.as_deref().filter(|id| *id != self.body_id) {
-                // 本平台**不换本体**（`--allow-unowned-pets` 仍在 `cli::REFUSED`）⇒ 这一行只报告
-                // 不一致，不追它。不写这一句就是"上次换的那只自己没了"而没人说过为什么。
+                // M7d 起这一行**只在"覆盖没成立"时打**：起点本体早在 [`App::startup`] 那一轮按
+                // [`plan_body_override`] 换过了（换成功 ⇒ `body_id` 已经等于库里那一行，这一支不进）。
+                // 所以此刻说的是一件真事：那一只**这一轮没装上**，而说得出没装上的三种成因。
                 eprintln!(
-                    "body: 库里那一行 {slot}={id}，而本轮起点本体是 {cur} ⇒ Windows 这一片不换本体\
-                     （P5 未移植）⇒ 那一只不会上屏；这一行留着，装上换本体那天它自己会消失",
+                    "body: 库里那一行 {slot}={id}，而本轮起点本体是 {cur} ⇒ 那一只这一轮没装上\
+                     （扫盘没交出它：目录不存在 / 产物坏了 / 格子档不同）",
                     slot = overlay_common::dress::BODY_SLOT,
                     cur = self.body_id,
                 );
@@ -1598,14 +2722,16 @@ mod win {
         /// 那臂只把命中结果递过来）。把关放命中侧的原因原样继承（结果卡相位不许点着底下的行，
         /// 门禁 `the_card_phase_opens_no_row_to_the_pointer` 是共用的绘制层测的）。
         ///
-        /// 哪些行真、哪些行欠（本批口径，逐臂写明去向）：
-        /// * **真**：`Close`/`Page`/`Lang`、动作页四行 + `Pause`（`Command::Go`）、`Quit`、
-        ///   `Equip`/`Unequip`/`NextOutfit`（M5e 换装，走 [`App::wear`] 那一族）；
-        /// * **欠**：`Pull*` = M6、收藏册与设置那六行 = M7（面板是它们的功能本体，菜单这侧只有入口）。
+        /// 哪些行真（M7b 之后**这一面上没有欠的行**，逐臂写明去向）：
+        /// * `Close`/`Page`/`Lang`、动作页四行 + `Pause`（`Command::Go`）、`Quit`、
+        ///   `Equip`/`Unequip`/`NextOutfit`（M5e 换装，走 [`App::wear`] 那一族）、
+        ///   `Pull1`/`Pull10`（M6 抽卡与结果卡面）；
+        /// * `Owned`/`Missing`/`Recent`/`MotionTier`/`Rates`/`Verify` = M7b 面板入口。
+        ///   ⚠️ 这六行**只是入口**：功能本体在 [`App::dispatch_panel`]，而菜单这侧不复制任何
+        ///   一条报表逻辑（收藏册三屏的字由 [`App::gacha_panel`] 一次算完、同时进 stderr 与像素）。
         ///
-        /// 欠的行**只出声 stderr，不在屏上发明新字** —— 那些行的文字本来就画在菜单上（共用
-        /// 绘制层 ⇒ 共用字体子集），点下去没有副作用是"分批交付"的形状，不是假按钮
-        /// （假按钮 = 画一个客户端**永远读不到**的东西；这里读得到、认得名字、只是活还没搬过来）。
+        /// 曾经挂在这一臂上的那句"欠的行**只出声 stderr，不在屏上发明新字**"仍然成立，
+        /// 只是 M7b 之后它没有使用者了 —— 屏上每一个格子背后都有一件真会办的事。
         fn dispatch_menu(&mut self, item: MenuItem) {
             match item {
                 MenuItem::Close => self.pending_menu_close = true,
@@ -1626,13 +2752,25 @@ mod win {
                 MenuItem::Equip => self.equip(),
                 MenuItem::Unequip => self.unequip(),
                 MenuItem::NextOutfit => self.cycle_accessory(),
-                MenuItem::Owned
-                | MenuItem::Missing
-                | MenuItem::Recent
-                | MenuItem::MotionTier
-                | MenuItem::Rates
-                | MenuItem::Verify => {
-                    eprintln!("menu: {item:?} = M7 面板接线 ⇒ 这一批点了只出声（第三块面还没建）");
+                MenuItem::Owned => self.collection_panel(CollectionTab::Owned, 0),
+                MenuItem::Missing => self.collection_panel(CollectionTab::Missing, 0),
+                // 「最近」的条数 = 一屏装得下的行数（`panel::MAX_ROWS - 1`，判据在
+                // `overlay_report::Gacha::tab_lines`，两家同一个数）。
+                MenuItem::Recent => self.collection_panel(CollectionTab::Recent, 0),
+                // ── 设置页：菜单那三行是**入口**，功能在面板上办 ──
+                // `MenuItem::Settings` 不存在（也不该有 —— 加一个变体要动 `rows()`、命中表、
+                // 四个 locale 的文案与字体子集），所以"动画"那一档的循环职责交给面板里的
+                // `PanelItem::Motion` 行，菜单这一行只负责把那一面开出来。
+                MenuItem::MotionTier => self.open_panel(PanelKind::Settings),
+                // 公示概率不碰库（见 [`App::rates_lines`]），所以这一臂不过 `gacha_panel`。
+                MenuItem::Rates => {
+                    let lines = self.rates_lines();
+                    self.show_panel_lines("rates", PanelKind::Settings, lines);
+                }
+                MenuItem::Verify => {
+                    self.gacha_panel("verify", PanelKind::Settings, |g, l, s| {
+                        g.verify_lines(l, s)
+                    });
                 }
             }
         }
@@ -1649,23 +2787,42 @@ mod win {
             m.items = menu::rects(next);
         }
 
-        /// 点语言行：`zh → en → ja → ko` 循环，**本进程立刻生效**（lang 进签名 ⇒ 下一轮重画）。
+        /// 点语言行：`zh → en → ja → ko` 循环，**本进程立刻生效 + 当场写回**（M7e）。
         ///
-        /// ⚠️ Wayland 那侧这一步还多两件事，都随 M7 的 `--lang`/config 链一起落地：
-        /// ① 写回 `config.toml`（`persist_ui_key`）；② 从 `--lang` 启动时那句"高于文件"的提醒。
-        /// 本平台此刻没有那条链 ⇒ 这里不假装有持久化（stderr 那句把欠账说在明处）。
+        /// 四步联动的次序与 Wayland 母本逐字一致（见 [`App::apply_lang`] 的理由）：本平台**没有**
+        /// 第二条调用者（§3.12 的 `lang.set` 套接字还没实现，那一臂归第三批），但这一层拆分成
+        /// 函数不是省事 —— 本平台只有这一处会动 `ui.lang`，写在一起让"只有这一处"可被 grep 数出来。
         fn cycle_lang(&mut self) {
-            let next = self.lang.next();
-            self.lang = next;
+            let next = self.ui.lang.next();
+            self.apply_lang(next, settings::ValueSource::MenuClick);
+        }
+
+        /// **一档新语言被应用 + 写回的唯一落点**（本平台只有 [`App::cycle_lang`] 一个调用者；
+        /// Wayland 那边还有 §3.12 `lang.set` 的套接字臂共用这一处）。
+        ///
+        /// 写回不再"提示你自己去写"：[`petstore::config::write_ui_key`] 走 `toml_edit` 保 decor +
+        /// 落盘前后各判一次，所以两处一起改（`App.ui.lang` 是真相源、`MenuState.lang` 是 draw 用的
+        /// 副本）—— **全项目只有这一处写它**。
+        ///
+        /// 第三处 = **开着的面板要把行重算**（[`App::refresh_panel_rows`]）：面板那一屏每一行的字
+        /// 都从 `lang` 来，不换就是"切了语言而收藏册还写着中文"。这里**不给面板置 `force_draw`**：
+        /// `lang` 与每一行文本都已经在 `panel::content_sig` 里，闸门自己认得出。
+        ///
+        /// 写回排在最后，是因为 [`App::persist_ui_key`] 是这一族里唯一会**改错误行**的一步，
+        /// 而错误行也在签名里 —— 它对"这次到底落没落地"有最后发言权。
+        fn apply_lang(&mut self, next: Lang, source: settings::ValueSource) {
+            // 写回之前先记下这一档原来是从哪层来的：命令行高于文件（§4.6），所以从 `--lang`
+            // 启动的那一次点了也不会下次生效，这句话必须说，不然是"点了没反应"的假故障。
+            let from_cli = self.ui.lang_from == settings::ValueSource::Cli;
+            self.ui.lang = next;
+            self.ui.lang_from = source;
             if let Some(m) = self.menu.as_mut() {
                 m.lang = next;
                 m.force_draw = true;
             }
-            eprintln!(
-                "ui: 语言 → {} ({})（本批不写回 config ⇒ 重启回到默认，写回随 M7 的 --lang 落地）",
-                next.self_name(),
-                next.code()
-            );
+            self.refresh_panel_rows();
+            eprintln!("ui: 语言 → {} ({})", next.self_name(), next.code());
+            self.persist_ui_key(petstore::config::KEY_LANG, next.code(), from_cli);
         }
 
         /// 动作页四行 + 暂停行 ⇒ 一条 `Command::Go`，**不在客户端预判内核会不会响应**
@@ -1692,6 +2849,11 @@ mod win {
                 (Some(n), Some(sim)) => Some((n.as_str(), sim.fingerprint())),
                 _ => None,
             };
+            // 生效值那一行同理（M7e）：正文 = [`Settings::summary`](crate::settings::Settings::summary)
+            // 的返回值，而它是**算出来的** `String` ⇒ 先落一个活过 `lines()` 的绑定，
+            // 好让 `Run` 保持 `Copy`。这一行与摘要清单里那行 `ui: 已接/未接` **共用 `ui:` 前缀**
+            // （读它要带更长的前缀，`summary.rs` 里那条计数断言钉着）。
+            let ui_line = self.ui.summary();
             let run = summary::Run {
                 ticks: self.ticks,
                 wall_secs: self.started.elapsed().as_secs_f64(),
@@ -1709,7 +2871,9 @@ mod win {
                 cpu_secs: cpu.as_ref().ok().copied(),
                 cpu_reason: cpu.as_ref().err().map(String::as_str),
                 menu_open: self.menu.is_some(),
+                panel_open: self.panel.is_some(),
                 font: summary::Font::collect(),
+                ui_effective: &ui_line,
             };
             println!("windows overlay 摘要：");
             for line in summary::lines(&run) {
@@ -1732,8 +2896,11 @@ mod win {
                     // 那份 canvas ⇒ 圆角外点得穿，与宠物面同一套 alpha 数学、同一个阈值。
                     self.menu.as_ref().is_some_and(|m| m.hit(x, y))
                 }
-                // 卡/面板两块面到 M6/M7 才存在；"存在而透明"比"报错"更配它们的未接线状态。
-                SurfaceKind::Card | SurfaceKind::Panel => false,
+                // 面板与菜单同一套数学：命中读的就是上一轮交出去的那份 canvas ⇒ 圆角外点得穿。
+                SurfaceKind::Panel => self.panel.as_ref().is_some_and(|p| p.hit(x, y)),
+                // 结果卡**不是一块独立面**（M6 拍板：它与菜单同面不同相位，`MenuAnim::Burst/
+                // Reveal` 画在同一张卡片上）⇒ 这一格在 Windows 上结构性不可达，`false` 是实话。
+                SurfaceKind::Card => false,
             }
         }
 
@@ -1751,7 +2918,19 @@ mod win {
                         self.dispatch_menu(item);
                     }
                 }
-                SurfaceKind::Card | SurfaceKind::Panel => {}
+                // 面板：与菜单同一条纪律 —— 命中 + `actionable` 把关只走 `panel::press`
+                // （唯一许可分派入口），坐标先物理→逻辑（命中表是逻辑口径）。
+                SurfaceKind::Panel => {
+                    let item = self
+                        .panel
+                        .as_ref()
+                        .and_then(|p| panel::press(&p.items, p.local_logical(x, y)));
+                    if let Some(item) = item {
+                        self.dispatch_panel(item);
+                    }
+                }
+                // 结果卡与菜单同面不同相位（见 `hit` 那一臂）⇒ 这块面上没有独立的点击可派发。
+                SurfaceKind::Card => {}
             }
         }
 
@@ -1762,13 +2941,16 @@ mod win {
         }
 
         fn right_press(&mut self, kind: SurfaceKind) {
-            // 两臂汇成同一个旗：toggle。分开列只是把"身份可判别"写清楚 ——
-            // 右键宠物 ⇒ 开菜单；右键菜单的不透明像素 ⇒ 关（D14"关闭 = 再右键"的 Windows 形）。
+            // 三臂 = 三种"此刻看着哪块面"：右键宠物/菜单 ⇒ 菜单 toggle（D14"关闭 = 再右键"）；
+            // 右键面板 ⇒ 关面板。**不许把面板并进上面那一臂**：`toggle_menu` 的第一句查的是
+            // `self.menu`，面板开着而菜单没开时它会去**开菜单**，正好把互斥那条破掉
+            // （症状 = 右键面板弹出菜单，看起来像"关不掉"）。
             // **这一臂就是 M5a 那份退出证据**：Wine 上右键宠物菜单出现，读的是这里，
             // 而 `window.rs` 那侧只保证 `WM_RBUTTONDOWN` 会走到这。
             match kind {
                 SurfaceKind::Pet | SurfaceKind::Menu => self.pending_menu_toggle = true,
-                SurfaceKind::Card | SurfaceKind::Panel => {}
+                SurfaceKind::Panel => self.close_panel(),
+                SurfaceKind::Card => {}
             }
         }
 
@@ -1818,7 +3000,17 @@ mod win {
         Ok(Box::leak(Box::new(m)))
     }
 
-    fn load_atlas(opts: &Options, manifest: &Manifest) -> Result<Option<Atlas>, String> {
+    /// 解**起点本体**那一张 sheet。`body_dir` = `plan_body_override` 判定要覆盖时那一只的
+    /// 目录；`None` = 用 `--manifest` 那个目录的父级（= 老行为）。
+    ///
+    /// ⚠️ 本平台**没有 polygon 的消费者**（命中读的是叠完之后的 canvas alpha，见 `stage.rs`），
+    /// 所以这里只取 `sheet.webp`。这不影响 [`discover_pets`] 仍按三件套要求本体 —— 两家同一本账，
+    /// 差别只在"谁在什么时候读哪一份"，不在"产物必须长什么样"。
+    fn load_atlas(
+        opts: &Options,
+        manifest: &Manifest,
+        body_dir: Option<&std::path::Path>,
+    ) -> Result<Option<Atlas>, String> {
         if opts.test_rect {
             return Ok(None);
         }
@@ -1826,10 +3018,18 @@ mod win {
             .manifest
             .as_deref()
             .ok_or("--manifest 缺失而矩形档也没开（cli 应当已经拒掉这一组合）")?;
-        let sheet = path
-            .parent()
-            .ok_or_else(|| format!("{} 没有父目录 ⇒ 找不到 sheet.webp", path.display()))?
-            .join("sheet.webp");
+        let owned_dir;
+        let dir = match body_dir {
+            Some(d) => d,
+            None => {
+                owned_dir = path
+                    .parent()
+                    .ok_or_else(|| format!("{} 没有父目录 ⇒ 找不到 sheet.webp", path.display()))?
+                    .to_path_buf();
+                &owned_dir
+            }
+        };
+        let sheet = dir.join("sheet.webp");
         let sheet_str = sheet.to_str().ok_or("sheet 路径不是 UTF-8")?;
         let atlas = Atlas::load(
             sheet_str,
