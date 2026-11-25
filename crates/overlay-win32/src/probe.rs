@@ -26,10 +26,14 @@
 //! 逐像素 alpha ⇒ 那一格答不了本探针要答的问题，却要往导入表里添一个 `dwmapi.dll`
 //! （DLL 白名单 16 → 17，`scripts/build_windows.sh` 那张表得整张重拿）。**为一个答不了问题的
 //! 读数重测白名单，是不划算的**，所以这里明写"没查"，不查而不说才是骗。
-//! ② **不建窗口、不改 DPI 感知档**。探针一旦调 `SetProcessDpiAwarenessContext`，它读到的
-//! DPI 就变成"探针进程自己的"，而真跑那一次读的是**窗口挂上显示器之后**的每窗 DPI
-//! （`window.rs:471`：那个顺序不能反）。所以这里给的是**未感知进程**那档的数字，并且
-//! 明写它不是真跑那一格 —— 宁可给一个带解释的数，不给一个没有解释的"看起来一样"的数。
+//! ② **不建窗口、不改进程 DPI 感知档**——唯一例外是**线程级**感知那一格，且它是被证伪才加的：
+//! 真机第一轮（2026-11-26，§6.1.26 ⑩）在 125% 屏上，unaware 档的 `GetMonitorInfoW` 把
+//! 1920x1080 报成 1536x864（= 物理 ÷ scale 的**虚拟化**矩形），而这一格印的标签是"物理"
+//! ⇒ 探针在打一句带谎的数。修法不是 `SetProcessDpiAwarenessContext`（那会让探针读到的档
+//! 变成"探针进程自己的"，真跑读的是**窗口挂上显示器之后**的每窗 DPI，`window.rs:471`
+//! 那个顺序不能反），而是 `SetThreadDpiAwarenessContext`：只抬本线程这一次枚举，办完
+//! 立刻把返回的旧值写回。进程档纹丝不动，同 user32、导入表不多一个名字。
+//! DPI 那一档的读数语义不变（未感知**进程**那档的系统整数），变的只有矩形。
 //!
 //! 反过来，**符号可见性**（第 4 格与 DPI 那一档的下半）是探针能诚实回答的：
 //! `GetProcAddress` 解析不到 `SetProcessDpiAwarenessContext` = 这台机器给不了
@@ -306,10 +310,24 @@ pub fn collect(
     flag_bottom: Option<f32>,
 ) -> ProbeReport {
     use crate::layout::{choose, resolve_insets};
+    // 与 §6.1.26 ⑩ 同一条根：unaware 档上 `GetMonitorInfoW` 交回的是**虚拟化**矩形
+    // （物理 ÷ scale 再被下游除一次）。但 M7 拍板"probe 不改进程 DPI 感知档"照旧
+    // 有效 ⇒ 正确的旋钮是**线程级**感知：只管本线程这一次枚举，办完立刻恢复。
+    // 进程档纹丝不动（同函数、同 user32，导入表一个名字都不多），读到的却是真物理矩形。
+    type DpiCtx = windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT;
+    let prev: DpiCtx = unsafe {
+        windows_sys::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(
+            windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    };
     let monitors = match crate::monitor::enumerate() {
         Ok(v) => v,
-        Err(e) => return ProbeReport::unavailable(&e),
+        Err(e) => {
+            restore_thread_dpi(prev);
+            return ProbeReport::unavailable(&e);
+        }
     };
+    restore_thread_dpi(prev);
     let stage = choose(&monitors, wanted).cloned();
     let symbols = match read_symbols() {
         Some(s) => s,
@@ -340,6 +358,14 @@ pub fn collect(
         insets,
         session_error: None,
     }
+}
+
+/// 把 `SetThreadDpiAwarenessContext` 返回的旧值原样写回。文档明说返回句**可以**当输入恢复
+/// （包括那两枚特殊值 `OLD`/`INVALID`），所以这里**无条件回写**，不加 `is_null` 判断——
+/// 加了反而是自造第三档。
+#[cfg(windows)]
+fn restore_thread_dpi(prev: windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT) {
+    unsafe { windows_sys::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(prev) };
 }
 
 /// 非 Windows 上探针**没有东西可探**：这里不给一份"全 0 的清单"，因为那份清单长得像读数。

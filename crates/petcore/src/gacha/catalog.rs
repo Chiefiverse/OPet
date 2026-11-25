@@ -96,7 +96,17 @@ impl fmt::Display for Slot {
 #[serde(deny_unknown_fields)]
 pub struct CatalogItem {
     pub id: String,
+    /// 规范显示名 = 中文。库里落的、审计认的都是它；译名只是渲染期视图（见 [`Self::name_for`]）。
     pub name: String,
+    /// 按 locale 的显示名，全部可选：缺译回退 `name`，未知语言码同样回退 ⇒ 显示永不留白。
+    /// 三枚显式字段（而非 map）是故意的 —— `deny_unknown_fields` 能抓到拼错的语言字段名，
+    /// map 的错键只会静默消失。
+    #[serde(default)]
+    pub name_en: Option<String>,
+    #[serde(default)]
+    pub name_ja: Option<String>,
+    #[serde(default)]
+    pub name_ko: Option<String>,
     pub kind: ItemKind,
     pub rarity: Rarity,
     /// 同档内相对权重，必须 > 0。等权就全填 1000。
@@ -108,6 +118,23 @@ pub struct CatalogItem {
     /// 结构校验不管它，存在性检查归 CLI（`catalog validate --strict-assets`）。
     #[serde(default)]
     pub manifest_path: Option<String>,
+}
+
+impl CatalogItem {
+    /// **物品名的唯一出口**（"一处写"纪律，同两家 dress 门禁盯 `self.wear(` 的理由）：
+    /// 报表层任何一块面要上屏物品名，只能经这里取，不许再摸 `item.name`。
+    /// `lang_code` = `overlay_common::ui::l10n::Lang::code()` 的那四个值；
+    /// 缺译 / `"zh"` / 未知码 ⇒ 回退中文 `name`（必填字段 ⇒ 返回值永不为空）。
+    /// petcore 不依赖 overlay-common，所以这里吃字符串而不是 `Lang`。
+    pub fn name_for(&self, lang_code: &str) -> &str {
+        let translated = match lang_code {
+            "en" => self.name_en.as_deref(),
+            "ja" => self.name_ja.as_deref(),
+            "ko" => self.name_ko.as_deref(),
+            _ => None,
+        };
+        translated.unwrap_or(&self.name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -249,6 +276,9 @@ mod tests {
         CatalogItem {
             id: id.into(),
             name: id.into(),
+            name_en: None,
+            name_ja: None,
+            name_ko: None,
             kind: if slot.is_some() {
                 ItemKind::Accessory
             } else {
@@ -281,6 +311,51 @@ mod tests {
         }
         // SSR 档只有 3 件：碎片商店自选（120 碎片）的候选集就是这个。
         assert_eq!(c.items_of(Rarity::SSR).count(), 3);
+    }
+
+    #[test]
+    fn default_catalog_carries_all_four_locales_for_every_item() {
+        // 发行目录必须逐件四语齐全 —— 缺译在运行时只会静默回退中文，屏幕上看不出"漏了一条"，
+        // 所以这条账必须由测例来对（§7-R12 翻向：物品名从此随 --lang 切换）。
+        let c = Catalog::default_v1().unwrap();
+        for i in &c.items {
+            for (code, field) in [
+                ("en", i.name_en.as_deref()),
+                ("ja", i.name_ja.as_deref()),
+                ("ko", i.name_ko.as_deref()),
+            ] {
+                let n = field.unwrap_or_else(|| panic!("{} 缺 {code} 译名", i.id));
+                assert!(!n.trim().is_empty(), "{} 的 {code} 译名是空白", i.id);
+                assert_eq!(
+                    i.name_for(code),
+                    n,
+                    "{} 的 name_for({code}) 没取到译名",
+                    i.id
+                );
+            }
+            assert_eq!(i.name_for("zh"), i.name);
+        }
+    }
+
+    #[test]
+    fn name_for_falls_back_and_old_json_still_loads() {
+        // 回退链 = 缺译→中文、未知码→中文；同时"没有新字段的旧目录"必须照常装载
+        // （三枚字段是 additive-optional，format 不升档）。
+        let old_shape = r#"{"format":1,"id":"t","banner_id":"t","items":[
+            {"id":"a","name":"甲","kind":"pet","rarity":"N","weight":10},
+            {"id":"b","name":"乙","kind":"pet","rarity":"N","weight":10,"name_en":"B-en"}]}"#;
+        let c = Catalog::from_json(old_shape).unwrap();
+        let (a, b) = (c.find("a").unwrap(), c.find("b").unwrap());
+        assert_eq!(
+            (a.name_en.as_ref(), a.name_ja.as_ref(), a.name_ko.as_ref()),
+            (None, None, None)
+        );
+        for code in ["en", "ja", "ko", "zh", "fr", ""] {
+            assert_eq!(a.name_for(code), "甲", "无译名的项在 {code} 档必须回退中文");
+        }
+        assert_eq!(b.name_for("en"), "B-en");
+        assert_eq!(b.name_for("ja"), "乙", "只有 en 的项在 ja 档回退中文");
+        assert_eq!(b.name_for("zh"), "乙");
     }
 
     #[test]

@@ -35,7 +35,7 @@ const NOTICE: &str = include_str!("../assets/fonts/NOTICE-ui-font.txt");
 
 /// `--verify` 三次连续重建逐字节一致后钉下来的摘要。改任何文案 → 重跑 `--emit-codes` +
 /// `--build` + `--verify` → **这里的常数必须一起改**（它就是"资产与清单漂移"的证据）。
-const FONT_SHA256: &str = "e5b0ab586ef37c4560989d07aa2aa5b22df6db2d49e437831e96bc06e7d0798a";
+const FONT_SHA256: &str = "9705a5ecf5b691c9076d48eda9ca48a0e39342626179c68028f6ca049a21d631";
 /// 源 .ttc 的摘要，与 `tools/subset_font.py` 的 `SOURCE_SHA256` 同一个数。
 const SOURCE_SHA256: &str = "b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a";
 /// §4.2 的体积门禁（i18n 把子集从"只中文"涨到四 locale 并集后重算的档）。实测 54,516 B
@@ -86,8 +86,17 @@ fn rendered_chars() -> BTreeSet<(u32, &'static str)> {
         "目录应该是 10 宠 + 20 配件 = 30 件"
     );
     for item in &catalog.items {
-        for ch in item.name.chars().filter(|c| *c > '\u{7e}') {
-            out.insert((ch as u32, "catalog-name"));
+        // §7-R12 翻向（2026-11-26）：名字出口按 lang 取译名 ⇒ ja/ko 与 zh 一样会上屏，
+        // 三枚译名字段都算"会渲染"（en 是 ASCII，filter 自然滤掉，列出来只为与扫描器同口径）。
+        for s in [
+            item.name.as_str(),
+            item.name_en.as_deref().unwrap_or(""),
+            item.name_ja.as_deref().unwrap_or(""),
+            item.name_ko.as_deref().unwrap_or(""),
+        ] {
+            for ch in s.chars().filter(|c| *c > '\u{7e}') {
+                out.insert((ch as u32, "catalog-name"));
+            }
         }
     }
     out

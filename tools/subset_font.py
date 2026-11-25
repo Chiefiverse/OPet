@@ -8,7 +8,8 @@
 
 为什么不是"手抄一份清单 + 手跑 pyftsubset"：上一轮 M3-b 抓到"白字压金底读不出"之后，
 本轮立的规矩是**缺字必须当场红**，而人能写下来的清单一定会过期。所以清单由脚本从
-`l10n.rs` 的字面量与 catalog 的 `name` 字段扫出来，Rust 侧另有两条测试兜着（见 §4.2 的门禁 ①②③）。
+`l10n.rs` 的字面量与 catalog 的 `name`/`name_ja`/`name_ko` 字段扫出来（en 是 ASCII 不入账），
+Rust 侧另有两条测试兜着（见 §4.2 的门禁 ①②③）。
 
 ⚠️ **换 fontTools 版本必然改变产物字节** ⇒ 必须重跑全部内存门禁（VmHWM / 字号档 / 体积）。
 所以下面把版本、输入文件摘要、每一个子集选项都写死，不用默认值。
@@ -159,8 +160,15 @@ def codes_from_l10n() -> set[str]:
 
 def codes_from_catalog() -> set[str]:
     items = json.loads(CATALOG.read_text(encoding="utf-8"))["items"]
-    # 只有 `name` 会画上卡片（`id` 是 ASCII slug，查不到名字时才回退显示它）。
-    return non_ascii([i["name"] for i in items])
+    # 会画上卡片的名字都算：zh `name`（查不到译名时的回退，必收）+ `name_ja` / `name_ko`
+    # （假名/汉字/谚文进子集）；`name_en` 与 `id` 是 ASCII，被 non_ascii 扫描自然滤掉。
+    texts = [
+        i[key]
+        for i in items
+        for key in ("name", "name_en", "name_ja", "name_ko")
+        if i.get(key)
+    ]
+    return non_ascii(texts)
 
 
 def provenance() -> dict[int, str]:

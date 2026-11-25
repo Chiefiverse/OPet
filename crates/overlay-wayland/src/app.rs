@@ -1894,7 +1894,14 @@ impl App {
             .ok_or_else(|| "库还没连上（收藏册读不到东西）".to_string())?;
         let owned = g.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
         let mut rows = album_rows(
-            &g.album_entries(&owned, &ids, &view.visible, &pet_ids, &pet_view.visible)?,
+            &g.album_entries(
+                &owned,
+                &ids,
+                &view.visible,
+                &pet_ids,
+                &pet_view.visible,
+                lang,
+            )?,
             scale,
         );
         rows.extend(
@@ -4509,11 +4516,37 @@ mod tests {
             .iter()
             .skip(1)
             .filter_map(|l| item_name_field(l, Lang::Zh))
-            .filter(|f| !f.is_ascii() && g.catalog.items.iter().any(|i| i.name.starts_with(f)))
+            .filter(|f| {
+                g.catalog
+                    .items
+                    .iter()
+                    .any(|i| i.name_for("zh").starts_with(f))
+            })
             .count();
         assert!(
             named > 0,
             "结果行的名字段对不上目录里的中文名 ⇒ catalog 查找没接上，卡片还在打 slug：{lines:?}"
+        );
+        // §7-R12 翻向（2026-11-26）：en 档必须打出**译名**，而"是 ASCII"从来不是判据。
+        // 退回 slug（`rabbit`）或中文（`兔`）都在这条上对不上 `name_for("en")` 的前缀。
+        // 与 Win32 `dress.rs` 同名测例同一条断言（那条的出处注释写着为什么不是判整行）。
+        let (en_lines, _best, _bb) = g
+            .pull(10, true, Lang::En, 1.5)
+            .expect("同一座内存库的第二轮 en 十连该成功");
+        let named_en = en_lines
+            .iter()
+            .skip(1)
+            .filter_map(|l| item_name_field(l, Lang::En))
+            .filter(|f| {
+                g.catalog
+                    .items
+                    .iter()
+                    .any(|i| i.name_for("en").starts_with(f))
+            })
+            .count();
+        assert!(
+            named_en > 0,
+            "en 结果行的名字段对不上目录译名 ⇒ 本地化名没走到卡面：{en_lines:?}"
         );
         assert!(
             balance >= before,
@@ -4525,6 +4558,48 @@ mod tests {
             !lines.iter().any(|l| l.contains("DRYRUN")),
             "演示标跑进结果行了 ⇒ 卡片上会有两处，而只有一处是签收过的"
         );
+    }
+
+    /// **卡面名字必须与 `name_en` 逐字相等**（M6 假绿一族的形状：`!is_ascii`/"像英文"这类
+    /// 观感判据会被 slug 与 tag 双向糊弄）。这里的目录刻意让 `id`、中文 `name`、`name_en`
+    /// 三者互不相同且都不作彼此的开头 ⇒ 接线坏了打出的是 `zq1` 或「甲一」，**逐字**对不上。
+    /// 与 Win32 `dress.rs` 的 `en_line_carries_the_exact_english_name` 同一条断言，一家都不许改弱。
+    #[test]
+    fn en_line_carries_the_exact_english_name() {
+        let catalog = Catalog::from_json(
+            r#"{"format":1,"id":"t_names","banner_id":"cat_series","items":[
+                {"id":"zq1","name":"甲一","name_en":"Alpha One","kind":"pet","rarity":"N","weight":10},
+                {"id":"zq2","name":"乙二","name_en":"Beta Two","kind":"pet","rarity":"R","weight":10},
+                {"id":"zq3","name":"丙三","name_en":"Gamma Three","kind":"pet","rarity":"SR","weight":10},
+                {"id":"zq4","name":"丁四","name_en":"Delta Four","kind":"pet","rarity":"SSR","weight":10}]}"#,
+        )
+        .expect("四语齐的构造目录该装载得起来");
+        catalog.validate().expect("构造目录该合法");
+        let mut store = Store::in_memory().expect("内存库该建得起来");
+        store.install_catalog(&catalog).expect("构造目录该装得进库");
+        let mut g = Gacha { store, catalog };
+        let (lines, _best, _b) = g.pull(12, true, Lang::En, 1.0).expect("构造目录十连该成功");
+        // 卡面只摊前几条明细（其余并成 "+N more"），且截断行（尾巴是 `…`）会被
+        // [`item_name_field`] 判 None ⇒ 判据形状 = "**显示的每一条**名字段逐字等于 name_en"，
+        // 不是"12 抽各有 12 行"。与 Windows 侧同一条断言，一家都不许改弱。
+        let named: Vec<&str> = lines
+            .iter()
+            .skip(1)
+            .filter_map(|l| item_name_field(l, Lang::En))
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "一行明细都没显示 ⇒ 这条门禁测的是空东西：{lines:?}"
+        );
+        for f in &named {
+            assert!(
+                g.catalog
+                    .items
+                    .iter()
+                    .any(|i| i.name_en.as_deref() == Some(*f)),
+                "en 档名字段「{f}」不是任何一件的 name_en（退回 slug/中文？）：{lines:?}"
+            );
+        }
     }
 
     /// **演示态一个字都不落库**（FLOW §9 P3 明写"这条要写进测试，防顺手修好"）。
@@ -5001,7 +5076,7 @@ mod tests {
                 let pet_visible: Vec<usize> = (0..pet_ids.len()).collect();
                 let owned = g.store.owned().expect("刚抽完十连的内存库该读得出库存");
                 let entries = g
-                    .album_entries(&owned, &ids, &visible, &pet_ids, &pet_visible)
+                    .album_entries(&owned, &ids, &visible, &pet_ids, &pet_visible, lang)
                     .expect("逐件收藏册的行该读得出来");
                 let mut content = album_rows(&entries, scale);
                 content.extend(
@@ -5185,7 +5260,14 @@ mod tests {
             .collect();
         let pet_view = DressView::select(false, Some(&owned), &pet_ids);
         let entries = g
-            .album_entries(&owned, &ids, &visible, &pet_ids, &pet_view.visible)
+            .album_entries(
+                &owned,
+                &ids,
+                &visible,
+                &pet_ids,
+                &pet_view.visible,
+                Lang::Zh,
+            )
             .expect("逐件条目该读得出来");
 
         // 条目序 = 档序（N 三件按档内序 → R），而 `wing` 不在 `owned` 里 ⇒ 根本不出现。
@@ -5206,6 +5288,23 @@ mod tests {
             entries.iter().all(|e| e.name != "翅膀"),
             "未拥有的件不该进逐件册（它出现在汇总那一行就够了）"
         );
+
+        // §7-R12 翻向：同四件走 en 档再来一遍 ⇒ 名字整列换成 `name_en`（顺序与载荷都不动）。
+        let en_entries = g
+            .album_entries(
+                &owned,
+                &ids,
+                &visible,
+                &pet_ids,
+                &pet_view.visible,
+                Lang::En,
+            )
+            .expect("en 档的逐件条目也该读得出来");
+        let want_en = ["Flag", "Space Cat", "Ball Cap", "Wand"];
+        assert_eq!(en_entries.len(), want_en.len());
+        for (e, name) in en_entries.iter().zip(want_en) {
+            assert_eq!(e.name, name, "收藏册 en 档没打译名（还是中文或 slug？）");
+        }
 
         // **真正的那条**：每个载荷都能拿它去**它那一张表**里反查出这一件自己的 id。
         // 写成"等于目录里的枚举序号"的话，这行永远验不出任何东西。
@@ -5378,7 +5477,14 @@ mod tests {
         );
 
         let entries = g
-            .album_entries(&owned, &ids, &visible, &pet_ids, &pet_view.visible)
+            .album_entries(
+                &owned,
+                &ids,
+                &visible,
+                &pet_ids,
+                &pet_view.visible,
+                Lang::Zh,
+            )
             .expect("逐件条目该读得出来");
         let rows = album_rows(&entries, 1.0);
         assert_eq!(rows.len(), entries.len(), "一行一件这条断了");
@@ -5527,7 +5633,7 @@ mod tests {
         let pet_ids: Vec<String> = Vec::new();
         let pet_visible: Vec<usize> = Vec::new();
         let entries = g
-            .album_entries(&owned, &ids, &visible, &pet_ids, &pet_visible)
+            .album_entries(&owned, &ids, &visible, &pet_ids, &pet_visible, Lang::Zh)
             .expect("逐件条目该读得出来");
         assert_eq!(
             entries.len(),

@@ -1335,7 +1335,7 @@ mod tests {
                     );
                     let lines = menu::report_lines(
                         &[0, 0, 0, 0],
-                        &ten_items([(r, false); 10]),
+                        &ten_items([(r, false); 10], lang),
                         42,
                         lang,
                         scale,
@@ -1944,31 +1944,44 @@ mod tests {
         paint(&mut zero, 0, 0, 4, &MenuAnim::Menu, ctx);
     }
 
-    /// 目录里**真实**的前 10 件名字（中文）配上给定的档位与新旧序列。
+    /// 目录里**真实**的前 10 件名字，按给定 locale 取（配上给定的档位与新旧序列）。
     ///
-    /// 出图必须走 `app.rs` 那条真实路径（`catalog.find(..).name`），不能再喂英文 slug ——
-    /// 喂 slug 的图看着很干净，恰恰因为真正会顶到边的东西没上屏。
-    fn ten_items(rs: [(Rarity, bool); 10]) -> Vec<(String, Rarity, bool)> {
+    /// 出图必须走 `app.rs` 那条真实路径（`catalog.find(..).name_for(lang)`），不能再喂英文
+    /// slug —— 喂 slug 的图看着很干净，恰恰因为真正会顶到边的东西没上屏。§7-R12 翻向后
+    /// 每一档 dump 画的都是该档真名，量的是真宽度。
+    fn ten_items(rs: [(Rarity, bool); 10], lang: Lang) -> Vec<(String, Rarity, bool)> {
         let catalog = petcore::gacha::Catalog::default_v1().expect("内嵌目录读不出来");
         catalog
             .items
             .iter()
             .zip(rs)
-            .map(|(i, (r, n))| (i.name.clone(), r, n))
+            .map(|(i, (r, n))| (i.name_for(lang.code()).to_string(), r, n))
             .collect()
     }
 
     #[test]
     fn dump_uses_real_catalog_names_that_need_the_font() {
-        // 这条不是出图，而是把"出图用的那份目录数据"钉在 CI 里：`ten_items` 喂给
-        // `#[ignore]` 的出图用例，而它取的名字必须是**非 ASCII** —— 目录哪天改成单语英文，
-        // 出图看着仍然很干净，只是再也量不到 CJK 的宽度（§7-R12 那条取舍就悄悄没了）。
-        let items = ten_items([(Rarity::N, false); 10]);
-        assert_eq!(items.len(), 10);
+        // 这条不是出图，而是把"出图用的那份目录数据"钉在 CI 里，两个方向都要钉：
+        // ① zh/ja/ko 的名字必须**非 ASCII** —— 目录哪天改回单语英文，出图看着仍然很干净，
+        //    只是再也量不到 CJK 的宽度（§7-R12 的老病）；
+        // ② en 那一列必须**逐字等于 `name_en`** —— 反方向的病是"四档都退打中文"，它过得了
+        //    ①（ja/ko 也在打中文的话照样非 ASCII）却过不了这条（M6 假绿一族：单边判据）。
+        let zh = ten_items([(Rarity::N, false); 10], Lang::Zh);
+        assert_eq!(zh.len(), 10);
         assert!(
-            items.iter().all(|(n, _, _)| !n.is_ascii()),
-            "目录名字全变 ASCII 了 ⇒ 出图测不到 CJK 宽度：{items:?}"
+            zh.iter().all(|(n, _, _)| !n.is_ascii()),
+            "中文名字列全变 ASCII 了 ⇒ 出图测不到 CJK 宽度：{zh:?}"
         );
+        let en = ten_items([(Rarity::N, false); 10], Lang::En);
+        let catalog = petcore::gacha::Catalog::default_v1().expect("内嵌目录读不出来");
+        for (i, (n, _, _)) in catalog.items.iter().zip(&en) {
+            assert_eq!(
+                n,
+                i.name_en.as_deref().unwrap(),
+                "en 档出图名 ≠ name_en（{}）⇒ dump 没按 locale 取名字",
+                i.id
+            );
+        }
     }
 
     /// 单抽那一份的档位序列（第十件 = SSR）；十连那一份最高 = SR。
@@ -2072,7 +2085,13 @@ mod tests {
     /// "这一档本来就没这张图"在文件名上根本分不开，而过眼的人只会以为我没出。
     #[test]
     fn the_phase_walk_samples_the_flash_frame_only_where_it_exists() {
-        let lines = menu::report_lines(&[6, 3, 0, 1], &ten_items(SSR_SEQ), 160, Lang::Zh, 1.5);
+        let lines = menu::report_lines(
+            &[6, 3, 0, 1],
+            &ten_items(SSR_SEQ, Lang::Zh),
+            160,
+            Lang::Zh,
+            1.5,
+        );
         for &motion in &Motion::ALL {
             let phases = walk_phases(Rarity::SSR, lines.clone(), motion);
             let flashed: Vec<&str> = phases
@@ -2266,8 +2285,13 @@ mod tests {
                         ("ssr", Rarity::SSR, [6u32, 3, 0, 1], 160, SSR_SEQ),
                         ("ten", Rarity::SR, [7, 2, 1, 0], 42, SR_SEQ),
                     ] {
-                        let lines =
-                            menu::report_lines(&counts, &ten_items(items), gained, lang, scale);
+                        let lines = menu::report_lines(
+                            &counts,
+                            &ten_items(items, lang),
+                            gained,
+                            lang,
+                            scale,
+                        );
                         for (tag, anim) in walk_phases(best, lines, motion) {
                             dump(&Frame {
                                 phase: &format!("{key}_{tag}"),

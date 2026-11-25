@@ -2356,7 +2356,7 @@ mod tests {
         // 是 0 ⇒ `line_width` 会算出"放得下"，这条门禁就自己把自己骗过去了（而且手打的串
         // 长度刚好 = 预算时，`fit` 根本不会截，测的是个空条件）。
         let catalog = Catalog::default_v1().unwrap();
-        let cjk: String = catalog.items.iter().map(|i| i.name.as_str()).collect();
+        let cjk: String = catalog.items.iter().map(|i| i.name_for("zh")).collect();
         assert!(
             cjk.chars().count() > 14,
             "测料太短（{} 字）⇒ 1× 档压根不会截，这条断言就退化成'没坏'",
@@ -2532,10 +2532,15 @@ mod tests {
     /// 所以在纯逻辑层就钉死 —— 渲染层的逐点裁剪只会把词切一半，不会报错。
     #[test]
     fn ten_pull_report_fits_the_card_budget() {
-        // 物品名取目录里**真实**的中文名（不翻译，§7-R12），而且是目录里最长的那批 ——
+        // 物品名取目录里**真实**的中文名（§7-R12 翻向后四档都存在，但 zh 是最宽的一档 ⇒
+        // 预算测料照旧锚 `name_for("zh")`，en 名更短、宽度门禁自然满足）。
         // 用 "cat_item_0" 这种 ASCII 占位测不出 CJK 的宽度。
         let catalog = Catalog::default_v1().unwrap();
-        let names: Vec<String> = catalog.items.iter().map(|i| i.name.clone()).collect();
+        let names: Vec<String> = catalog
+            .items
+            .iter()
+            .map(|i| i.name_for("zh").to_string())
+            .collect();
         assert!(names.len() >= 10, "目录不足 10 件 ⇒ 这条测的是空东西");
         let items: Vec<(String, Rarity, bool)> = (0..10)
             .map(|i| (names[i].clone(), Rarity::ALL[i % 4], i % 3 == 0))

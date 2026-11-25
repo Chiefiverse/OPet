@@ -990,16 +990,24 @@ mod tests {
         //     宠物行全部退化成只读，而宿主这 76 条与共用层几百条**一条都不会红**（那边同一格的
         //     读数 `the_album_routes_pets_to_the_body_index_space` 测的是**判据**，这条测**接线**）。
         let album = fn_body(code, "album_screen");
+        // 空白折叠 + 去掉拆行才有的尾逗号后再比：调用超过一行时 `cargo fmt` 会把实参拆行并补
+        // `,` ⇒ 这条判的是"接线喂了谁"，不是"源码排了几行"（2026-11-26 加 `lang` 形参后 fmt
+        // 拆行，曾把这条顶成假红）。
+        let flat: String = album
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .replace(",)", ")");
         assert!(
-            album.contains("let pet_view = self.pet_view();")
-                && album.contains(
-                    "&g.album_entries(&owned, &ids, &view.visible, &pet_ids, &pet_view.visible)"
+            flat.contains("letpet_view=self.pet_view();")
+                && flat.contains(
+                    "&g.album_entries(&owned,&ids,&view.visible,&pet_ids,&pet_view.visible,lang)"
                 ),
             "`album_screen` 没有把本体那两张表喂进 `album_entries` ⇒ 收藏册的宠物行又变回只读\
              （屏上看不出、测例读不到，只有这一条有读数）"
         );
         assert!(
-            !album.contains("&[], &[]"),
+            !flat.contains("&[],&[]"),
             "`album_screen` 里出现了空表实参 ⇒ 就是上面那条恒空的写法回来了"
         );
         assert!(
@@ -1061,11 +1069,36 @@ mod tests {
             .iter()
             .skip(1)
             .filter_map(|l| item_name_field(l, Lang::Zh))
-            .filter(|f| !f.is_ascii() && g.catalog.items.iter().any(|i| i.name.starts_with(f)))
+            .filter(|f| {
+                g.catalog
+                    .items
+                    .iter()
+                    .any(|i| i.name_for("zh").starts_with(f))
+            })
             .count();
         assert!(
             named > 0,
             "结果行的名字段对不上目录里的中文名 ⇒ catalog 查找没接上，卡片还在打 slug：{lines:?}"
+        );
+        // §7-R12 翻向（2026-11-26）：en 档必须打出**译名**，而"是 ASCII"从来不是判据。
+        // 退回 slug（`rabbit`）或中文（`兔`）都在这条上对不上 `name_for("en")` 的前缀。
+        let (en_lines, _best, _bb) = g
+            .pull(10, true, Lang::En, 1.5)
+            .expect("同一座内存库的第二轮 en 十连该成功");
+        let named_en = en_lines
+            .iter()
+            .skip(1)
+            .filter_map(|l| item_name_field(l, Lang::En))
+            .filter(|f| {
+                g.catalog
+                    .items
+                    .iter()
+                    .any(|i| i.name_for("en").starts_with(f))
+            })
+            .count();
+        assert!(
+            named_en > 0,
+            "en 结果行的名字段对不上目录译名 ⇒ 本地化名没走到卡面：{en_lines:?}"
         );
         assert!(
             balance >= before,
@@ -1077,6 +1110,48 @@ mod tests {
             !lines.iter().any(|l| l.contains("DRYRUN")),
             "演示标跑进结果行了 ⇒ 卡片上会有两处，而只有一处是签收过的"
         );
+    }
+
+    /// **卡面名字必须与 `name_en` 逐字相等**（M6 假绿一族的形状：`!is_ascii`/"像英文"这类
+    /// 观感判据会被 slug 与 tag 双向糊弄）。这里的目录刻意让 `id`、中文 `name`、`name_en`
+    /// 三者互不相同且都不作彼此的开头 ⇒ 接线坏了打出的是 `zq1` 或「甲一」，**逐字**对不上。
+    /// 与 Wayland 侧 `en_line_carries_the_exact_english_name` 同一条断言，一家都不许改弱。
+    #[test]
+    fn en_line_carries_the_exact_english_name() {
+        let catalog = Catalog::from_json(
+            r#"{"format":1,"id":"t_names","banner_id":"cat_series","items":[
+                {"id":"zq1","name":"甲一","name_en":"Alpha One","kind":"pet","rarity":"N","weight":10},
+                {"id":"zq2","name":"乙二","name_en":"Beta Two","kind":"pet","rarity":"R","weight":10},
+                {"id":"zq3","name":"丙三","name_en":"Gamma Three","kind":"pet","rarity":"SR","weight":10},
+                {"id":"zq4","name":"丁四","name_en":"Delta Four","kind":"pet","rarity":"SSR","weight":10}]}"#,
+        )
+        .expect("四语齐的构造目录该装载得起来");
+        catalog.validate().expect("构造目录该合法");
+        let mut store = Store::in_memory().expect("内存库该建得起来");
+        store.install_catalog(&catalog).expect("构造目录该装得进库");
+        let mut g = Gacha { store, catalog };
+        let (lines, _best, _b) = g.pull(12, true, Lang::En, 1.0).expect("构造目录十连该成功");
+        // 卡面只摊前几条明细（其余并成 "+N more"），且截断行（尾巴是 `…`）会被
+        // [`item_name_field`] 判 None ⇒ 判据形状 = "**显示的每一条**名字段逐字等于 name_en"，
+        // 不是"12 抽各有 12 行"。
+        let named: Vec<&str> = lines
+            .iter()
+            .skip(1)
+            .filter_map(|l| item_name_field(l, Lang::En))
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "一行明细都没显示 ⇒ 这条门禁测的是空东西：{lines:?}"
+        );
+        for f in &named {
+            assert!(
+                g.catalog
+                    .items
+                    .iter()
+                    .any(|i| i.name_en.as_deref() == Some(*f)),
+                "en 档名字段「{f}」不是任何一件的 name_en（退回 slug/中文？）：{lines:?}"
+            );
+        }
     }
 
     /// 逐 locale 真抽十连，每一行过一遍字体子集。这条抓的是"某个 locale 的模板里有一个没进

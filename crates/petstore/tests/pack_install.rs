@@ -167,6 +167,37 @@ fn empty_catalog() -> Catalog {
     Catalog::from_json(r#"{"format":1,"id":"t","banner_id":"t","items":[]}"#).unwrap()
 }
 
+/// §7-R12 翻向后的库侧口径：目录可以带四枚名字，但 `install_catalog` 只认必填的中文
+/// `name` 一列（`pets`/`accessories` schema 没动）⇒ 账本与语言无关。
+/// 上面的 `catalog_with` / `pool` 用的还是**无新字段的旧形状 JSON**，原样保留 = 兼容证据。
+#[test]
+fn four_names_load_but_the_ledger_records_only_the_zh_one() {
+    let json = r#"{"format":1,"id":"t","banner_id":"t","items":[
+        {"id":"wing","name":"翅膀","name_en":"Wings","name_ja":"羽","name_ko":"날개",
+         "kind":"accessory","rarity":"N","weight":1000,"slot":"head",
+         "manifest_path":"accessories/wing/accessory.json"}]}"#;
+    let cat = Catalog::from_json(json).expect("四名字齐的 format=1 目录要能装载");
+    let item = &cat.items[0];
+    assert_eq!(item.name, "翅膀", "必填 name 仍是中文那一枚");
+    assert_eq!(item.name_for("en"), "Wings");
+    assert_eq!(item.name_for("ja"), "羽");
+    assert_eq!(item.name_for("ko"), "날개");
+    let mut store = Store::in_memory().unwrap();
+    let (pets, acc) = store.install_catalog(&cat).unwrap();
+    assert_eq!(
+        (pets, acc),
+        (0, 1),
+        "四名字齐的项要照常进库，且不因为新字段多写一行"
+    );
+    let name: String = store
+        .conn()
+        .query_row("SELECT name FROM accessories WHERE id='wing'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(name, "翅膀", "库里落的必须是中文 `name` ⇒ 账本与语言无关");
+}
+
 #[test]
 fn opening_a_clean_pack_names_every_entry_it_holds() {
     let h = Harness::new();

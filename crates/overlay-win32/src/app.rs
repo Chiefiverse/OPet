@@ -224,7 +224,7 @@ mod win {
     use crate::settings;
     use crate::stage::{Stage, Worn};
     use crate::summary;
-    use crate::window::{Client, DpiPath, Events, SurfaceKind, TimerPath, Wake};
+    use crate::window::{Client, DpiPath, Events, SurfaceKind, TimerPath, Wake, set_dpi_awareness};
     use overlay_report::{
         BodyCandidate, BodyChoice, Gacha, SwapBody, album_rows, db_body_row, discover_pets,
         pet_root, plan_body_override, plan_swap_body, published_rates_lines,
@@ -748,6 +748,13 @@ mod win {
             }
 
             let started = Instant::now();
+            // ⚠️ **先感知、后枚举**：awareness 生效之前进程是 DPI-unaware，
+            // `GetMonitorInfoW` 交回的是**虚拟化**矩形（真机 2026-11-26：125% 的
+            // 1920x1080 屏报成 1536x864 = 物理 ÷ scale），再除一次 scale 就是双重
+            // 除法 ⇒ 舞台比屏幕小一整圈、脚不落地。`Client::open` 第一步也调它，
+            // 但那一格只保证"建窗之前"—— 舞台算在建窗之前，所以这里也必须自己调。
+            // 首调裁决、再调同值（`window::set_dpi_awareness` 记忆化）⇒ 两处读数一致。
+            let _ = set_dpi_awareness();
             let mons = crate::monitor::enumerate()?;
             let stage = crate::layout::choose(&mons, opts.monitor.as_deref()).ok_or_else(|| {
                 let found: Vec<&str> = mons.iter().map(|m| m.name.as_str()).collect();
@@ -1714,7 +1721,14 @@ mod win {
                 .ok_or_else(|| "库还没连上（收藏册读不到东西）".to_string())?;
             let owned = g.store.owned().map_err(|e| format!("读库存失败: {e}"))?;
             let mut rows = album_rows(
-                &g.album_entries(&owned, &ids, &view.visible, &pet_ids, &pet_view.visible)?,
+                &g.album_entries(
+                    &owned,
+                    &ids,
+                    &view.visible,
+                    &pet_ids,
+                    &pet_view.visible,
+                    lang,
+                )?,
                 scale,
             );
             rows.extend(

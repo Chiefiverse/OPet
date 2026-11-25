@@ -1106,23 +1106,53 @@ impl Drop for Client {
     }
 }
 
+/// 本进程首条回答，之后每条都回同一个值（真调只有一次；见下面 `set_dpi_awareness`）。
+static DPI_PATH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
 /// 在**注册窗口类之前**设 DPI 感知，返回走了哪条路。
 ///
-/// 由 [`Client::open`] 的第一步调用。公开它是为了让测试与文档能点名这一格，
-/// **不是**为了让调用方自己排序（那种前置条件见 [`Client::open`] 里那句"迟早会被忘"）。
+/// 由 [`Client::open`] 的第一步调用，也由 `app.rs` 在**枚举显示器之前**调用 ——
+/// 后者不是优化而是正确性：`SetProcessDpiAwarenessContext` 生效前，进程是
+/// DPI-unaware，`GetMonitorInfoW` 交回的是**虚拟化**矩形（125% 的 1920x1080 屏
+/// 报成 1536x864 = 真物理 ÷ scale）。拿这份数再除一次 scale 就是双重除法
+/// ⇒ 舞台比屏幕小一整圈、脚不落地（真机第一轮 2026-11-26 实测，见 §6.1.26 ⑩）。
+/// 本函数**可重入且诚实**：首调裁决并记住档位，再调返回记住的那个值 ⇒ 调用方
+/// 不存在"谁先调谁拿到真话"的排序陷阱。若这里是裸调系统 API，第二次调会得到
+/// `ProcessAware`（首调已占位）⇒ 摘要里 ★8 那一行会变成一句谎。
 ///
 /// 两档退路不区分原因（"系统太老"与"已经被 manifest 设过"）是有意的：区分要
 /// `GetProcAddress` 动态载入，而两档缺的是**同一个能力**（每窗 DPI + `WM_DPICHANGED`）
 /// ⇒ 同一句真话。
 pub fn set_dpi_awareness() -> DpiPath {
-    let v2 = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-    if v2 != 0 {
-        return DpiPath::PerMonitorV2;
+    use std::sync::atomic::Ordering;
+    let cached = DPI_PATH.load(Ordering::Acquire);
+    if cached != u8::MAX {
+        // 越界值只可能来自被改坏的 static ⇒ 回落真调一次比拿谎当读数便宜。
+        return match cached {
+            0 => DpiPath::PerMonitorV2,
+            1 => DpiPath::ProcessAware,
+            2 => DpiPath::Assume100,
+            _ => set_dpi_awareness_slow(),
+        };
     }
-    if unsafe { SetProcessDPIAware() } != 0 {
-        return DpiPath::ProcessAware;
-    }
-    DpiPath::Assume100
+    set_dpi_awareness_slow()
+}
+
+fn set_dpi_awareness_slow() -> DpiPath {
+    use std::sync::atomic::Ordering;
+    let path = {
+        let v2 =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if v2 != 0 {
+            DpiPath::PerMonitorV2
+        } else if unsafe { SetProcessDPIAware() } != 0 {
+            DpiPath::ProcessAware
+        } else {
+            DpiPath::Assume100
+        }
+    };
+    DPI_PATH.store(path as u8, Ordering::Release);
+    path
 }
 
 /// 窗口回调。`GWLP_USERDATA` 为空时（建窗期的 `WM_NCCREATE`/`WM_CREATE`，与析构之后）

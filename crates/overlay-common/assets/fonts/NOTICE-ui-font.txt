@@ -1,11 +1,11 @@
 NOTICE — OPet UI 字体子集
 =========================
 
-产物：crates/overlay-wayland/assets/fonts/ui.otf
-  大小     54,068 B（52.8 KiB）
-  sha256   e5b0ab586ef37c4560989d07aa2aa5b22df6db2d49e437831e96bc06e7d0798a
+产物：crates/overlay-common/assets/fonts/ui.otf
+  大小     68,028 B（66.4 KiB）
+  sha256   9705a5ecf5b691c9076d48eda9ca48a0e39342626179c68028f6ca049a21d631
   家族名   OPet UI（name ID 1）／唯一标识 OPetUI-Regular（ID 6）
-  码位     336 个：ASCII 95 + 汉字 151 + 谚文 69 + 假名 19 + 标点 2（… U+2026、：U+FF1A）
+  码位     432 个：ASCII 95 + 汉字 166 + 谚文 126 + 假名 43 + 标点 2（… U+2026、：U+FF1A）
            （2026-10-29 菜单分页新增 46 个：动作/其它页名 + 走跑跳爬暂停退出行标签；
             2026-11-01 换装页新增 19 个：换装页名 + 穿上/脱下/返回四 locale 标签；
             2026-11-01 同日修「跳跃」的 ja 错字 ジッャンプ→ジャンプ，删掉唯一用到的小書き
@@ -38,7 +38,13 @@ NOTICE — OPet UI 字体子集
             虚构 slug 整批退池，换成 ballcap/cowboy_hat/flag/…/wing，slot 与中文名取产物 accessory.json，
             cowboy_hat/flag 两件产物 display_name 为空、按判词补「牛仔帽」「旗」）⇒ 342 → **336（汉字净 −6）**、
             产物 54,516 → **54,068 B（−448 B）**。档位计数 N8/R6/SR4/SSR2 与等权不变 ⇒ 公示概率逐字不变、
-            rates.json 仅换 id。净 −6 仍是"旧虚构名里的字退池即回收"那一族（第三次），arena 余量反而放宽）
+            rates.json 仅换 id。净 −6 仍是"旧虚构名里的字退池即回收"那一族（第三次），arena 余量反而放宽；
+            2026-11-26 **§7-R12 翻向**：物品名随 --lang 切换，catalog 每件新增 name_en/name_ja/name_ko
+            可选字段并全量填齐 30 件（en 是 ASCII 不入账）⇒ 336 → **432（净 +96 = 汉字 +15 / 谚文 +57 /
+            假名 +24）**、产物 54,068 → **68,028 B（+13,960 B ≈ 145 B/字**，谚文/假名比汉字 414 B/字
+            便宜得多）。⚠️ 这批**第一次把 32 px 档挤出 120 KiB arena**（116,866 → 150,463 B）⇒ 门禁
+            one_tier_of_every_glyph_fits_the_arena 当场红（红的是真实溢出），由用户第三次拍板
+            **加宽 arena = 120 KiB → 160 KiB（163,840 B）**，三选项形状与 11-01/11-02 两次相同）
   轮廓     CFF（Type 2 charstring）—— 本机所有中文字体都是这个形状，栅格器必须能吃它
 
 来源（下面每一行都是 2026-10-26 用 `python3 tools/subset_font.py --name-report` 从字体

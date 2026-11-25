@@ -251,11 +251,29 @@ echo "   ✅ $(printf '%s\n' "$DLLS" | wc -l) 个名字全在白名单内，且�
 # ── 6/6 摊开产物目录 ───────────────────────────────────────────────────
 step "6/6 摊开 $OUT"
 rm -rf "$OUT"
-mkdir -p "$OUT/assets/pets/$PET" || fail "建不出 $OUT"
+mkdir -p "$OUT/assets/pets" "$OUT/assets/accessories" || fail "建不出 $OUT"
 cp "$EXE" "$OUT/$BIN.exe" || fail "拷 exe 失败"
-# 只拷运行时三件套；frames/ 是 11 MB 烘焙中间产物，pack.py 之后没人读它
-cp "assets/pets/$PET"/{pet.json,sheet.webp,polygon.json} "$OUT/assets/pets/$PET/" ||
-  fail "拷资产失败"
+# 只拷运行时三件套；frames/ 是每档 ~11 MB 的烘焙中间产物，pack.py 之后没人读它。
+# ⚠️ **M8 真机第一轮（2026-11-26）反馈 1/2 的根因在这一格**：zip 原来只带一只 tiger、
+# 零配件，而收藏册与换装读的是**库根**（`$OPET_PETS` → `%LOCALAPPDATA%\opet\pets`）⇒
+# 真机上两条 `打不开（os error 3）`，换装/换本体的行点了根本没有东西可点。
+# 所以整库入库：十只本体 + 全部在册配件，run.bat 再用环境变量把库根指到包内。
+for d in assets/pets/*/; do
+  id="$(basename "$d")"
+  [ -f "$d/pet.json" ] && [ -f "$d/sheet.webp" ] || continue
+  mkdir -p "$OUT/assets/pets/$id" || fail "建不出 $OUT"
+  cp "$d"/{pet.json,sheet.webp,polygon.json} "$OUT/assets/pets/$id/" ||
+    fail "拷本体 $id 失败"
+done
+for d in assets/accessories/*/; do
+  id="$(basename "$d")"
+  [ -f "$d/accessory.json" ] && [ -f "$d/sheet.webp" ] || continue
+  mkdir -p "$OUT/assets/accessories/$id" || fail "建不出 $OUT"
+  cp "$d"/{accessory.json,sheet.webp,polygon.json} "$OUT/assets/accessories/$id/" ||
+    fail "拷配件 $id 失败"
+done
+[ -f "$OUT/assets/pets/$PET/pet.json" ] ||
+  fail "开机本体 $PET 不在产物里 ⇒ run.bat 的 --manifest 指向虚空"
 
 # run.bat / help.bat 必须 CRLF：cmd.exe 读 LF-only 批处理会在一行中间断句，症状是
 # "说不认识某条命令"，而文件在 Linux 上看着完全正确 ⇒ 判据只能落在字节上（下面核 CR）。
@@ -268,20 +286,31 @@ cat >"$OUT/run.bat" <<'BAT'
 REM Windows test slice, second+third batch: pet, menu, dress-up, gacha card,
 REM collection panel. Four runs. Every run ends by itself - no pet is allowed to
 REM linger on your desktop. Report form: README-win32-test.txt
+REM
+REM Point the two asset libraries at THIS folder. Without these two lines the
+REM client looks in %LOCALAPPDATA%\opet\pets, that folder does not exist, and
+REM every collection / dress-up row is a read-only "would do nothing" row
+REM (real-machine round 1, 2026-11-26, reports 1 and 2 - packaging gap).
+set "OPET_PETS=%~dp0assets\pets"
+set "OPET_ACCESSORIES=%~dp0assets\accessories"
 
 echo ==== 1/4  test rect (reads no asset bytes, 20s) ====
 opet-overlay-win32 --test-rect --seconds 20
 
 echo.
 echo ==== 2/4  the pet, demo store (nothing is written to disk, 300s) ====
-echo Right-click the silhouette: menu. Try dress-up, one pull, the collection panel.
-echo Watch the result card with motion tiers: add  --motion reduce  or  --motion off
+echo Right-click the silhouette: menu. Try one pull, ten pulls, the collection panel.
+echo Dress-up and body-swap HERE are expected refusals (demo store owns nothing,
+echo and the exemption needs a real store) - the live version is run 3.
 opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --seed 1
 
 echo.
 echo ==== 3/4  real archive for one session (writes opet-session.db here, 300s) ====
 echo Same checks, but the DB line, the gacha rows and the panel rows must be live.
-opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --seed 1 --db opet-session.db
+echo The two unowned flags are ON in THIS run only: dress-up and body-swap
+echo must visibly work here (hat page, "put on" / "take off" / "pick another",
+echo and the pet rows on the collection panel).
+opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --seed 1 --db opet-session.db --allow-unowned-accessories --allow-unowned-pets
 
 echo.
 echo ==== 4/4  language and motion from the command line (60s) ====
@@ -308,9 +337,12 @@ OPet for Windows —— M5/M6/M7 测试包（宠物 + 菜单 + 换装 + 抽卡�
 
 这个目录里
   opet-overlay-win32.exe   交叉编译出的 64 位程序。不装、不要管理员权限
-  assets/pets/__PET__/     一份烘焙好的本体：pet.json + sheet.webp + polygon.json
-  run.bat                  双击 = 四段：矩形档 20s → 本体演示态 300s → 带 --db 300s → 语言/动效 60s，
-                           各自到点自己退
+  assets/pets/             **整册本体库**（每只一个目录：pet.json + sheet.webp + polygon.json）
+  assets/accessories/      **整册配件库**（每件一个目录：accessory.json + sheet.webp + polygon.json）
+  run.bat                  双击 = 四段：矩形档 20s → 本体演示态 300s → 带 --db 与豁免旗 300s → 语言/动效 60s，
+                           各自到点自己退。开头两行 set 把 OPET_PETS / OPET_ACCESSORIES
+                           指到本目录 ⇒ 收藏册与换装行是**活的**（第一轮 zip 不带库根，
+                           那两族行全是只读，反馈 1/2 就是它）
   help.bat                 把 --help 打到控制台（参数面 + 被拒绝的开关与理由）
 
 这一片**有**：最上层会动、能拖、点会反应的宠物；右键菜单；换装（含未拥有豁免旗）；
@@ -318,13 +350,18 @@ OPet for Windows —— M5/M6/M7 测试包（宠物 + 菜单 + 换装 + 抽卡�
 这一片**没有**（第三批）：托盘图标、NSIS 安装包、opet ctl 控制套接字、命中滞回。
 上面那些开关会被**点名拒绝并给理由**（--ipc / --ipc-path / --no-cursor），
 不会出现"接受了但没有任何作用"。
+⚠️ 一条**在册限制**（真机第一轮反馈 3 定性，不是本轮回归）：**物品名不随 --lang 切换**。
+菜单、卡片、摘要这些 UI 文案有四套语言，但宠物与配件的名字来自资产数据，
+清单 schema 里每个物品只有一个中文 `display_name` ⇒ 切 en/ja/ko 后物品行照旧是
+「牛仔帽」「旗」。要让物品名跟着语言走，得先给资产格式加多语言名字段（产品决定，已登记）。
 
 怎么跑
   1) 双击 run.bat；或者
   2) 在本目录开命令行（Shift+右键 → 在此处打开终端），逐条：
        opet-overlay-win32 --test-rect --seconds 20
        opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --seed 1
-       opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --db opet-session.db
+       set "OPET_PETS=%CD%\assets\pets" & set "OPET_ACCESSORIES=%CD%\assets\accessories"
+       opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --db opet-session.db --allow-unowned-accessories --allow-unowned-pets
        opet-overlay-win32 --probe > probe.log 2>&1
      想一直跑：--seconds 0。**没有托盘图标**，结束它 = 任务管理器，或
        taskkill /IM opet-overlay-win32.exe
@@ -384,21 +421,28 @@ DPI 档位只到返回值、叠帧行为与真合成器不同。本机 Wine 九�
 21. 其它异常（闪烁、残影、卡顿）    ：
 22. --probe 的 probe.log            ：        （整份附回来；退出码 0/1 也要说）
 23. 右键菜单：出不出、贴没贴身      ：        （run.bat 第 2 段里点）
-24. 菜单项：换装页点"穿上"外观立变？：
-25. 帽子页的未拥有行                ：        （不带豁免旗 = 灰的点名拒绝？带
-                                                --allow-unowned-accessories 能穿？）
+24. 菜单项：换装页点"穿上"外观立变？：        （判卷段 = run.bat 第 3 段；第 2 段是
+                                                演示库，点了应当是**点名拒绝**而不是变装）
+25. 帽子页的未拥有行                ：        （第 2 段不带豁免 = 灰的点名拒绝；第 3 段
+                                                自带 --allow-unowned-accessories，能穿）
 26. 抽卡：单抽/十连点得动吗          ：        （余额行随之变吗）
 27. 结果卡面：相位看得见吗          ：        （ burst 展开 → 结果 → 点掉）
 28. --motion reduce/off：卡面变了吗  ：★off    （off 该**根本不进** burst 相位；
                                                 Wine 只有静态断言，没有点击证据）
 29. 余额为 0 时抽卡                  ：        （点名拒绝的文案出不出）
 30. 收藏面板：开面板菜单是不是先关   ：        （两块面永不同时在场）
-31. 面板行：没抽到的本体点了有效吗   ：        （默认应为只读行；带
-                                                --allow-unowned-pets 才换得动）
+31. 面板行：没抽到的本体点了有效吗   ：        （第 2 段 = 只读行点名拒绝；第 3 段自带
+                                                --allow-unowned-pets，应换得动）
 32. 换本体后帽子去哪了                ：        （新本体没有那件 ⇒ 应脱下并写库，
-                                                重启后还是脱着的状态）
+                                                重启后还是脱着的状态；判卷段 = 第 3 段）
 33. 带 --db 跑完后的 opet-session.db ：        （把文件本身附回来；Linux 侧要复验审计链）
-34. 这一版你最想让我先修的           ：
+34. 宠物几何：脚贴地、活动范围铺满屏 ：★       （第一轮抓到"舞台被 scale 除了两次"的真 bug
+                                                ⇒ 宠物只占屏幕一角、脚不落地。本版已修，
+                                                这一格是修复复核项：屏幕四边与地面都走到）
+35. --lang 切语言后的物品名           ：        （UI 文案与物品名都应随语言变（2026-11-26
+                                                §7-R12 翻向：抽卡卡面/收藏册/还缺/最近四块
+                                                面都走 name_for）；名仍中文 = 病）
+36. 这一版你最想让我先修的           ：
 
 填不出的格子写"没测"，不要留空 —— 留空我会当成"你测过、没问题"，
 "没测"我才知道下一轮该补哪一格。
@@ -419,6 +463,13 @@ step "产物目录自检"
 for f in "$BIN.exe" "run.bat" "help.bat" "README-win32-test.txt" "assets/pets/$PET/pet.json" "assets/pets/$PET/sheet.webp" "assets/pets/$PET/polygon.json"; do
   [ -f "$OUT/$f" ] || fail "产物目录缺 $f"
 done
+# 库不空是本轮反馈 1/2 的**打包面判据**：zip 里只有一只 tiger 时，换装与换本体在真机上
+# 根本没有测试面（`打不开` 那两行日志就是证据），所以这里断言的是"库存在且非空"。
+N_PETS=$(ls -d "$OUT"/assets/pets/*/ 2>/dev/null | wc -l)
+N_ACCS=$(ls -d "$OUT"/assets/accessories/*/ 2>/dev/null | wc -l)
+[ "$N_PETS" -ge 2 ] || fail "dist 只有 $N_PETS 只本体 ⇒ 换本体没有测试面"
+[ "$N_ACCS" -ge 1 ] || fail "dist 没有配件库 ⇒ 换装没有测试面"
+echo "   ✅ 库账：本体 $N_PETS 只、配件 $N_ACCS 件（run.bat 的 set 指向它们）"
 grep -q $'\r' "$OUT/run.bat" || fail "run.bat 里没有 CR ⇒ 不是 CRLF，cmd.exe 会读坏"
 grep -q $'\r' "$OUT/help.bat" || fail "help.bat 里没有 CR ⇒ 不是 CRLF，cmd.exe 会读坏"
 
@@ -441,8 +492,12 @@ zip -qT "$ZIP" || fail "zip CRC 自检没过 ⇒ 这份别拷过去，压缩或�
 ZIP_ENTRIES=$(unzip -Z1 "$ZIP" 2>/dev/null | grep -vc '/$')
 EXE_IN_ZIP=$(unzip -Z1 "$ZIP" 2>/dev/null | grep -c "$BIN.exe$")
 [ "$EXE_IN_ZIP" = "1" ] || fail "zip 里没有（或有多个）$BIN.exe ⇒ 打包路径不对"
-printf '   zip 内文件数 = %s（应为 7：exe + 三件套 + 两个 .bat + README）\n' "$ZIP_ENTRIES"
-[ "$ZIP_ENTRIES" = "7" ] || fail "zip 内容物数量不对，别拷这份"
+# 计数从"目录里真有几个文件"来，不再写死 7（写死的那版随整库入库必然红，而它红的
+# 是"计划变了"不是"包坏了"—— 提前换成动态，判据留给"zip 与目录不一致"这件事本身）。
+DIR_FILES=$(find "$OUT" -type f | wc -l)
+printf '   zip 内文件数 = %s（目录实测 %s：exe + 本体 %s 只×3 + 配件 %s 件×3 + 两 .bat + README）\n' \
+  "$ZIP_ENTRIES" "$DIR_FILES" "$N_PETS" "$N_ACCS"
+[ "$ZIP_ENTRIES" = "$DIR_FILES" ] || fail "zip 内容物数量与产物目录不一致，别拷这份"
 
 echo
 du -sh "$OUT"

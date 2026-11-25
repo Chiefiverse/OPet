@@ -82,9 +82,9 @@ impl Gacha {
                 count,
             )
             .map_err(|e| format!("PULL {count}: {e}"))?;
-        // 显示名 = catalog 里的**中文**名（`蓝帽`），查不到回退 `item_id` ⇒ **绝不留白**。
-        // 四 locale 一律显示目录中文，英文界面配中文物品名是明写的取舍（§7-R12：给目录加
-        // `name_en` 要动 `petcore::gacha::catalog` 的 `deny_unknown_fields` schema，本轮不做）。
+        // 显示名 = catalog 里**按语言**的译名（`name_for`，gacha.rs 这一层是它唯一的 UI 调用方），
+        // 缺译回退中文规范名、查不到 item 回退 `item_id` ⇒ **绝不留白**。§7-R12 已于 2026-11-26
+        // 翻向：目录带 `name_en/ja/ko` 三枚可选字段，物品名随 `--lang` 切换（真机反馈第 3 条）。
         let items: Vec<(String, Rarity, bool)> = report
             .outcomes
             .iter()
@@ -92,7 +92,7 @@ impl Gacha {
                 let name = self
                     .catalog
                     .find(&o.item_id)
-                    .map(|i| i.name.clone())
+                    .map(|i| i.name_for(lang.code()).to_string())
                     .unwrap_or_else(|| o.item_id.clone());
                 (name, o.rarity, o.duplicate)
             })
@@ -192,6 +192,9 @@ impl Gacha {
     ///
     /// `owned` 由调用方给（`App::album_screen` 一次点击只读一遍库存 ⇒ 逐件那几张行与
     /// 汇总行问的是**同一份**答案，不是"各问了一遍然后祈祷它们相同"）。
+    ///
+    /// `lang` 决定 `AlbumEntry::name` 取哪一档译名（目录名出口唯一 = `CatalogItem::name_for`）。
+    /// 这与 §7-R10"卡面烘在抽取那一刻"不冲突：收藏册是每次打开重建的只读视图，不是挂着的卡。
     pub fn album_entries(
         &self,
         owned: &Owned,
@@ -199,6 +202,7 @@ impl Gacha {
         visible: &[usize],
         pet_ids: &[String],
         pet_visible: &[usize],
+        lang: Lang,
     ) -> Result<Vec<AlbumEntry>, String> {
         let mut out = Vec::new();
         for r in Rarity::ALL {
@@ -228,7 +232,7 @@ impl Gacha {
                     .map_err(|e| format!("读 {} 的件数失败: {e}", item.id))?;
                 out.push(AlbumEntry {
                     target,
-                    name: item.name.clone(),
+                    name: item.name_for(lang.code()).to_string(),
                     rarity: item.rarity,
                     slot: item.slot,
                     kind_pet,
@@ -268,7 +272,7 @@ impl Gacha {
                 .catalog
                 .items_of(r)
                 .filter(|i| !owned.contains(&i.id))
-                .map(|i| i.name.as_str())
+                .map(|i| i.name_for(lang.code()))
                 .collect();
             if names.is_empty() {
                 continue;
@@ -325,7 +329,7 @@ impl Gacha {
                 let name = self
                     .catalog
                     .find(&r.item_id)
-                    .map(|i| i.name.as_str())
+                    .map(|i| i.name_for(lang.code()))
                     .unwrap_or(r.item_id.as_str());
                 let dup_tag = if r.duplicate {
                     format!(" {}", lang.t(Key::Dup))
