@@ -16,13 +16,16 @@
 #   bash scripts/build_windows.sh --clean         # 删掉产物目录与该 target 的构建目录后退出
 #
 # ⚠️ 三条硬边界：
-#   * **本机不跑 Windows**（没装 wine）⇒ 交叉这几层只能证明"能编、能链、导入表干净"。
-#     屏上对不对只有第 10 步用户那台真机回答，README 里那张报告表就是为这一格写的。
+#   * **本机的 Windows 面 = Wine 11.22**（`bash scripts/test_windows_wine.sh` 九轮全判据化）。
+#     交叉这几层证明"能编、能链、导入表干净"，Wine 那一套证明"逻辑在真 Win32 API 上自洽"；
+#     但 **Wine 读数不是 Win11 判据**（D5）⇒ 屏上对不对、内存线、DPI 档位只有第 10 步用户
+#     那台真机回答，README 里那张报告表就是为这一格写的。
 #   * 产物目录**必须**是 git-ignored：里面装的是烘焙产物（sheet.webp 3.4 MB + polygon.json
 #     476 KB）。`.gitignore` 现在靠 `/dist/` 挡住它 ⇒ 脚本每次核一遍，挡不住就失败退出，
 #     不"只警告"（一次 `git add .` 就是把 3.4 MB 提交进公开仓库）。
-#   * 产出的 exe **不含** `petstore`（用户 2026-11-21 第 4 条拍板；真实理由 = `rusqlite/bundled`
-#     要在本 target 上编 C）⇒ `--db` / 抽卡 / 库存这一族在 Windows 上没有入口，cli 会点名拒绝。
+#   * exe **链着 `petstore`**（M0 2026-11-22 证伪了"bundled SQLite 编不过"的担心；第一批那句
+#     "不带 petstore 依赖"已作废）⇒ `--db` / 抽卡 / 库存 / 面板在 Windows 上有真入口。
+#     代价已实测并登记在旁边那张 DLL 白名单（14 → 16 名，出处 = `libsqlite3.a` 的两个 UCRT 符号）。
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
@@ -127,6 +130,12 @@ done
 [ -n "$OBJDUMP" ] || fail "没有 objdump（试过 x86_64-w64-mingw32-objdump / llvm-objdump / objdump）⇒ 白名单那一层没法判"
 echo "   objdump = $OBJDUMP"
 
+# petstore 的 C 交叉编译（rusqlite/bundled）是第二批起的硬前置。这里**不真编**（第 2–4 步
+# 就是它的真 compiler-invocation 证明），只把"诊断工具在场"提前到第 0 步：白名单红的时候第一
+# 问句是"哪个符号是谁带进来的"，拿不到 nm 就只能整张表重猜（M5e 那次的出处行就是这条命令）。
+command -v x86_64-w64-mingw32-nm >/dev/null ||
+  fail "找不到 x86_64-w64-mingw32-nm ⇒ 第 5 步白名单若红将无法点名新符号的出处（binutils 没装齐）"
+
 rustc --print target-list 2>/dev/null | grep -qx "$TARGET" ||
   fail "rustc 不认识 target $TARGET（工具链太旧？）"
 if ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
@@ -193,7 +202,7 @@ echo "   ✅ 交叉 clippy 0 warning（原文 = $XLOG）"
 step "3/6 交叉测试**编译**（--no-run）"
 # 跑不了：本机没有 wine，也没有 Windows。所以这一层能证的只有"这些测例在 Windows
 # 目标上建得起来"——这已经比"只在 Linux 上编过"多一格：测例里的 cfg 与链接错误都抓得住。
-cargo test --no-run -p overlay-win32 -p overlay-common --target "$TARGET" ||
+cargo test --no-run -p overlay-win32 -p overlay-common -p overlay-report -p petstore --target "$TARGET" ||
   fail "交叉测试构建失败"
 
 step "4/6 交叉 release 构建"
@@ -256,20 +265,33 @@ cp "assets/pets/$PET"/{pet.json,sheet.webp,polygon.json} "$OUT/assets/pets/$PET/
 # 所以要区分的是"我们写的脚本"与"脚本打印的东西"。
 cat >"$OUT/run.bat" <<'BAT'
 @echo off
-REM M5 slice 1 = the pet on screen, nothing else. The two runs below differ only in
-REM whether an atlas is read; window / DPI / click-through maths is the same path.
+REM Windows test slice, second+third batch: pet, menu, dress-up, gacha card,
+REM collection panel. Four runs. Every run ends by itself - no pet is allowed to
+REM linger on your desktop. Report form: README-win32-test.txt
 
-echo ==== 1/2  test rect (reads no asset bytes, exits by itself after 20s) ====
+echo ==== 1/4  test rect (reads no asset bytes, 20s) ====
 opet-overlay-win32 --test-rect --seconds 20
 
 echo.
-echo ==== 2/2  the pet (exits by itself after 20s) ====
-opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 20 --seed 1
+echo ==== 2/4  the pet, demo store (nothing is written to disk, 300s) ====
+echo Right-click the silhouette: menu. Try dress-up, one pull, the collection panel.
+echo Watch the result card with motion tiers: add  --motion reduce  or  --motion off
+opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --seed 1
 
 echo.
-echo Both runs should print the summary block at the end. No summary = the process
-echo was ended from outside, so that run is not evidence.
-echo Instructions and the report form: README-win32-test.txt
+echo ==== 3/4  real archive for one session (writes opet-session.db here, 300s) ====
+echo Same checks, but the DB line, the gacha rows and the panel rows must be live.
+opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --seed 1 --db opet-session.db
+
+echo.
+echo ==== 4/4  language and motion from the command line (60s) ====
+opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 60 --lang ja --motion off
+
+echo.
+echo One more read-only run worth doing by hand (no window, prints diagnostics):
+echo     opet-overlay-win32 --probe ^> probe.log 2^>^&1
+echo If a run printed no summary block, it was ended from outside - that run is
+echo not evidence. Please also run  --probe  and attach probe.log.
 pause
 BAT
 cat >"$OUT/help.bat" <<'BAT'
@@ -282,27 +304,32 @@ sed -i 's/$/\r/' "$OUT/run.bat" "$OUT/help.bat"
 README="$OUT/README-win32-test.txt"
 {
   cat <<'TXT'
-OPet for Windows —— M5 第一批测试包（宠物上屏最小闭环）
+OPet for Windows —— M5/M6/M7 测试包（宠物 + 菜单 + 换装 + 抽卡卡面 + 收藏面板）
 
 这个目录里
   opet-overlay-win32.exe   交叉编译出的 64 位程序。不装、不要管理员权限
   assets/pets/__PET__/     一份烘焙好的本体：pet.json + sheet.webp + polygon.json
-  run.bat                  双击 = 先 20 秒矩形档，再 20 秒本体，各自到点自己退
+  run.bat                  双击 = 四段：矩形档 20s → 本体演示态 300s → 带 --db 300s → 语言/动效 60s，
+                           各自到点自己退
   help.bat                 把 --help 打到控制台（参数面 + 被拒绝的开关与理由）
 
-这一片**只有**：一只宠物在最上层走动、能拖、点它会反应、它旁边的空白处点得穿下去。
-这一片**没有**：右键菜单、抽卡、收藏册、配件、托盘图标、控制套接字。
-上面那些开关会被**点名拒绝并给理由**（--db / --ipc / --lang / --probe 等），
+这一片**有**：最上层会动、能拖、点会反应的宠物；右键菜单；换装（含未拥有豁免旗）；
+抽卡与结果卡面（含动效三档）；收藏面板与收藏册点名；换本体；--db/--lang/--motion/--probe 转真。
+这一片**没有**（第三批）：托盘图标、NSIS 安装包、opet ctl 控制套接字、命中滞回。
+上面那些开关会被**点名拒绝并给理由**（--ipc / --ipc-path / --no-cursor），
 不会出现"接受了但没有任何作用"。
 
 怎么跑
   1) 双击 run.bat；或者
   2) 在本目录开命令行（Shift+右键 → 在此处打开终端），逐条：
        opet-overlay-win32 --test-rect --seconds 20
-       opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 20 --seed 1
+       opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --seed 1
+       opet-overlay-win32 --manifest assets\pets\__PET__\pet.json --seconds 300 --db opet-session.db
+       opet-overlay-win32 --probe > probe.log 2>&1
      想一直跑：--seconds 0。**没有托盘图标**，结束它 = 任务管理器，或
        taskkill /IM opet-overlay-win32.exe
      不带 --seconds = 3 秒自毁（手工敲错也不许有一只宠物赖在你桌面上）。
+     不带 --db = 演示态：屏上右下角有 DRYRUN，盘上一个字节都不写（与 Wayland 同口径）。
 
 控制台那一页是什么
   win:  开头 = 这一轮的几何：舞台显示器、scale 与 DPI 路线、窗口/buffer 像素、
@@ -327,6 +354,8 @@ OPet for Windows —— M5 第一批测试包（宠物上屏最小闭环）
 TXT
   cat <<'TXT'
 ──── 报告表（填这一页，别凭印象口述）──────────────────────────────────
+★ = 这一格 Wine 判不了、只有真 Win11 的回答算数（D5 口径：Wine 的内存口径无量、
+DPI 档位只到返回值、叠帧行为与真合成器不同。本机 Wine 九轮绿的都不是这些格）。
 
  1. Windows 版本与构建号            ：        （winver 回车，抄那一行）
  2. 分辨率与缩放百分比              ：        （设置 → 显示 → 缩放与布局，两个都抄）
@@ -335,21 +364,41 @@ TXT
  5. 任务栏位置                      ：        （上/下/左/右）
  6. 任务栏高度或宽度（像素）        ：        （截图里量，或抄摘要里"顶部留白/底部留白"）
  7. 有没有把宠物拖到过别的屏        ：
- 8. 摘要里的 scale 与 DPI 路线      ：        （抄 win: 那一行）
- 9. 宠物是否可缩放（是/否 + 档位）  ：
+ 8. 摘要里的 scale 与 DPI 路线      ：★       （抄 win: 那一行）
+ 9. 宠物是否可缩放（是/否 + 档位）  ：★       （缩放改成 125%/150% 各看一次）
 10. 宠物是否可移动（是/否）         ：
 11. 截图：宠物骑在记事本窗口上      ：        （要能看出穿透边界在哪）
 12. 截图：宠物在屏幕边缘（左/右/下）：
 13. 控制台整段输出                  ：        （从第一行 win: 到摘要最后一行；
                                                 长的那一页直接附 out.log 文件）
-14. 边缘有没有黑边                  ：        （有 / 没有 / 看不出来）
+14. 边缘有没有黑边                  ：★       （Wine 有已知的 ULW 叠帧"累加老虎"，
+                                                那边的边缘读数不能外推）
 15. 穿透：试过哪几种判定方法        ：        （记事本光标 / 画布画点 / 按钮能不能按）
 16. 穿透：结论                      ：        （穿 / 不穿 / 部分不穿 = 哪一块）
 17. CPU 占用                        ：        （任务管理器那一列，另抄摘要里的 CPU 时间）
-18. 这一轮怎么结束的                ：        （到点自退 / 手杀 / taskkill / 关控制台）
-19. 崩过吗（摘要打完 = 没崩）        ：
-20. 其它异常（闪烁、残影、卡顿）    ：
-21. 这一版你最想让我先修的          ：
+18. 内存（PrivateWorkingSet）       ：★       （任务管理器"专用工作集"或
+                                                Get-Process 的 PrivateMemory；
+                                                摘要里那行在 Wine 恒 0 = 无量）
+19. 这一轮怎么结束的                ：        （到点自退 / 手杀 / taskkill / 关控制台）
+20. 崩过吗（摘要打完 = 没崩）        ：
+21. 其它异常（闪烁、残影、卡顿）    ：
+22. --probe 的 probe.log            ：        （整份附回来；退出码 0/1 也要说）
+23. 右键菜单：出不出、贴没贴身      ：        （run.bat 第 2 段里点）
+24. 菜单项：换装页点"穿上"外观立变？：
+25. 帽子页的未拥有行                ：        （不带豁免旗 = 灰的点名拒绝？带
+                                                --allow-unowned-accessories 能穿？）
+26. 抽卡：单抽/十连点得动吗          ：        （余额行随之变吗）
+27. 结果卡面：相位看得见吗          ：        （ burst 展开 → 结果 → 点掉）
+28. --motion reduce/off：卡面变了吗  ：★off    （off 该**根本不进** burst 相位；
+                                                Wine 只有静态断言，没有点击证据）
+29. 余额为 0 时抽卡                  ：        （点名拒绝的文案出不出）
+30. 收藏面板：开面板菜单是不是先关   ：        （两块面永不同时在场）
+31. 面板行：没抽到的本体点了有效吗   ：        （默认应为只读行；带
+                                                --allow-unowned-pets 才换得动）
+32. 换本体后帽子去哪了                ：        （新本体没有那件 ⇒ 应脱下并写库，
+                                                重启后还是脱着的状态）
+33. 带 --db 跑完后的 opet-session.db ：        （把文件本身附回来；Linux 侧要复验审计链）
+34. 这一版你最想让我先修的           ：
 
 填不出的格子写"没测"，不要留空 —— 留空我会当成"你测过、没问题"，
 "没测"我才知道下一轮该补哪一格。
@@ -403,4 +452,4 @@ echo "   单文件包：$ZIP（$(du -h "$ZIP" | cut -f1)）"
 echo "   sha256 ：$(sha256sum "$ZIP" | cut -d' ' -f1)"
 echo "   ⇒ 到 Windows 上先 certutil -hashfile <包名> SHA256 对一眼，再解压、双击 run.bat。"
 echo "   整个目录拷到 Windows 11 x64，双击 run.bat，把 README 末尾那张表填回来。"
-echo "   本机没有 Windows 也没有 wine ⇒ 上面每一层都只证明\"能编/能链/导入表干净\"，不证明屏上是对的。"
+echo "   交叉层只证明\"能编/能链/导入表干净\"；Wine 九轮（scripts/test_windows_wine.sh）只证明逻辑与启动链；屏上对不对要真机。"

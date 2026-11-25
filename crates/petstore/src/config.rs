@@ -748,27 +748,47 @@ mod tests {
     /// 选链是**参数**不是编译目标：同一份 `ConfigEnv`（五种变量全填）喂 `read_on` 的两边，
     /// 必须各拿各的文件。`cfg!(windows)` 在本文件里只许出现在 [`Config::read`] 与
     /// [`write_ui_key`] 两处 ⇒ 除此之外任何"平台自己决定"的路径都是没接线的第三条链。
+    ///
+    /// ⚠️ unix 侧样本必须是**两侧都绝对**的路径，不许用 `/xdg` 这类字面量：`config_path`
+    /// 判绝对用的是宿主 `Path::is_absolute`（unix 链在 unix 上跑，这是本模块唯一允许它的地方），
+    /// 而 `"/xdg"` 在 Windows/Wine 上判否 ⇒ 退 `$HOME` 档，断言就变成"在哪个平台编译"的函数
+    ///（M8 的 Wine 脚本第一轮正是红在这里——红的是样本的平台假设，不是链）。tempdir 在
+    /// 宿主是 `/tmp/…`、在 Wine 是 `C:\users\…\Temp\…`，两侧各自绝对 ⇒ 链的语义不变、样本中性。
     #[test]
     fn the_two_chains_are_one_env_apart_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let xdg = dir.path().join("xdg").display().to_string();
+        let home = dir.path().join("home").display().to_string();
+        // Windows 侧样本同一条纪律：**不许**用 C:\Users\jun\AppData\Local 这种在某个宿主上
+        // 会真实存在的值 —— Wine 的 %LOCALAPPDATA% 正映射到它，而 M7-e 起的真轮次往那里写过
+        // config.toml ⇒ "Absent" 会红在环境（M8 第一轮实测）。用不存在的假档；Roaming 档
+        // 指进 tempdir 并投毒，反证"阶梯在第一档就停、不下探"。
+        let fake_local = r"C:\opet-missing-local-a1b2";
+        let roam = dir.path().join("roaming");
+        std::fs::create_dir_all(roam.join("opet")).expect("建投毒档");
+        std::fs::write(
+            roam.join("opet").join("config.toml"),
+            "[ui]\nlang = \"ja\"\n",
+        )
+        .expect("投毒");
+        let roam = roam.display().to_string();
         let env = ConfigEnv {
-            xdg_config_home: Some("/xdg".into()),
-            home: Some("/home/jun".into()),
-            local_appdata: Some(r"C:\Users\jun\AppData\Local".into()),
-            appdata: Some(r"C:\Users\jun\AppData\Roaming".into()),
+            xdg_config_home: Some(xdg.clone()),
+            home: Some(home.clone()),
+            local_appdata: Some(fake_local.into()),
+            appdata: Some(roam.clone()),
             userprofile: Some(r"C:\Users\jun".into()),
         };
         let unix = Config::read_on(&env, false);
         let win = Config::read_on(&env, true);
         assert_eq!(
             unix.path,
-            PathBuf::from("/xdg").join("opet").join("config.toml"),
+            PathBuf::from(&xdg).join("opet").join("config.toml"),
             "unix 链看 XDG/$HOME，不许被 Windows 三档污染"
         );
         assert_eq!(
             win.path,
-            PathBuf::from(r"C:\Users\jun\AppData\Local")
-                .join("opet")
-                .join("config.toml"),
+            PathBuf::from(fake_local).join("opet").join("config.toml"),
             "Windows 链看三档，不许回落 `$HOME/.config`（那棵树在真 Windows 上没人读）"
         );
         assert_ne!(
@@ -778,6 +798,10 @@ mod tests {
         // 两份都不存在 ⇒ 同一种沉默（Absent + 零出声），平台不该改变出声行为
         assert_eq!(unix.source, ConfigSource::Absent);
         assert_eq!(win.source, ConfigSource::Absent);
+        assert!(
+            win.ui.lang.is_none(),
+            "ja 出现在这里 = 阶梯下探到投毒的 Roaming 档了"
+        );
         assert!(unix.notices.is_empty() && win.notices.is_empty());
     }
 

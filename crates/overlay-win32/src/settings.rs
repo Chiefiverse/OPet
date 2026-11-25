@@ -152,10 +152,25 @@ mod tests {
         );
 
         // 阶梯第一档是合法 Windows 绝对值 ⇒ 落点就是它，那个有内容的目录**不是**候选。
-        let local = r"C:\Users\jun\AppData\Local";
+        // ⚠️ 三个形状坑，都在这条测例上踩过或会踩：
+        //  1) 不许写真实 AppData 形制的字面量（旧写法 C:\Users\jun\AppData\Local）——宿主上恒
+        //     不存在 ⇒ 白过，而这套 exe 在 Wine 里真跑，M7-e 起真轮次会往真 Local 写文件
+        //     ⇒ "Absent" 红在环境不红在产品。
+        //  2) 不许拿 unix 路径当档位——is_windows_absolute 不收，阶梯会**掉进回退档**，
+        //     旧写法那条 path 断言在 Linux 上其实是回退值与期望值的巧合，不是阶梯判出来的。
+        //  3) 档位用 UNC 形（\\ 前缀）：`PathBuf` 在 Linux 上也把 "C:\…" 当相对段（b[0] 不是
+        //     '/'），而 UNC 以 '\\' 开头 ⇒ 两侧都是"绝对、不存在"，join 的分隔符混排无害。
+        // 第二、三档投毒是白捡的加强：判"阶梯在第一档就停、不下探、不回退 unix 目录"。
+        // 档位必须用 join 派生，不许 display() 拼字面量：宿主分隔符是 '/'、Wine 是 '\'
+        //（tempdir 在 Wine 报 C:\users\jun\…），嵌一段带反斜杠的字面量在两侧形状都不一样。
+        let local = r"\\opet-fake\local";
+        let roam = dir.path().join("fake-roaming");
+        std::fs::create_dir_all(&roam).expect("建假 Roaming 档");
+        std::fs::write(roam.join("config.toml"), "[ui]\nlang = \"ja\"\n").expect("投毒第二档");
+        let roam = roam.display().to_string();
         let ladder = Config::read_windows_in(&ConfigEnv::with_windows(
             Some(local),
-            Some(r"C:\Users\jun\AppData\Roaming"),
+            Some(&roam),
             dir.path().to_str(),
         ));
         assert_eq!(
@@ -168,7 +183,7 @@ mod tests {
         assert_eq!(ladder.source, petstore::config::ConfigSource::Absent);
         assert!(
             ladder.ui.lang.is_none(),
-            "读错了文件 = 那份 en 会出现在这里"
+            "读错了文件 = 那份 en 会出现在这里（ja 出现在这里 = 阶梯下探了）"
         );
         assert!(ladder.notices.is_empty(), "文件不存在必须彻底安静");
 
