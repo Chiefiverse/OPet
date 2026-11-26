@@ -94,7 +94,7 @@ use overlay_report::{
     plan_body_override, plan_swap_body, published_rates_lines,
 };
 
-use crate::atlas::Atlas;
+use crate::atlas::{Atlas, AtlasSet};
 use crate::card;
 use crate::ipc;
 use crate::l10n::Lang;
@@ -172,7 +172,9 @@ impl Default for Options {
             monitor: None,
             panel_bottom: 0.0,
             panel_top: 0.0,
-            seed: 1,
+            // 24 = 按 300 s 窗口实测挑的（首飞 3 s、5 min 内 7 次升空）；旧的 1 是样本里最稀的一出
+            // （5 min 只 1 次、飞 6 s）⇒ 裸跑看不见升空，读数见 DESIGN §6.1.26 ⑭。
+            seed: 24,
             db: None,
             test_rect: false,
             no_cursor: false,
@@ -316,7 +318,11 @@ pub struct App {
     qh: Option<QueueHandle<App>>,
 
     manifest: &'static Manifest,
-    atlas: Option<Atlas>,
+    /// 本体像素 = **一组** sheet（段表只由清单给，见 [`Manifest::sheet_segments`]）。
+    ///
+    /// 单张时代它是 `Option<Atlas>`；换成集合不是为了多文件，而是为了让"哪一段的哪一行"只有
+    /// 一个换算口（[`AtlasSet::at`]）。`None` = 这一轮没有像素（`--test-rect`、无 `--manifest`）。
+    atlas: Option<AtlasSet>,
     /// **本体自己那份**穿透轮廓，永远不含配件 ⇒ 脱装的复原就是把它换回 [`Self::regions`]。
     /// 存两份而不是"脱装时重读 `polygon.json`"：重读会失败（文件可能已被搬走），而失败发生在
     /// 用户刚点完"脱下"的那一刻 —— 一份几 KB 的表换来一条不可能失败的复原路径。
@@ -703,16 +709,19 @@ fn load_manifest(opts: &Options) -> Result<&'static Manifest, String> {
     Ok(Box::leak(Box::new(m)))
 }
 
-/// 解**起点本体**那一张 sheet（本轮唯一一次本体解码）。
+/// 解**起点本体**那一张或几张 sheet（本轮唯一一次本体解码）。
 ///
 /// `body_dir` = 库里那一行 `body` 覆盖出来的目录（[`plan_body_override`] 那一臂）。给出来时
-/// sheet 与 polygon 都从**它**取，而不是从 `--manifest` 的父目录取 ⇒ 覆盖成立的那一轮
+/// 像素与 polygon 都从**它**取，而不是从 `--manifest` 的父目录取 ⇒ 覆盖成立的那一轮
 /// 从头到尾只解**一只**本体的像素。`None` = 没有覆盖（老库、无 `--db`）⇒ 逐字节是 P4 的行为。
+///
+/// ⚠️ 文件名**不在这里**：段表与文件名都由清单给（[`Manifest::sheet_segments`]）。这里曾经写死
+/// `dir.join("sheet.webp")` ⇒ 一份指着别的名字的清单会被静默读成"装载成功"，而屏上是错的像素。
 fn load_asset(
     opts: &Options,
     manifest: &Manifest,
     body_dir: Option<&std::path::Path>,
-) -> Result<(Option<Atlas>, Option<Regions>), String> {
+) -> Result<(Option<AtlasSet>, Option<Regions>), String> {
     if opts.test_rect {
         return Ok((None, None));
     }
@@ -731,15 +740,7 @@ fn load_asset(
             &owned_dir
         }
     };
-    let sheet = dir.join("sheet.webp");
-    let atlas = Atlas::load(
-        sheet.to_str().ok_or("sheet 路径不是 UTF-8")?,
-        manifest.grid.cols as u32,
-        manifest.grid.rows as u32,
-        manifest.grid.w,
-        manifest.grid.h,
-    )
-    .map_err(|e| format!("{}: {e}", sheet.display()))?;
+    let set = AtlasSet::load(dir, manifest).map_err(|e| format!("{}: {e}", dir.display()))?;
     let polygon = dir.join("polygon.json");
     let regions = Regions::load(
         polygon.to_str().ok_or("polygon 路径不是 UTF-8")?,
@@ -748,16 +749,25 @@ fn load_asset(
         SURFACE_MARGIN,
     )
     .map_err(|e| format!("{}: {e}", polygon.display()))?;
+    // 逐张一行：一张 sheet 是 45 MiB 那一档，"两张里哪一张贵"必须看得见（D16 的输入）。
+    for (index, (file, sheet)) in set.segments().enumerate() {
+        eprintln!(
+            "asset: 第 {} 张 {file} {}x{} {} KB → 解码 {} ms / {:.3} MiB",
+            index + 1,
+            sheet.width,
+            sheet.height,
+            sheet.encoded_bytes / 1024,
+            sheet.decode_ms,
+            sheet.decoded_bytes() as f64 / (1024.0 * 1024.0),
+        );
+    }
     eprintln!(
-        "asset: sheet {}x{} {} KB → 解码 {} ms / {:.3} MiB；区域 {} 格",
-        atlas.width,
-        atlas.height,
-        atlas.encoded_bytes / 1024,
-        atlas.decode_ms,
-        atlas.decoded_bytes() as f64 / (1024.0 * 1024.0),
+        "asset: 合计 {} 张 · 解码 {:.3} MiB；区域 {} 格",
+        set.len(),
+        set.decoded_bytes() as f64 / (1024.0 * 1024.0),
         regions.frame_count(),
     );
-    Ok((Some(atlas), Some(regions)))
+    Ok((Some(set), Some(regions)))
 }
 
 /// 配件库在哪 —— **只由环境决定，命令行没有第二个入口**（用户 2026-11-02 的原话"配件不是应该由
@@ -959,8 +969,10 @@ fn start_body_id(manifest_path: Option<&str>, slug: &str) -> String {
 /// [`Candidate::merged`] 里，所以"点了穿上而屏上没帽子"与"点了穿上而帽子点不到"这两种形状
 /// 在这一层都构造不出来（后者正是上面那条 `first_missing` 守的东西）。
 fn decode(cand: &Candidate) -> Result<Equipped, String> {
-    let sheet = cand.dir.join("sheet.webp");
+    // 名字来自清单（裁决 6）：拼死 `"sheet.webp"` 时，一份指着别的名字的清单会静默
+    // 装成"成功"而屏上是错的像素。穿越形状由 `AccessoryManifest::validate` 拦在装载之前。
     let acc = &cand.manifest;
+    let sheet = cand.dir.join(acc.sheet.as_str());
     let atlas = Atlas::load(
         sheet.to_str().ok_or("配件 sheet 路径不是 UTF-8")?,
         acc.grid.cols as u32,
@@ -1001,7 +1013,7 @@ fn decode(cand: &Candidate) -> Result<Equipped, String> {
 #[allow(clippy::too_many_arguments)]
 fn blit_cell(
     dst: &mut [u8],
-    body: Option<&Atlas>,
+    body: Option<(&AtlasSet, &Manifest)>,
     worn: Option<&Equipped>,
     cell: (u32, u32),
     key: AssetKey,
@@ -1009,9 +1021,8 @@ fn blit_cell(
     cell_h: u32,
     stride: usize,
 ) -> Result<(), String> {
-    if let Some(atlas) = body {
-        atlas
-            .blit(cell.0, cell.1, dst, cell_w, cell_h, stride)
+    if let Some((set, manifest)) = body {
+        set.blit(manifest, cell.0, cell.1, dst, cell_w, cell_h, stride)
             .map_err(|e| format!("blit ({},{}) 失败: {e}", cell.0, cell.1))?;
     }
     if let Some(acc) = worn.filter(|a| a.manifest.covers(key)) {
@@ -2631,10 +2642,10 @@ impl App {
     /// 换成另一只本体（P5 = 收藏册里点宠物行那一件事）。**唯一入口**。
     ///
     /// ⚠️ **顺序就是它的全部安全性**，所以九步一步不许换位置，理由各自写在行上。整体论证：
-    /// * 第 4 步（`atlas.reload`）是**不可回头的那一条线**之前唯一的写点，而它自己的三条自检
-    ///   全排在它第一笔像素写之前（见 [`Atlas::reload`]）⇒ "新图集 + 旧清单"这个半换形状
-    ///   **构造不出来**：3 之后的步骤全是赋值（`regions` 早在扫盘时就解好，见
-    ///   `BodyCandidate::regions` 那条字段注释，所以这一步没有 IO、不可能失败）。
+    /// * 第 4 步（换像素那两臂，见那里的注释）是**不可回头的那一条线**之前唯一的写点，而它自己的
+    ///   几条自检全排在第一笔像素写之前（原地那臂先逐张读头，见 [`AtlasSet::reload_segments`]）
+    ///   ⇒ "新图集 + 旧清单"这个半换形状**构造不出来**：5 之后的步骤全是赋值（`regions` 早在扫盘
+    ///   时就解好，见 `BodyCandidate::regions` 那条字段注释，所以那一步没有 IO、不可能失败）。
     /// * 5–9 里唯一还能失败的 IO 是第 7 步那次 `wear()` 的解码；它的失败形状 = 本体新、帽子无、
     ///   点名一行 ⇒ **自洽**（屏上没有帽子而库里有那一行，重启会在新本体上重新穿上它 —— 而它
     ///   过得了门禁，因为第 6 步刚刚按这只新本体重跑过一遍）。
@@ -2644,8 +2655,9 @@ impl App {
     /// **峰值 = 一只本体 + 一顶帽**（D16 那条 M1 档）。第 2 步排在第 4 步之前不是顺手：
     /// 反过来就瞬间有"旧本体 45 + 新本体 45 + 帽 45"在场，而 ≈147 MB **仍落在 ≤200 MiB 门禁内
     /// ⇒ 什么都不会红**（`148,076 kB` 那一族就是这么漏掉的；那条线 2026-11-10 前是 150 MiB）。
-    /// 所以这条防线的读数是两处：
-    /// 验收量一次 `VmHWM`，以及源级门禁数 `atlas.reload(` 恰好 1 次 + `take_worn` 排在它前面。
+    /// 所以这条防线的读数是两处：验收量一次 `VmHWM`，以及源级门禁数"换像素那两臂"（原地那一臂
+    /// 恰好 1 次、整只那一臂只许出现在 `fits` 为假的分支里并自带那行"峰值两只本体"）
+    /// + `take_worn` 排在它们前面。
     ///
     /// 非目标（写在这里以免被读宽）：**不做**"换回默认本体"这一档 ⇒ `body` 行永远只有 UPSERT、
     /// 没有 DELETE（换本体是"换到某一只"，不是"脱下"；屏幕上任何时刻都有一只本体）。
@@ -2678,16 +2690,14 @@ impl App {
         }
         // 四道都过 ⇒ 这一格必然在库里。仍用 `get`：取不到就多打一行后返回，不赌一次 panic
         // （硬约束 3：宠物不能因为一行下标消失）。
-        let Some((pet_slug, new_regions, sheet)) = self
+        // ⚠️ 取的是**目录**不是某张 sheet：文件名归清单（[`Manifest::sheet_segments`]），这里
+        // 拼死一个名字就是第二个事实源（旧形状 = `b.sheet()` 写回 `sheet.webp`）。
+        let Some((pet_slug, new_regions, dir)) = self
             .bodies
             .get(i)
-            .map(|b| (b.slug.clone(), b.regions.clone(), b.sheet()))
+            .map(|b| (b.slug.clone(), b.regions.clone(), b.dir.clone()))
         else {
             eprintln!("ui: 换本体 ⇒ 判定放行而 {name} 这一格取不到 ⇒ 不动（判据与库对不上）");
-            return;
-        };
-        let Some(sheet_str) = sheet.to_str().map(|s| s.to_string()) else {
-            eprintln!("ui: 换本体 ⇒ {name} 的 sheet 路径不是 UTF-8 ⇒ 本体不动");
             return;
         };
 
@@ -2718,9 +2728,36 @@ impl App {
         // 没有 IO。把"到换的时候再读一次 `polygon.json`"排除掉不是省几微秒，而是让"新清单 +
         // 旧轮廓"这个半换形状**没有对应的代码**：一个不可能失败的步骤不需要错误分支。
         // —— 第 4 步：解新 sheet。这一步之后就没有可回头的失败了。
+        // 清单**先取**（[`BodyCandidate::leaked`] 只泄几 KB 元数据、一像素不碰 ⇒ 排在"可回头"这侧
+        // 安全），因为段表只能从清单读；**赋给 `self.manifest` 仍是第 5 步那唯一一处**（那条赋值
+        // 由形状门禁数着，"新清单 + 旧像素"必须只有一个落点）。
+        let m = self.bodies[i].leaked();
         match self.atlas.as_mut() {
-            Some(atlas) => {
-                if let Err(e) = atlas.reload(&sheet_str) {
+            Some(set) => {
+                // 两条路，按**段形是否相同**分岔（`fits` 是那条判据）：
+                // * 相同 ⇒ 逐段原地换（`reload_segments` 内部先逐张读头再解，见那段注释）⇒
+                //   峰值 = 一只本体，与单张时代同一个数。
+                // * 不同（单张 ↔ 分段、或 2+2 ↔ 1+3）⇒ 原地接不住，只能整只 `load`。⚠️ 那一刻
+                //   内存里是**两只**本体（≈147 MB），它落在 ≤200 MiB 门禁内 ⇒ 没有任何测例会为它
+                //   变红，所以那一行日志是它唯一的读数；在册产物切法相同，正常轮不走到这里。
+                let swapped: Result<(), String> = if set.fits(m) {
+                    set.reload_segments(&dir, m).map_err(|e| e.to_string())
+                } else {
+                    match AtlasSet::load(&dir, m) {
+                        Ok(fresh) => {
+                            eprintln!(
+                                "ui: 换本体 ⇒ {name} 的 sheet 切法与当前本体不同（{} 段 → {} 段）\
+                                 ⇒ 整只重解，**峰值两只本体**",
+                                set.len(),
+                                fresh.len(),
+                            );
+                            *set = fresh;
+                            Ok(())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                };
+                if let Err(e) = swapped {
                     eprintln!(
                         "ui: 换本体 ⇒ {name} 的 sheet 解不开（{e}）⇒ **本体没换**，屏上仍是 {cur}\
                          （帽子已在第 2 步释放，库里那一行还在：点「穿上」就回来，重启也会回来）",
@@ -2743,9 +2780,9 @@ impl App {
             }
         }
 
-        // —— 第 5 步：提交元数据。清单的 `&'static` 在这里才泄（第一次用上它，见
-        // [`BodyCandidate::leaked`]）⇒ 一份进程内每只不同的宠物只泄几 KB，不是每次换都泄。
-        let m = self.bodies[i].leaked();
+        // —— 第 5 步：提交元数据。**唯一一处** `self.manifest` 赋值（形状门禁数它）：清单的
+        // `&'static` 在第 4 步就取好了（`leaked` 只泄元数据），像素先落、清单后落 ⇒ 中间任何
+        // 失败分支上"本体没换"那句话都是真的。
         self.manifest = m;
         self.body_regions = Some(new_regions.clone());
         self.regions = Some(new_regions.clone());
@@ -3685,7 +3722,7 @@ impl App {
             // （`Tick::Fault` 有自己的档位，且会把新 margin 冲出去）也不把它画出来。
             if let Err(e) = blit_cell(
                 take,
-                self.atlas.as_ref(),
+                self.atlas.as_ref().map(|set| (set, self.manifest)),
                 self.worn.as_ref(),
                 (row, col),
                 key,
@@ -4368,16 +4405,20 @@ impl App {
             .map(|s| s.body.pos)
             .unwrap_or(self.pointer_world);
         self.grab_offset = Vec2::new(self.pointer_world.x - feet.x, self.pointer_world.y - feet.y);
-        self.drag = true;
+        // 双击不发起抓取（§3.5-j）：否则"解钉→跑开→同手被抓回→松手又钉回"，双击永远解不掉。
+        // 抽卡反馈只发 DoubleTap（另一处），所以它不解钉。
+        self.drag = !dbl;
         if let Some(sim) = self.sim.as_mut() {
             if dbl {
+                sim.send(Command::Unpin);
                 sim.send(Command::DoubleTap);
+            } else {
+                sim.send(Command::DragStart);
             }
-            sim.send(Command::DragStart);
         }
         self.set_cursor(conn);
         // 拖拽期把区域撑满整块 surface：指针滑出剪影会丢 focus，Release 就永远不来
-        if !self.region_full {
+        if self.drag && !self.region_full {
             let rects = match self.regions.as_ref() {
                 Some(r) => r.full_surface(),
                 None => vec![CellRect::new(0, 0, self.logical.0, self.logical.1)],
@@ -4886,15 +4927,37 @@ mod tests {
              是旧的\"那个半换状态的另一半（实际 {} 处）",
             code.matches("self.manifest = ").count()
         );
-        // ⚠️ needle 带 `&`：`atlas.reload(` 这个字面量在 [`Atlas::reload`] 那条**文档注释**里
-        // 也出现过（它把这条门禁的口径写在注释上），不带 `&` 会数到 2 而那是文档不是代码。
+        // ⚠️ **计数口径自多 sheet 起换了 = 是新缝进来了，不是放宽。** 单张时代那"唯一一处"
+        // `atlas.reload(&` 现在是两臂（`set.reload_segments(` 原地 + `AtlasSet::load(` 整只），
+        // 而它们仍是**同一条缝**：像素落进内存的位置在 `AtlasSet` 里只有一处（见 atlas.rs）。
+        // 原来那句杀的是"load-then-swap ⇒ 峰值两只本体而 ≤200 MiB 门禁抓不到"；今天照旧杀它，
+        // 只多认一条**合法**例外（段形不同接不住，只能整只换），代价 = 那一臂必须自己打一行
+        // "峰值两只本体"。客户端**不许**再直接对单张 `Atlas::reload` 说话 ⇒ 下面第一条是负判据。
         assert_eq!(
-            code.matches("atlas.reload(&").count(),
+            code.matches(".reload(").count(),
+            0,
+            "客户端绕过 `AtlasSet` 去解单张 = 第二个像素写入点（段序在那一层之外，实际 {} 处）",
+            code.matches(".reload(").count()
+        );
+        assert_eq!(
+            code.matches("set.reload_segments(").count(),
             1,
-            "原地重载只许有一处 ⇒ 写成 load-then-swap（先 `Atlas::load` 再换掉）峰值就是**两只\
-             本体 ≈147 MB，而它落在 ≤200 MiB 门禁内 ⇒ 什么都不会红**，只有这一条 + 验收那一次 \
-             `VmHWM` 能抓（实际 {} 处）",
-            code.matches("atlas.reload(&").count()
+            "原地逐段重载只许有一处 ⇒ 两处就会有两个\"哪一段坏了\"的答案（实际 {} 处）",
+            code.matches("set.reload_segments(").count()
+        );
+        assert_eq!(
+            code.matches("AtlasSet::load(").count(),
+            2,
+            "`AtlasSet::load` 只有两个落点：`load_asset`（起点本体）+ `swap_body` 的段形不同那臂\
+             （峰值两只本体，必须自带那行日志）。多出来的第三处 = 有人又在别处装像素（实际 {} 处）",
+            code.matches("AtlasSet::load(").count()
+        );
+        // 那一臂的**唯一**读数就是这行日志（≤200 MiB 门禁抓不到 147 MB，没有任何测例会为它红）
+        // ⇒ 计数对而句子被删 = 屏幕后面偷偷多了一只本体，而盘上看不出来。
+        let swap_arm = body("swap_body");
+        assert!(
+            swap_arm.contains("**峰值两只本体**"),
+            "段形不同那一臂必须自带「峰值两只本体」那一行 ⇒ 它是那条合法例外唯一的读数"
         );
 
         // ⑦ **九步的次序**（本轮最承重的四行了）。`reload` 是不可回头的那一条线，所以：
@@ -4903,26 +4966,32 @@ mod tests {
         //    · 删掉 `drawn_cell = None` = **本轮的变异 G**：四份产物的行表逐字节相同 ⇒
         //      `cell != drawn_cell` 那条永不开 ⇒ 545 条全绿而真机 J1 失败（屏上静默不变）。
         //      ⇒ 这一行**只有**下面这条 textual 读数，真机上唯一的读数是一张截图。
+        //    ·  needle 用 `set.reload_segments(`：它是那两臂里**排在前面**的一臂（`if` 支），所以
+        //      它的位置 = 旧 needle 的位置，"不可回头的那一条线"这条读数的含义没变。
         let swap = body("swap_body");
         let said = |needle: &str| {
             swap.find(needle)
                 .unwrap_or_else(|| panic!("`swap_body` 里没有 `{needle}` ⇒ 那九步被拆了"))
         };
         assert!(
-            said("plan_swap_body(") < said("atlas.reload(&"),
+            said("plan_swap_body(") < said("set.reload_segments("),
             "判定排在解像素之后 ⇒ 被拒的那一次已经改过图集，而日志说的是\"没换\""
         );
         assert!(
-            said("self.take_worn()") < said("atlas.reload(&"),
+            said("self.take_worn()") < said("set.reload_segments("),
             "旧帽没先卸下就去解新本体 ⇒ 峰值 = 本体 + 旧帽 + 新本体（M1 档那条 148,076 kB）"
         );
         assert!(
-            said("atlas.reload(&") < said("self.persist_body("),
+            said("set.fits(") < said("set.reload_segments("),
+            "原地那一臂没排在 `fits` 之后 ⇒ 两臂不再互斥，段形不同会被硬塞进原地换"
+        );
+        assert!(
+            said("set.reload_segments(") < said("self.persist_body("),
             "账排在像素之前 ⇒ 解码失败那一轮库里记着一只屏上没有的本体"
         );
         assert!(
-            said("atlas.reload(&") < said("self.drawn_cell = None"),
-            "`drawn_cell` 的复位没排在 `reload` 之后 ⇒ 换本体是一次屏上静默不变（变异 G 的 P5 版）"
+            said("set.reload_segments(") < said("self.drawn_cell = None"),
+            "`drawn_cell` 的复位没排在换像素之后 ⇒ 换本体是一次屏上静默不变（变异 G 的 P5 版）"
         );
         assert!(
             said("discover_accessories(") < said("let fresh = self.dress_view()"),
@@ -5959,6 +6028,13 @@ mod tests {
         path
     }
 
+    /// 把 `BODY_JSON` 那张单张清单的**文件名**换掉（其余一字不动）。
+    /// 存在的理由 = 客户端现在读的是清单里的名字：写死 `sheet.webp` 的那一版测试无论怎么改
+    /// 拼接都读得到文件 ⇒ 抓不到"清单说 A、代码去读 B"这个形状（裁决 6）。
+    fn body_manifest(sheet: &str) -> Manifest {
+        Manifest::parse(&BODY_JSON.replace("sheet.webp", sheet)).expect("改名的本体清单该合法")
+    }
+
     /// 本体区域从盘上读（`Regions::load` 只吃路径 ⇒ 没有"内存里造一份"的旁路，这正好）。
     fn body_regions(dir: &std::path::Path, skip: &[(u32, u32)]) -> Regions {
         let json = polygon_json(T_CELL, &cells_with(T_ROWS, BODY_SPANS, skip));
@@ -6299,7 +6375,11 @@ mod tests {
         let found = discover_pets(tmp.path(), &cur);
         assert_eq!(found.len(), 1, "sheet 内容不参与发现，否则这条就是假的");
         assert_eq!(found[0].id, "tiny");
-        assert_eq!(found[0].sheet(), tmp.path().join("tiny/sheet.webp"));
+        assert_eq!(
+            found[0].sheets(),
+            vec![tmp.path().join("tiny/sheet.webp")],
+            "单张清单 = 一段，且名字来自清单（旧形状是拼死 `sheet.webp`）"
+        );
         assert_eq!(
             found[0].regions.frame_count(),
             (T_ROWS * T_COLS) as usize,
@@ -6349,15 +6429,9 @@ mod tests {
     fn blit_cell_skips_the_overlay_for_a_state_the_hat_never_drew() {
         let dir = tempfile::tempdir().expect("临时目录");
         let body_bytes = sheet_bytes(T_ROWS, |_, _| [0, 0, 255, 255]);
-        let body_path = write(dir.path(), "body.webp", &body_bytes);
-        let body_atlas = Atlas::load(
-            body_path.to_str().expect("UTF-8"),
-            T_COLS,
-            T_ROWS,
-            T_CELL,
-            T_CELL,
-        )
-        .expect("本体图集");
+        write(dir.path(), "body.webp", &body_bytes);
+        let body_m = body_manifest("body.webp");
+        let body_set = AtlasSet::load(dir.path(), &body_m).expect("本体图集");
         let hat_bytes = sheet_bytes(T_ROWS, |r, c| {
             if (r, c) == (0, 0) {
                 [0, 255, 0, 128]
@@ -6382,8 +6456,8 @@ mod tests {
         let n = (T_CELL * T_CELL) as usize;
         let stride = (T_CELL * 4) as usize;
         let mut plain = vec![0u8; n * 4];
-        body_atlas
-            .blit(0, 0, &mut plain, T_CELL, T_CELL, stride)
+        body_set
+            .blit(&body_m, 0, 0, &mut plain, T_CELL, T_CELL, stride)
             .expect("本体那一格该画得出来");
         let mut covered = vec![0u8; n * 4];
         hat.atlas
@@ -6393,7 +6467,7 @@ mod tests {
         let mut idle = vec![0u8; n * 4];
         blit_cell(
             &mut idle,
-            Some(&body_atlas),
+            Some((&body_set, &body_m)),
             Some(&hat),
             (0, 0),
             AssetKey::Idle,
@@ -6405,7 +6479,7 @@ mod tests {
         let mut run = vec![0u8; n * 4];
         blit_cell(
             &mut run,
-            Some(&body_atlas),
+            Some((&body_set, &body_m)),
             Some(&hat),
             (0, 0),
             AssetKey::Run,
@@ -6436,31 +6510,160 @@ mod tests {
         }
     }
 
+    /// 把 `BODY_JSON` 改成"行表一字不动、像素拆成两张各 `each` 行"的 format 3 清单。
+    ///
+    /// 存在的理由 = 拆分彩排的判据正是"除存放之外什么都不变"（§6.1.27 裁决 1）：从这里改的
+    /// 只有 `format` 与那一行文件名的形状，`grid.rows` / `states.*.rows` / `fps` / `loop` 全照抄。
+    fn split_body_manifest(top: &str, bot: &str, each: usize) -> Manifest {
+        let json = BODY_JSON
+            .replace("\"format\":2", "\"format\":3")
+            .replace(
+                "\"sheet\":\"sheet.webp\"",
+                &format!(
+                    "\"sheets\":[{{\"file\":\"{top}\",\"rows\":{each}}},{{\"file\":\"{bot}\",\"rows\":{each}}}]"
+                ),
+            );
+        Manifest::parse(&json).expect("两段的本体清单该合法")
+    }
+
+    /// **拆分彩排的宿主读数**：同一批像素，"一张存"与"两张存"必须**逐字节**画进 buffer。
+    ///
+    /// 为什么不在库层测完就算（`overlay-common::atlas` 的 `split_manifest` 那一族已经证明
+    /// `AtlasSet::blit` 会换算段号）：库层断言管不到**客户端有没有把清单交给它**。漏一处就是
+    /// 把全局 `row` 当段内行号用，症状是宠物身上混两批像素而一错都不报。这里读的是
+    /// `blit_cell` 吐出的那份 shm 字节 = 屏上那一格的替身。与 Windows 侧
+    /// `stage::tests::a_split_body_paints_bit_identical_to_one_sheet` 同一条断言。
+    #[test]
+    fn a_split_body_blits_bit_identical_to_one_sheet() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        const EACH: u32 = 2;
+        // 每格一颗由 (row,col) 唯一决定的色 ⇒ 任何行号错位都会改掉至少一格。
+        let color = |r: u32, c: u32| {
+            [
+                40 + c as u8 * 20,
+                60 + r as u8 * 50,
+                200 - c as u8 * 12,
+                255,
+            ]
+        };
+
+        write(dir.path(), "one.webp", &sheet_bytes(T_ROWS, color));
+        let sm = body_manifest("one.webp");
+        let single = AtlasSet::load(dir.path(), &sm).expect("单张该装起来");
+
+        write(dir.path(), "top.webp", &sheet_bytes(EACH, color));
+        write(
+            dir.path(),
+            "bot.webp",
+            &sheet_bytes(EACH, |r, c| color(r + EACH, c)),
+        );
+        let split_m = split_body_manifest("top.webp", "bot.webp", EACH as usize);
+        let split = AtlasSet::load(dir.path(), &split_m).expect("两段该装起来");
+        assert_eq!(
+            split.len(),
+            2,
+            "这份清单就是两段 ⇒ 集合数不对说明装载没读 sheets"
+        );
+
+        let n = (T_CELL * T_CELL * 4) as usize;
+        let stride = (T_CELL * 4) as usize;
+        let blit = |set: &AtlasSet, m: &Manifest, row: u32, col: u32| -> Vec<u8> {
+            let mut dst = vec![0u8; n];
+            blit_cell(
+                &mut dst,
+                Some((set, m)),
+                None,
+                (row, col),
+                AssetKey::Idle,
+                T_CELL,
+                T_CELL,
+                stride,
+            )
+            .expect("blit");
+            dst
+        };
+        for row in 0..T_ROWS {
+            for col in 0..T_COLS {
+                assert_eq!(
+                    blit(&single, &sm, row, col),
+                    blit(&split, &split_m, row, col),
+                    "格 ({row},{col})：拆分前后不逐字节同 ⇒ 段号换算漂了"
+                );
+            }
+        }
+
+        // **反向对照**（这条测有没有牙）：把两段的先后写反 ⇒ 必须至少有一格不同。少了这一段，
+        // 上面那个循环在"代码根本没读 sheets、一直拿第一张"时也照样绿。
+        let crossed_m = split_body_manifest("bot.webp", "top.webp", EACH as usize);
+        let crossed = AtlasSet::load(dir.path(), &crossed_m).expect("反序也装得起来");
+        let mut differ = 0;
+        for row in 0..T_ROWS {
+            for col in 0..T_COLS {
+                if blit(&single, &sm, row, col) != blit(&crossed, &crossed_m, row, col) {
+                    differ += 1;
+                }
+            }
+        }
+        assert!(
+            differ > 0,
+            "段序写反而每一格都画得一样 ⇒ 集合根本没按清单分段取像素，上面那条是假绿"
+        );
+    }
+
+    /// 裁决 6 的配件那一半：`decode` 过去拼死 `sheet.webp`，于是清单里那个字段是死的 ——
+    /// 一份写着别的（合法裸）名字的清单要么报"文件不存在"，要么静默解出目录里**别人的**像素。
+    /// 目录里同时留一张旧名字、行数不同的件 ⇒ 两种错形状都会红，而红的都是同一个病。
+    #[test]
+    fn the_accessory_sheet_name_comes_from_its_manifest() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let json = HAT_JSON.replace("\"sheet.webp\"", "\"cap.webp\"");
+        let polygon = polygon_json(T_CELL, &cells_with(2, HAT_SPANS, &[]));
+        hat_in(dir.path(), &json, Some(&polygon), 0);
+        write(
+            dir.path(),
+            "hat/sheet.webp",
+            &sheet_bytes(1, |_, _| [1, 2, 3, 255]),
+        );
+        write(
+            dir.path(),
+            "hat/cap.webp",
+            &sheet_bytes(T_ROWS, |_, _| [4, 5, 6, 255]),
+        );
+        let body = Manifest::parse(BODY_JSON).expect("本体清单该合法");
+        let regions = body_regions(dir.path(), &[]);
+        let cand = sole(dir.path(), &body, &regions);
+        let eq = decode(&cand).expect("清单说 cap.webp ⇒ 就该解 cap.webp");
+        assert_eq!(
+            eq.atlas.rows, T_ROWS,
+            "解出来的必须是清单点名的那一张（旧代码在这里拿到 1 行的冒名件）"
+        );
+        assert_eq!(
+            eq.atlas.decoded_bytes(),
+            (T_ROWS * T_COLS * T_CELL * T_CELL * 4) as usize,
+            "行数对了还得是整张 ⇒ 钉住「读到别的文件」这一形"
+        );
+    }
+
     /// 两边的失败**分得开**：本体检不到格 vs 配件图集比清单短。错误里必须带着是哪一侧，
     /// 否则真机上"帽子没显示"和"宠物没了"是同一条日志，只能靠猜。
     #[test]
     fn blit_cell_names_the_side_that_failed() {
         let dir = tempfile::tempdir().expect("临时目录");
+        // 配件仍是单张（裁决 3：`ACCESSORY_MAX_FORMAT = 2`）⇒ 配件侧的失败形状没变。
         let short = write(
             dir.path(),
             "short.webp",
             &sheet_bytes(1, |_, _| [0, 0, 0, 0]),
         );
         let short_atlas = Atlas::load(short.to_str().expect("UTF-8"), T_COLS, 1, T_CELL, T_CELL)
-            .expect("1 行的图集");
-        let full = write(
+            .expect("1 行的配件图集");
+        write(
             dir.path(),
             "full.webp",
             &sheet_bytes(T_ROWS, |_, _| [0, 0, 0, 0]),
         );
-        let full_atlas = Atlas::load(
-            full.to_str().expect("UTF-8"),
-            T_COLS,
-            T_ROWS,
-            T_CELL,
-            T_CELL,
-        )
-        .expect("4 行的图集");
+        let full_m = body_manifest("full.webp");
+        let full_set = AtlasSet::load(dir.path(), &full_m).expect("4 行的本体图集");
         let hat = Equipped {
             manifest: AccessoryManifest::parse(HAT_JSON).expect("帽子清单该合法"),
             // 清单说 4 行而像素只有 1 行 = 不同批产物的形状（`covers(idle)` 仍为真）
@@ -6471,7 +6674,7 @@ mod tests {
 
         let Err(err) = blit_cell(
             &mut dst,
-            Some(&full_atlas),
+            Some((&full_set, &full_m)),
             Some(&hat),
             (3, 0),
             AssetKey::Idle,
@@ -6487,12 +6690,16 @@ mod tests {
         );
         assert!(err.contains("图集只有 1 行"), "要带上图集自己的说法: {err}");
 
+        // 本体侧自多 sheet 起换了失败形状："清单 4 行而像素 1 行"不可能了（`AtlasSet::load`
+        // 逐张核几何，那种清单装不起来）⇒ 能落到 `blit` 的只剩"全局行号进不了任何一张"。
+        let one_row_m = Manifest::parse(
+            r#"{"format":2,"slug":"tiny","sheet":"short.webp","grid":{"cols":8,"rows":1,"w":16,"h":16},"states":{"idle":{"rows":[0],"fps":8,"loop":true}},"anchor":{"feet":[8,15]}}"#,
+        )
+        .expect("1 行的本体清单该合法");
+        let one_row_set = AtlasSet::load(dir.path(), &one_row_m).expect("单张单行的本体图集");
         let Err(err) = blit_cell(
             &mut dst,
-            Some(
-                &Atlas::load(short.to_str().expect("UTF-8"), T_COLS, 1, T_CELL, T_CELL)
-                    .expect("再Load一次短图集"),
-            ),
+            Some((&one_row_set, &one_row_m)),
             None,
             (3, 0),
             AssetKey::Idle,
@@ -6503,5 +6710,9 @@ mod tests {
             panic!("本体检不到行 3 ⇒ 必须失败");
         };
         assert!(err.starts_with("blit"), "本体侧不该被写成配件的错: {err}");
+        assert!(
+            err.contains("落不进任何一张"),
+            "要带上行号空间的口径: {err}"
+        );
     }
 }

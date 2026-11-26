@@ -14,7 +14,8 @@ pub struct SpriteFrame {
     /// 该状态内的第几帧（0..frame_count）
     pub frame: usize,
     pub frame_count: usize,
-    /// 图集物理行列
+    /// 图集单元的全局行列。**`row` 是全局行号**：像素分段存放（`format = 3` + `sheets`）时，
+    /// 它落在哪一张由 [`Manifest::locate`] 现算，这里不带段号（DESIGN §6.1.27 裁决 1）。
     pub row: usize,
     pub col: usize,
 }

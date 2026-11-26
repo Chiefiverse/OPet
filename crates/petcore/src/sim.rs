@@ -252,6 +252,13 @@ impl<'m> Sim<'m> {
         h = mix(h, self.body.vel.y.to_bits() as u64);
         h = mix(h, self.machine.facing().index() as u64);
         h = mix(h, self.machine.rng().counter());
+        // i+j 批（路线 + 钉住）混入钉住旗标与路线链余量；j′/k 续批再混入巡线三读数
+        // （指纹代际串：ea97139205536cd8 → a852abc77565dfcb[已签收] → ed2a7a7df379e3c8[本批第四代，已签收 2026-11-26]）。
+        h = mix(h, self.machine.pinned() as u64);
+        h = mix(h, self.machine.route_remaining() as u64);
+        h = mix(h, self.machine.patrol_hops() as u64);
+        h = mix(h, self.machine.patrol_departures() as u64);
+        h = mix(h, self.body.motion as u64);
         if let Some(s) = self.last_sprite {
             h = mix(h, s.row as u64);
             h = mix(h, s.col as u64);
@@ -297,12 +304,34 @@ impl<'m> Sim<'m> {
         // 状态与物理模式不能互相矛盾
         let grounded_state = self.machine.state().is_grounded();
         let grounded_body = self.body.motion == crate::physics::Motion::Grounded;
-        if grounded_state && !grounded_body {
+        let floating_body = self.body.motion == crate::physics::Motion::Float;
+        if grounded_state && !(grounded_body || floating_body) {
             return Err(bad(format!(
                 "状态 {:?} 应是着地态，但物理是 {:?}",
                 self.machine.state(),
                 self.body.motion
             )));
+        }
+        // §3.5-k：Float 档的合法栖息地只有这四个状态（Sleep/Climb/WallSit/Fall 结构不可能）
+        if floating_body
+            && !matches!(
+                self.machine.state(),
+                State::Idle | State::Stop | State::Walk | State::Run
+            )
+        {
+            return Err(bad(format!(
+                "Float 档不该出现在状态 {:?}",
+                self.machine.state()
+            )));
+        }
+        // §3.5-j′/k：空中 Idle 要么是钉悬空，要么是巡线腿间驻留（hops>0，当格必有腿）。
+        // 下降腿在 begin_descent 同格清零 hops 并立刻进 Walk ⇒ 不可见为"Idle+hops0"。
+        if floating_body
+            && self.machine.state() == State::Idle
+            && !self.machine.pinned()
+            && self.machine.patrol_hops() == 0
+        {
+            return Err(bad("悬空 Idle 既没钉住也没巡线腿可跳 = 卡空中的前兆".into()));
         }
         if matches!(
             self.machine.state(),

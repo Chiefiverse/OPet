@@ -70,8 +70,8 @@ OPTIONS:
   --panel-bottom N      same override rule at the bottom. Measuring alone is not
                         enough here - a third-party dock often takes no work-area
                         reservation, so this inset still has to be sayable.
-  --seed N              seed for the behavioural core (default 1). Same seed replays
-                        the same frames bit for bit.
+  --seed N              seed for the behavioural core (default 24, same as the
+                        Wayland client). Same seed replays the same frames bit for bit.
   --lang CODE           UI language: zh / en / ja / ko. Not given = the chain decides:
                         [ui] lang in config.toml -> LC_ALL/LANG -> en. An unrecognised
                         code is an ERROR and exits - never a silent fall back to the
@@ -292,7 +292,7 @@ impl Args {
             monitor: self.monitor.clone(),
             panel_top: self.panel_top,
             panel_bottom: self.panel_bottom,
-            seed: self.seed.unwrap_or(1),
+            seed: self.seed.unwrap_or(24),
             lang: self.lang.clone(),
             motion: self.motion.clone(),
             allow_unowned_accessories: self.allow_unowned_accessories,
@@ -550,6 +550,25 @@ mod tests {
         );
     }
 
+    /// 与 Wayland 那份**同一个数**（`app.rs` 的 `Opts::default()` 也同值）：两家裸跑看的是
+    /// 同一齣戏。挪到 24 的理由 = 真机舞台 300 s 探针里 seed 1 只升空 1 次 / 飞 6 s，24 是
+    /// 7 次 / 首飞 3 s（读数 = DESIGN §6.1.26 ⑭）。**分佈一字未动** ⇒ 基线指纹不受影响。
+    #[test]
+    fn the_default_seed_is_the_showcase_value_and_usage_agrees() {
+        let a = parse(&v(&["--test-rect"])).unwrap();
+        assert_eq!(
+            a.options().unwrap().seed,
+            24,
+            "缺省 seed 必须与 overlay-wayland 那份同值（两家裸跑看同一齣戏）"
+        );
+        let b = parse(&v(&["--test-rect", "--seed", "1"])).unwrap();
+        assert_eq!(b.options().unwrap().seed, 1, "挪缺省不许让显式 --seed 失效");
+        assert!(
+            USAGE.contains("default 24"),
+            "USAGE 里的缺省数与实现漂移（帮助写完就没人回头看过 = `--cell` 那一族）"
+        );
+    }
+
     /// **这一条钉的是那两个旗在 Windows 上换了语义**（`Option<f32>` 而不是 `f32`）。
     ///
     /// 压成 `f32` 默认 0 会让"我要 0 留白"与"你去量工作区"变成同一个数，而后者才是常态：
@@ -658,7 +677,7 @@ mod tests {
         .options()
         .unwrap();
         assert!(two.allow_unowned_accessories);
-        assert_eq!(two.seed, 7, "下一旗被吃成值的话，种子会退回默认 1");
+        assert_eq!(two.seed, 7, "下一旗被吃成值的话，种子会退回默认 24");
     }
 
     /// 两根旗**各自独立**（Wayland 侧 `cli.rs` 同一条拍板④的 Windows 版）。
@@ -972,10 +991,12 @@ mod tests {
     #[test]
     fn the_stub_never_claims_success() {
         let o = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        let seed = o.seed;
         let err = crate::app::run(o)
             .expect_err("宿主桩必须报错（返回 Ok = 在这台机器上假装跑过一轮 Windows overlay）");
         assert!(!err.is_empty());
         // 参数要在报错里可见：否则"解析错了"与"没接线"在 stdout 上长得一样。
-        assert!(err.contains("种子=1"), "{err}");
+        // 读解析出来的值比写死缺省数稳（缺省 seed 挪过一次：1 → 24）。
+        assert!(err.contains(&format!("种子={seed}")), "{err}");
     }
 }

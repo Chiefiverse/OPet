@@ -500,12 +500,17 @@ mod tests {
         assert_eq!(item.kind, ItemKind::Pet);
 
         // **这条序列就是 §3.11.1 说的"内置与包内走同一条代码路径"**：
-        // 清单 → 解析 → 按清单里写的 sheet 名取字节 → 内核寻址。
+        // 清单 → 解析 → 按清单里写的**每一张** sheet 名取字节 → 内核寻址。
         let text = item.manifest().unwrap().read_text().unwrap();
         let m = crate::assets::Manifest::parse(&text).expect("清单要能被内核解析");
         assert_eq!(m.slug, "demo");
-        let sheet = item.member(&m.sheet).unwrap();
-        assert_eq!(sheet.read().unwrap(), b"SHEET-demo");
+        // 装载方拿的是**名字表**，不是 `m.sheet` 那个字段：分段存放时 `sheet` 是空串。
+        let names = m.sheet_files();
+        assert_eq!(names, ["sheet.webp"], "单张存放的名字表就是一张");
+        for name in &names {
+            let sheet = item.member(name).unwrap();
+            assert_eq!(sheet.read().unwrap(), b"SHEET-demo");
+        }
         assert!(item.member("polygon.json").unwrap().exists());
         assert_eq!(src.locate(ItemKind::Pet, "没有这只"), None);
         assert_eq!(
@@ -513,6 +518,83 @@ mod tests {
             None,
             "这条根只装本体"
         );
+    }
+
+    /// 分段存放的那一份走**同一条**装载序列：名字表来自清单的 `sheets`，而 `sheet` 字段是空的。
+    /// 这条存在的理由 = 裁决 6 要消灭的那种假事实源 —— 装载方若还去拼 `sheet.webp`，
+    /// 对一份 `sheets=["a.webp","b.webp"]` 的清单就会**静默读不到像素**（或读到别人的张）。
+    /// 反向对照在最后一行：越界名藏在 `sheets[]` 里时，穿越闸照样要拦（它不再只守 `sheet` 字段）。
+    #[test]
+    fn a_split_pet_reads_each_sheet_by_the_name_the_manifest_gives() {
+        let dir = scratch("dir_split");
+        let pets = dir.join("pets");
+        std::fs::create_dir_all(pets.join("split")).unwrap();
+        std::fs::write(
+            pets.join("split/pet.json"),
+            r#"{
+              "format": 3, "slug": "split", "display_name": "测试",
+              "sheets": [ { "file": "sheet_a.webp", "rows": 2 },
+                          { "file": "sheet_b.webp", "rows": 2 } ],
+              "grid": { "cols": 8, "rows": 4, "w": 192, "h": 192 },
+              "states": { "idle": {"rows": [0, 1, 2, 3], "fps": 8, "loop": true} },
+              "anchor": { "feet": [96, 180] }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(pets.join("split/sheet_a.webp"), b"SHEET-A").unwrap();
+        std::fs::write(pets.join("split/sheet_b.webp"), b"SHEET-B").unwrap();
+        std::fs::write(pets.join("split/polygon.json"), "{}").unwrap();
+
+        let src = installed_dir(&pets, ItemKind::Pet);
+        let item = src.locate(ItemKind::Pet, "split").unwrap();
+        let m = crate::assets::Manifest::parse(&item.manifest().unwrap().read_text().unwrap())
+            .expect("分段清单要能被内核解析并放行");
+        m.validate().expect("平铺 2+2 == grid.rows，该放行");
+        assert!(m.sheet.is_empty(), "分段存放不许再留第二个像素事实源");
+        assert_eq!(m.sheet_files(), ["sheet_a.webp", "sheet_b.webp"]);
+        let got = m
+            .sheet_files()
+            .iter()
+            .map(|n| String::from_utf8(item.member(n).unwrap().read().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(got, ["SHEET-A", "SHEET-B"], "两张各自的字节");
+
+        // 名字表里第三张没落盘 ⇒ 读的时候点名是哪一张，不许静默少一张
+        let err = item
+            .member("sheet_c.webp")
+            .unwrap()
+            .read()
+            .expect_err("清单写了却没落盘的那张必须报错");
+        assert!(err.message().contains("sheet_c.webp"), "{}", err.message());
+
+        // 反向对照：越界名写进 `sheets[]` 而不是 `sheet`，两道闸都要拦得住（清单那一层先红，
+        // 装载那一层不许因为它红了就跟着放行）。
+        let pets2 = dir.join("pets_evil");
+        std::fs::create_dir_all(pets2.join("evil")).unwrap();
+        std::fs::write(
+            pets2.join("evil/pet.json"),
+            r#"{
+              "format": 3, "slug": "evil", "display_name": "测试",
+              "sheets": [ { "file": "sheet_a.webp", "rows": 2 },
+                          { "file": "../../etc/shadow", "rows": 2 } ],
+              "grid": { "cols": 8, "rows": 4, "w": 192, "h": 192 },
+              "states": { "idle": {"rows": [0, 1, 2, 3], "fps": 8, "loop": true} },
+              "anchor": { "feet": [96, 180] }
+            }"#,
+        )
+        .unwrap();
+        let evil = installed_dir(&pets2, ItemKind::Pet)
+            .locate(ItemKind::Pet, "evil")
+            .unwrap();
+        let text = evil.manifest().unwrap().read_text().unwrap();
+        let err = crate::assets::Manifest::parse(&text)
+            .expect_err("`sheets[]` 里的 ../../ 不该被当成合法清单");
+        assert!(err.to_string().contains("裸文件名"), "{err}");
+        let err = evil
+            .member("../../etc/shadow")
+            .expect_err("`sheets[]` 里的 ../../ 不该拼出一个句柄");
+        let msg = err.message();
+        assert!(msg.contains("installed") && msg.contains("evil"), "{msg}");
     }
 
     /// 越界的成员名（写在清单里的 `sheet` 字段，来自别人打的包）必须出局。
@@ -667,7 +749,7 @@ mod tests {
     fn a_full_pack_round_trips_through_the_same_path_as_a_directory() {
         let dir = scratch("pack_full");
         let pack = dir.join("cat_series_01.petpack");
-        // `evil` 那份的 `sheet` 字段是越界的：包能开、项能列，**取字节那一刻**必须出局。
+        // `evil` 那份的 `sheet` 字段是越界的：包能开、项能列，**清单与取字节两处**都必须出局。
         // 这是第三方包唯一能影响我们路径的通道（清单里的成员名是不可信输入）。
         let evil = pet_json("evil").replace("\"sheet.webp\"", "\"../../etc/passwd\"");
         let bytes = write_store_zip(&[
@@ -701,7 +783,12 @@ mod tests {
         let pet = src.locate(ItemKind::Pet, "demo").unwrap();
         let m =
             crate::assets::Manifest::parse(&pet.manifest().unwrap().read_text().unwrap()).unwrap();
-        assert_eq!(pet.member(&m.sheet).unwrap().read().unwrap(), b"SHEET-PET");
+        // 逐张走**名字表**，不直接读 `m.sheet`：这条序列必须与分段那份（上面那条测）同一条代码形状，
+        // 否则"包内只认 `sheet` 字段"这种漂移在这里量不出来。
+        assert_eq!(m.sheet_files(), ["sheet.webp"], "单张存放的名字表就是一张");
+        for name in m.sheet_files() {
+            assert_eq!(pet.member(name).unwrap().read().unwrap(), b"SHEET-PET");
+        }
         let acc = src.locate(ItemKind::Accessory, "hat").unwrap();
         let a =
             crate::assets::AccessoryManifest::parse(&acc.manifest().unwrap().read_text().unwrap())
@@ -710,12 +797,16 @@ mod tests {
         a.validate_against(&m).expect("同寻址应放行");
 
         let evil_item = src.locate(ItemKind::Pet, "evil").unwrap();
-        let em =
+        // 自本批起这是**两层**闸，顺序从上到下：清单自己就拒收越界的 `sheet` 名
+        // （`Manifest::validate` 的裸文件名判据），而包成员那一层照旧独立拦一次
+        // ⇒ 名字可能不来自清单（调用方直接给 `member`），那一层不许因为上面有了就拆掉。
+        let err =
             crate::assets::Manifest::parse(&evil_item.manifest().unwrap().read_text().unwrap())
-                .expect("越界成员名不影响清单自身合法");
+                .expect_err("越界 sheet 名不该被当成合法清单");
+        assert!(err.to_string().contains("裸文件名"), "{err}");
         let err = evil_item
-            .member(&em.sheet)
-            .expect_err("清单里写 ../../ 必须出局，读不到 NEVER-READ 那份字节");
+            .member("../../etc/passwd")
+            .expect_err("就算绕过清单，包成员这一层也必须出局，读不到 NEVER-READ 那份字节");
         let msg = err.message();
         assert!(msg.contains("evil"), "要点名是哪一项: {msg}");
         assert!(

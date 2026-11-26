@@ -85,6 +85,28 @@ pub struct BehaviorConfig {
     pub stop_on_focus_lost: bool,
     /// 到达目标判定半径
     pub arrive_epsilon: f32,
+    /// 松手即钉（§3.5-j）：拖拽释放时钉在释放点；false = 旧抛出语义
+    pub pin_on_release: bool,
+    /// 一次出发的最多途经点数（§3.5-i 路线链；1 = 关掉续跳）
+    pub route_max: u8,
+    /// 路线链中途经点的停留秒数（固定常数，不吃骰子）
+    pub route_pause: f32,
+    /// 路线链每一跳的最小步距，px；不足则确定性平移
+    pub route_min_step: f32,
+    /// 左右半区偏好强度：窗口内少去的半区加权多少
+    pub route_zone_bias: f32,
+    /// 半区偏好回看的最近跳数
+    pub route_zone_window: u8,
+    /// 升空巡线份额（§3.5-k）：walk 骰子带内再分的比例；0 = 逐位旧形状
+    pub patrol_share: f32,
+    /// 巡线速度倍率：定速 = `walk_speed() × 此值`（空中滑行比地面走得快些）
+    pub patrol_speed_scale: f32,
+    /// 巡线竖直分量阻尼：方向向量的 dy 先乘此值再参与 max 归一定速
+    pub patrol_vertical_scale: f32,
+    /// 巡线高度带：距舞台顶边的留白
+    pub patrol_top_gap: f32,
+    /// 巡线高度带：距地面的留白（默认 ≈ jump_height_max ⇒ "飞得比一跳更高"才算升空）
+    pub patrol_floor_gap: f32,
 }
 
 impl Default for BehaviorConfig {
@@ -111,6 +133,17 @@ impl Default for BehaviorConfig {
             obstacle_lookahead: 24.0,
             stop_on_focus_lost: true,
             arrive_epsilon: 1.0,
+            pin_on_release: true,
+            route_max: 3,
+            route_pause: 0.9,
+            route_min_step: 80.0,
+            route_zone_bias: 0.35,
+            route_zone_window: 6,
+            patrol_share: 0.25,
+            patrol_speed_scale: 2.0,
+            patrol_vertical_scale: 0.75,
+            patrol_top_gap: 40.0,
+            patrol_floor_gap: 120.0,
         }
     }
 }

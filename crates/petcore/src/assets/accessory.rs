@@ -28,8 +28,8 @@ use crate::gacha::catalog::Slot;
 use crate::geom::Facing;
 
 use super::manifest::{
-    FACING_COLUMNS, MAX_CELL_PX, MAX_FPS, MAX_SHEET_PX, Manifest, ManifestError, SUPPORTED_FORMAT,
-    StateTrack,
+    ACCESSORY_MAX_FORMAT, FACING_COLUMNS, MAX_CELL_PX, MAX_FPS, MAX_SHEET_PX, Manifest,
+    ManifestError, StateTrack,
 };
 
 /// 一件配件的图集清单。字段顺序即 `pack.py` 将来产出的顺序。
@@ -67,9 +67,11 @@ impl AccessoryManifest {
         let who = || format!("配件 {}", self.slug);
         let bad = |msg: String| Err(ManifestError::Invalid(format!("{}: {msg}", who())));
 
-        if self.format == 0 || self.format > SUPPORTED_FORMAT {
+        // 配件装载这一侧只有"整张 sheet"一个概念 ⇒ 3 那档（分段存放）不许出现在配件清单里，
+        // 否则老读法会把它当单张装载出错误像素（本体侧的同一条规则见 Manifest::validate）。
+        if self.format == 0 || self.format > ACCESSORY_MAX_FORMAT {
             return bad(format!(
-                "format {} 超出支持范围 1..={SUPPORTED_FORMAT}",
+                "format {} 超出配件支持范围 1..={ACCESSORY_MAX_FORMAT}（分段存放归本体侧）",
                 self.format
             ));
         }
@@ -78,6 +80,13 @@ impl AccessoryManifest {
         }
         if self.sheet.is_empty() {
             return bad("sheet 为空".into());
+        }
+        // 与本体同一口径：`decode` 自本批起读清单里的名字，所以名字必须是裸文件名。
+        if !super::manifest::is_bare_name(&self.sheet) {
+            return bad(format!(
+                "sheet 文件名 \"{}\" 不是裸文件名：装载方一律 `dir.join(name)`，含分隔符或 `:` 会读到资产目录之外",
+                self.sheet
+            ));
         }
         if self.grid.cols != FACING_COLUMNS {
             return bad(format!(
@@ -128,7 +137,8 @@ impl AccessoryManifest {
 
     /// **同寻址校验** = D16 那条路线的地基。装备一件配件前必须过它。
     ///
-    /// 逐项要求：格子尺寸、列数与本体相等；配件声明的每个状态，本体也必须声明，且
+    /// 逐项要求：格子尺寸、列数与本体相等；本体必须是**单张存放**（`sheets` 为空）；
+    /// 配件声明的每个状态，本体也必须声明，且
     /// `rows`（逐位）、解析后的 `fps`、解析后的循环标志**全部相等**。
     /// 通过后 [`Self::cell`] 对任意 `(状态, 帧, 朝向)` 必然给出与 [`Manifest::cell`] 同一个坐标。
     pub fn validate_against(&self, body: &Manifest) -> Result<&AccessoryManifest, ManifestError> {
@@ -152,6 +162,15 @@ impl AccessoryManifest {
             return bad(format!(
                 "格子 {}x{} 与本体的 {}x{} 不一致 ⇒ 同一格不是同一块矩形，逐格叠加的偏移不再是 0",
                 self.grid.w, self.grid.h, body.grid.w, body.grid.h
+            ));
+        }
+        if !body.sheets.is_empty() {
+            // 本体分段存放（format 3 + sheets）时，配件这一侧还没有"按段取格"的概念 ⇒
+            // 同序号行在两边指向不同像素。宁可点名拒绝，不许静默错叠（DESIGN §6.1.27 在册限制）。
+            return bad(format!(
+                "本体清单是分段存放的（{} 张，grid.rows={}）⇒ 配件侧还没有分段装载，同序号行会取到不同像素",
+                body.sheets.len(),
+                body.grid.rows
             ));
         }
         if !self.fits.is_empty() && !self.fits.iter().any(|s| s == &body.slug) {
@@ -305,6 +324,39 @@ mod tests {
             }
         }
         assert_eq!(checked_states, 1, "这份夹具只该覆盖 idle 一档");
+    }
+
+    /// 在册限制：本体分段存放（format 3 + sheets）时，配件这一侧只会读整张 sheet 的第
+    /// `row` 行 ⇒ 同序号行在两边指向不同像素。放行就是"配件戴在错误的帧上"，
+    /// 所以必须点名拒绝，而不是画错了再让人眼抓（DESIGN §6.1.27）。
+    #[test]
+    fn refuses_a_body_whose_pixels_are_split_across_sheets() {
+        let split_body = r#"{
+          "format": 3, "slug": "cat_shiro",
+          "grid": { "cols": 8, "rows": 4, "w": 192, "h": 192 },
+          "states": { "idle": {"rows": [0, 1, 2, 3], "fps": 8, "loop": true} },
+          "anchor": {"feet": [96, 188]},
+          "sheets": [ {"file": "sheet_a.webp", "rows": 2}, {"file": "sheet_b.webp", "rows": 2} ]
+        }"#;
+        let body = Manifest::parse(split_body).expect("这份本体清单自己是合法的");
+        let e = hat()
+            .validate_against(&body)
+            .expect_err("分段本体必须挡住单张配件");
+        let msg = e.to_string();
+        assert!(msg.contains("分段"), "错误要说明是分段存放的问题: {msg}");
+        assert!(msg.contains("cap_blue"), "错误要点名是哪件配件: {msg}");
+
+        // 正面对照：把 sheets 换回单张，同一件配件必须放行 ⇒ 证明红的是 sheets 这一项
+        let single = split_body
+            .replace("\"format\": 3", "\"format\": 2")
+            .replace(
+                r#""sheets": [ {"file": "sheet_a.webp", "rows": 2}, {"file": "sheet_b.webp", "rows": 2} ]"#,
+                r#""sheet": "sheet.webp""#,
+            );
+        let body = Manifest::parse(&single).unwrap();
+        hat()
+            .validate_against(&body)
+            .expect("单张本体配单张配件必须照旧放行");
     }
 
     #[test]
@@ -517,6 +569,23 @@ mod tests {
     fn rejects_an_empty_identifier_or_sheet() {
         assert!(AccessoryManifest::parse(&HAT.replace("\"cap_blue\"", "\"\"")).is_err());
         assert!(AccessoryManifest::parse(&HAT.replace("\"sheet.webp\"", "\"\"")).is_err());
+    }
+
+    /// 本体侧那条同名门禁的配件孪生：`decode` 自本批起读清单里的 `sheet`，
+    /// 所以配件清单里的穿越名字必须在装载之前就被拒（不是靠"以前拼死名字所以安全"）。
+    #[test]
+    fn rejects_a_sheet_name_that_escapes_its_directory() {
+        for name in ["../body/sheet.webp", "/etc/passwd", "a/b.webp", "x:y"] {
+            let err =
+                AccessoryManifest::parse(&HAT.replace("\"sheet.webp\"", &format!("\"{name}\"")))
+                    .err()
+                    .unwrap_or_else(|| panic!("配件路径放行了 {name:?}"));
+            assert!(err.to_string().contains("裸文件名"), "{err}");
+        }
+        assert!(
+            AccessoryManifest::parse(&HAT.replace("\"sheet.webp\"", "\"cap-01.webp\"")).is_ok(),
+            "合法的改名不许被这条门禁顺手拒掉"
+        );
     }
 
     #[test]

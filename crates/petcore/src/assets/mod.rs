@@ -10,7 +10,7 @@ pub mod source;
 pub mod zip;
 
 pub use accessory::AccessoryManifest;
-pub use manifest::{Grid, Manifest, ManifestError, SUPPORTED_FORMAT, StateTrack};
+pub use manifest::{Grid, Manifest, ManifestError, SUPPORTED_FORMAT, SheetDesc, StateTrack};
 pub use scheduler::{Scheduler, SpriteFrame};
 pub use source::{
     AssetDir, AssetError, AssetHandle, AssetItem, AssetSource, builtin_dir, installed_dir,

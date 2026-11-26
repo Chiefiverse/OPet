@@ -14,8 +14,8 @@
 //! 把矩形近似搬到 Windows 上才会造出两个事实源：分叉的形态是屏上剪影与可点区域不一致，
 //! 而那**只有手会摸出来**。
 
-use overlay_common::atlas::{ALPHA_HIT_THRESHOLD, Atlas};
-use petcore::assets::AccessoryManifest;
+use overlay_common::atlas::{ALPHA_HIT_THRESHOLD, Atlas, AtlasSet};
+use petcore::assets::{AccessoryManifest, Manifest};
 use petcore::behavior::AssetKey;
 
 use crate::layout::Frame;
@@ -34,6 +34,10 @@ pub struct Stage {
 /// 与 Wayland 侧 `app.rs` 的 `Equipped` 同形同理由：两个字段必须同时存在才画得对，
 /// 铺成两个 `Option` 就能表示"有清单没像素"这种一画就错的组合。配件的命中并集在本平台
 /// 不需要单独维护 —— `hit` 读的就是叠完之后的那份像素（模块头"为什么 Windows 读像素"）。
+///
+/// ⚠️ 这里的 `atlas` 是**单张** [`Atlas`] 而本体是 [`AtlasSet`]，不是漏改：
+/// `ACCESSORY_MAX_FORMAT = 2`（`petcore::assets::accessory`）⇒ 配件清单不可能带 `sheets`，
+/// 分段只属于本体。等配件真要分段那天，这一格与 `Worn` 的对应物要一起翻。
 pub struct Worn {
     pub manifest: AccessoryManifest,
     pub atlas: Atlas,
@@ -75,8 +79,13 @@ impl Stage {
     ///
     /// 失败 ⇒ 缓冲区已经清零但没画上新格（"这一帧是空的"）。这是有意的：
     /// 半张宠物在屏上与"宠物缺了一块"同形，而空帧下一 tick 就被覆盖，不需要额外状态。
-    pub fn paint(&mut self, atlas: &Atlas, row: u32, col: u32) -> Result<(), String> {
-        self.paint_composited(atlas, None, (row, col), AssetKey::Idle)
+    pub fn paint(
+        &mut self,
+        body: (&AtlasSet, &Manifest),
+        row: u32,
+        col: u32,
+    ) -> Result<(), String> {
+        self.paint_composited(body, None, (row, col), AssetKey::Idle)
     }
 
     /// 本体 + 穿着中配件的合成分：**整块清零 → 本体覆盖 → 配件 source-over**。
@@ -92,13 +101,20 @@ impl Stage {
     /// 与那边的一处**形状**差异（不是数学差异）：`body` 在这里不是 `Option` —— Wayland 的
     /// `blit_cell` 要兼画 `--test-rect`（两份图集都没有），本平台的矩形档走 [`Stage::paint_solid`]，
     /// 本体缺席在这里不是可达状态。`key` 只在 `worn` 在场时被读；`worn` 为 `None` 时随便给。
+    ///
+    /// ⚠️ 本体是 `(图集集合, 清单)` 这一**对**而不是单个图集：`row` 自 §6.1.27 起是全局行号，
+    /// "它归第几张 sheet"只能由 [`Manifest::locate`] 现算，而那个换算只在
+    /// [`AtlasSet::blit`] 里发生一次。少带清单 = 客户端自己猜段号，症状是身上混两批像素且
+    /// 一错都不报。配件仍是单张（[`Worn`] 那段说明）。
+    #[allow(clippy::too_many_arguments)]
     pub fn paint_composited(
         &mut self,
-        body: &Atlas,
+        body: (&AtlasSet, &Manifest),
         worn: Option<&Worn>,
         cell: (u32, u32),
         key: AssetKey,
     ) -> Result<(), String> {
+        let (body, manifest) = body;
         self.px.fill(0);
         let (pw, ph) = self.frame.cell_phys();
         let off = self.frame.cell_offset_bytes();
@@ -107,6 +123,7 @@ impl Stage {
         // 逐项同式。放大由 `Atlas::blit` 的最近邻做掉，ULW 只搬像素（它若自己缩放 = 糊边）。
         let (row, col) = cell;
         body.blit(
+            manifest,
             row,
             col,
             &mut self.px[take..],
@@ -205,6 +222,84 @@ mod tests {
         frame.cell_to_stage(x as f32, y as f32)
     }
 
+    /// 图集列数 = 方向环那 8 列（`Manifest::validate` 硬要求 `grid.cols == 8`）。
+    ///
+    /// ⚠️ 探针像素只填前两列（`fixture::SOLID` 那些 `(row,col)` 全在 0/1 上），右边六列留全透
+    /// ⇒ 逐像素点名照旧成立，而测试里的图集形状与生产同形。旧的 `fixture::COLS` = 2 列**装不进
+    /// 合法清单**，集合那一侧因此必须按 8 列摊开 —— 不是把探针改宽好看，是清单不收 2 列。
+    const SHEET_COLS: u32 = 8;
+
+    /// 指向某张像素文件的**单张**本体清单（`name` = 文件名，`rows` = 那张自己的行数）。
+    ///
+    /// 存在的理由与 Wayland 侧 `body_manifest` 同一条：装载只认"目录 + 清单"，而名单来自清单
+    /// ⇒ 测试必须能把名字交给清单，否则"清单说 A、代码读 B"这个形状在测试里永远绿。
+    fn body_manifest(name: &str, rows: u32) -> Manifest {
+        let rows_list = (0..rows)
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Manifest::parse(&format!(
+            r#"{{"format":2,"slug":"probe","sheet":"{name}","grid":{{"cols":{SHEET_COLS},"rows":{rows},"w":{},"h":{}}},"states":{{"idle":{{"rows":[{rows_list}],"fps":8,"loop":true}}}},"anchor":{{"feet":[2,3]}}}}"#,
+            fixture::CELL,
+            fixture::CELL,
+        ))
+        .expect("探针本体清单该合法")
+    }
+
+    /// [`fixture::probe_rgba`] 摊到 [`SHEET_COLS`] 列：左边两列逐位照抄，右边补全透。
+    fn probe_wide() -> Vec<u8> {
+        let src_w = fixture::COLS * fixture::CELL;
+        let w = SHEET_COLS * fixture::CELL;
+        let h = fixture::ROWS * fixture::CELL;
+        let src = fixture::probe_rgba();
+        let mut dst = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            let s = ((y * src_w) as usize * 4)..(((y + 1) * src_w) as usize * 4);
+            let d = ((y * w) as usize * 4)..(((y * w + src_w) as usize) * 4);
+            dst[d].copy_from_slice(&src[s]);
+        }
+        dst
+    }
+
+    /// 把一批直通 RGBA 像素按 `name` 落进 `dir`，再照清单解成集合。
+    ///
+    /// `AtlasSet` 没有旁路构造器（只有"目录 + 清单"这一条真路径）⇒ 像素必须先过一遍
+    /// `encode_lossless_rgba` 与真解码，测试才量的是装载而不是造像。
+    fn set_in(dir: &std::path::Path, name: &str, rgba: &[u8], rows: u32) -> (AtlasSet, Manifest) {
+        let m = body_manifest(name, rows);
+        let webp = overlay_common::atlas::encode_lossless_rgba(
+            rgba,
+            SHEET_COLS * fixture::CELL,
+            rows * fixture::CELL,
+        )
+        .expect("encode");
+        std::fs::write(dir.join(name), webp).expect("write");
+        (AtlasSet::load(dir, &m).expect("load"), m)
+    }
+
+    /// 探针图集的 **(集合, 清单)** 形，像素 = [`probe_wide`]。
+    ///
+    /// 与 `fixture::probe_atlas()` 是**同一批像素**（[`fixture::probe_rgba`] 是共同事实源），
+    /// 所以下面那些逐像素点名的判据一字不改。
+    fn probe_set(dir: &std::path::Path) -> (AtlasSet, Manifest) {
+        set_in(dir, "probe.webp", &probe_wide(), fixture::ROWS)
+    }
+
+    /// 分段存放（format 3）的本体清单：两张各 `each` 行，文件名由调用方给。
+    fn split_manifest(top: &str, bot: &str, each: usize) -> Manifest {
+        let rows = each * 2;
+        let rows_list = (0..rows)
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Manifest::parse(&format!(
+            r#"{{"format":3,"slug":"probe","sheet":"","grid":{{"cols":{SHEET_COLS},"rows":{rows},"w":{},"h":{}}},"sheets":[{{"file":"{top}","rows":{each}}},{{"file":"{bot}","rows":{each}}}],"states":{{"idle":{{"rows":[{rows_list}],"fps":8,"loop":true}}}},"anchor":{{"feet":[2,3]}}}}"#,
+            fixture::CELL,
+            fixture::CELL,
+        ))
+        .expect("两段的本体清单该合法")
+    }
+
     // ── ① 字节序 ────────────────────────────────────────────────────────────
 
     /// 源 `(R=10, G=20, B=30, A=255)` 到 DIB 必须是 `[30, 20, 10, 255]`。
@@ -216,8 +311,9 @@ mod tests {
     fn premultiplied_bytes_land_in_bgra_order() {
         let f = probe_frame();
         let mut s = Stage::new(f);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::SOLID.0, fixture::SOLID.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::SOLID.0, fixture::SOLID.1)
             .expect("paint");
         let (x, y) = at(&f, 0, 0);
         let i = (y as usize) * f.stride() + (x as usize) * 4;
@@ -235,8 +331,9 @@ mod tests {
     fn hit_reads_alpha_and_not_a_colour_channel() {
         let f = probe_frame();
         let mut s = Stage::new(f);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::ALPHA_PROBES.0, fixture::ALPHA_PROBES.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::ALPHA_PROBES.0, fixture::ALPHA_PROBES.1)
             .expect("paint");
 
         let alpha = |p: (u32, u32)| {
@@ -296,8 +393,9 @@ mod tests {
     fn the_ported_contract_probes_still_answer_on_real_pixels() {
         let f = probe_frame();
         let mut s = Stage::new(f);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::SILHOUETTE.0, fixture::SILHOUETTE.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::SILHOUETTE.0, fixture::SILHOUETTE.1)
             .expect("paint");
 
         // ① 脚下锚点必须命中宠物
@@ -341,8 +439,9 @@ mod tests {
     fn an_empty_cell_paints_nothing_and_bleeds_nothing() {
         let f = probe_frame();
         let mut s = Stage::new(f);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::EMPTY.0, fixture::EMPTY.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::EMPTY.0, fixture::EMPTY.1)
             .expect("paint");
         assert!(
             s.bytes().iter().all(|&b| b == 0),
@@ -360,13 +459,14 @@ mod tests {
     fn paint_replaces_the_previous_frame_rather_than_compositing() {
         let f = probe_frame();
         let mut s = Stage::new(f);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::SOLID.0, fixture::SOLID.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::SOLID.0, fixture::SOLID.1)
             .expect("paint");
         let (x, y) = at(&f, 0, 0);
         assert!(s.hit(x, y), "前提：实心格该命中");
 
-        s.paint(&a, fixture::EMPTY.0, fixture::EMPTY.1)
+        s.paint((&a, &am), fixture::EMPTY.0, fixture::EMPTY.1)
             .expect("paint");
         assert!(
             !s.hit(x, y),
@@ -386,8 +486,9 @@ mod tests {
     fn out_of_range_is_a_pass_through_not_a_panic() {
         let f = probe_frame();
         let mut s = Stage::new(f);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::SILHOUETTE.0, fixture::SILHOUETTE.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::SILHOUETTE.0, fixture::SILHOUETTE.1)
             .expect("paint");
         let (w, h) = f.surface_phys();
         for (x, y) in [
@@ -412,8 +513,9 @@ mod tests {
     fn resize_follows_the_new_scale_and_clears() {
         let small = probe_frame();
         let mut s = Stage::new(small);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::SOLID.0, fixture::SOLID.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::SOLID.0, fixture::SOLID.1)
             .expect("paint");
         assert_eq!(s.bytes().len(), small.buffer_bytes());
 
@@ -449,8 +551,9 @@ mod tests {
         assert_eq!((pw, ph), (8, 8), "前提：4 px 格在 2× 下是 8 px");
         let m = f.margin_phys();
         let mut s = Stage::new(f);
-        let a = fixture::probe_atlas();
-        s.paint(&a, fixture::SOLID.0, fixture::SOLID.1)
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
+        s.paint((&a, &am), fixture::SOLID.0, fixture::SOLID.1)
             .expect("paint");
         for dy in 0..ph {
             for dx in 0..pw {
@@ -516,14 +619,15 @@ mod tests {
     /// 重画）走的都是同一对函数，`px.fill(0)` 少一次就是上一帧的字节混进这一帧。
     #[test]
     fn the_two_paint_paths_do_not_leave_each_others_bytes() {
-        let a = fixture::probe_atlas();
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
         let f = Frame::new(1.0, fixture::CELL, fixture::CELL).expect("1.0 合法");
         let (pw, ph) = f.cell_phys();
         let m = f.margin_phys();
 
         let mut s = Stage::new(f);
         s.paint_solid();
-        s.paint(&a, fixture::SOLID.0, fixture::SOLID.1)
+        s.paint((&a, &am), fixture::SOLID.0, fixture::SOLID.1)
             .expect("paint");
         for dy in 0..ph {
             for dx in 0..pw {
@@ -537,7 +641,7 @@ mod tests {
         assert_ne!(&s.bytes()[i..i + 2], &[0xFF, 0x00], "BG 还是品红");
 
         let mut t = Stage::new(f);
-        t.paint(&a, fixture::SOLID.0, fixture::SOLID.1)
+        t.paint((&a, &am), fixture::SOLID.0, fixture::SOLID.1)
             .expect("paint");
         t.paint_solid();
         for dy in 0..ph {
@@ -595,25 +699,20 @@ mod tests {
         }
     }
 
-    /// 逐格**纯色**的图集（整格 4×4 同一颗直通 RGBA）。
+    /// 逐格**纯色**的直通 RGBA 源像素（整格 4×4 同一颗）—— 单张与集合两条路共同的像素事实源。
     ///
     /// 为什么要自己造一份而不是连 `probe_atlas()` 调两次：合成判据要"本体一格、配件另一格
     /// 内容**不同**"，而同一份图集两侧只能取同一个 `(row,col)` —— 两边全同的叠加把
     /// "顺序写反"与"根本没叠"两种病都藏住（`composite_over(x, x)` 与 `x` 在 `a==0/255`
     /// 两档恰好等值，正是探针格挑出来的那两档）。
-    /// `lossless` 往返 + 预乘都在 `Atlas::load` 真路径上走，不留测试专用的后门构造。
-    fn sheet_atlas(
-        dir: &std::path::Path,
-        name: &str,
-        cell_rgba: impl Fn(u32, u32) -> [u8; 4],
-        rows: u32,
-    ) -> Atlas {
-        let w = fixture::COLS * fixture::CELL;
+    fn cell_rgba(cell: impl Fn(u32, u32) -> [u8; 4], rows: u32) -> (Vec<u8>, u32, u32) {
+        // 宽度按 8 列算（清单那一侧只收 8 列），内容仍只填探针那两列 ⇒ 右边六列全透。
+        let w = SHEET_COLS * fixture::CELL;
         let h = rows * fixture::CELL;
         let mut rgba = vec![0u8; (w * h * 4) as usize];
         for cy in 0..rows {
             for cx in 0..fixture::COLS {
-                let c = cell_rgba(cy, cx);
+                let c = cell(cy, cx);
                 for py in 0..fixture::CELL {
                     for px in 0..fixture::CELL {
                         let i = (((cy * fixture::CELL + py) * w + cx * fixture::CELL + px)
@@ -624,17 +723,40 @@ mod tests {
                 }
             }
         }
+        (rgba, w, h)
+    }
+
+    /// 纯色像素 → 单张图集（配件那一侧仍走这条：`ACCESSORY_MAX_FORMAT = 2`）。
+    fn sheet_atlas(
+        dir: &std::path::Path,
+        name: &str,
+        cell: impl Fn(u32, u32) -> [u8; 4],
+        rows: u32,
+    ) -> Atlas {
+        let (rgba, w, h) = cell_rgba(cell, rows);
         let webp = overlay_common::atlas::encode_lossless_rgba(&rgba, w, h).expect("encode");
         let path = dir.join(format!("{name}.webp"));
         std::fs::write(&path, webp).expect("write");
         Atlas::load(
             path.to_str().expect("UTF-8"),
-            fixture::COLS,
+            SHEET_COLS,
             rows,
             fixture::CELL,
             fixture::CELL,
         )
         .expect("load")
+    }
+
+    /// 纯色像素 → **本体**那一侧的集合（单段）。像素与上面的 `sheet_atlas` 同一个事实源，
+    /// 只是走 [`AtlasSet::load`]：本体取格只能经集合（全局行号 ⇒ `locate` 换算）。
+    fn sheet_set(
+        dir: &std::path::Path,
+        name: &str,
+        cell: impl Fn(u32, u32) -> [u8; 4],
+        rows: u32,
+    ) -> (AtlasSet, Manifest) {
+        let (rgba, _, _) = cell_rgba(cell, rows);
+        set_in(dir, &format!("{name}.webp"), &rgba, rows)
     }
 
     /// stage 像素缓冲里格内 `(x,y)` 的四字节（scale 1.0 ⇒ 物理 = 逻辑，点名无歧义）。
@@ -656,7 +778,7 @@ mod tests {
     fn worn_overlay_is_source_over_and_covers_gates_the_state() {
         let dir = tempfile::tempdir().expect("临时目录");
         let f = probe_frame();
-        let body = sheet_atlas(dir.path(), "body", |_, _| [0, 0, 255, 255], fixture::ROWS);
+        let (body, bm) = sheet_set(dir.path(), "body", |_, _| [0, 0, 255, 255], fixture::ROWS);
         let hat = sheet_atlas(
             dir.path(),
             "hat",
@@ -673,14 +795,14 @@ mod tests {
         let mut s = Stage::new(f);
 
         // ② + ③：`idle` 覆盖的两格
-        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Idle)
+        s.paint_composited((&body, &bm), Some(&acc), (0, 0), AssetKey::Idle)
             .expect("idle 该叠上");
         assert_eq!(
             px_at(&f, s.bytes(), 1, 1),
             [127, 128, 0, 255],
             "(0,0) 不是 source-over 的手算值 ⇒ 混合或取样错"
         );
-        s.paint_composited(&body, Some(&acc), (0, 1), AssetKey::Idle)
+        s.paint_composited((&body, &bm), Some(&acc), (0, 1), AssetKey::Idle)
             .expect("配件声明了 idle 的 rows=[0,1]，(0,1) 也该叠");
         assert_eq!(
             px_at(&f, s.bytes(), 1, 1),
@@ -689,7 +811,7 @@ mod tests {
         );
 
         // ①：同一件配件、同一个格，状态换成没声明过的 `run` ⇒ 逐字节回到纯本体
-        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Run)
+        s.paint_composited((&body, &bm), Some(&acc), (0, 0), AssetKey::Run)
             .expect("run 也该出图（只是不叠）");
         let (pw, ph) = f.cell_phys();
         for y in 0..ph {
@@ -710,18 +832,18 @@ mod tests {
     fn hit_follows_the_composite_not_just_the_body() {
         let dir = tempfile::tempdir().expect("临时目录");
         let f = probe_frame();
-        let body = sheet_atlas(dir.path(), "clear", |_, _| [0, 0, 0, 0], fixture::ROWS);
+        let (body, bm) = sheet_set(dir.path(), "clear", |_, _| [0, 0, 0, 0], fixture::ROWS);
         let hat9 = sheet_atlas(dir.path(), "hat9", |_, _| [255, 255, 255, 9], fixture::ROWS);
         let hat8 = sheet_atlas(dir.path(), "hat8", |_, _| [255, 255, 255, 8], fixture::ROWS);
         let mut s = Stage::new(f);
         let (hx, hy) = at(&f, 1, 1); // 格内 (1,1) → 窗口坐标（margin 之内）
 
-        s.paint_composited(&body, None, (0, 0), AssetKey::Idle)
+        s.paint_composited((&body, &bm), None, (0, 0), AssetKey::Idle)
             .expect("裸本体");
         assert!(!s.hit(hx, hy), "前提：全透本体该点不动");
 
         s.paint_composited(
-            &body,
+            (&body, &bm),
             Some(&worn_with(hat9, &["idle"])),
             (0, 0),
             AssetKey::Idle,
@@ -733,7 +855,7 @@ mod tests {
         );
 
         s.paint_composited(
-            &body,
+            (&body, &bm),
             Some(&worn_with(hat8, &["idle"])),
             (0, 0),
             AssetKey::Idle,
@@ -753,12 +875,12 @@ mod tests {
     fn paint_composited_names_the_side_that_failed() {
         let dir = tempfile::tempdir().expect("临时目录");
         let f = probe_frame();
-        let body = sheet_atlas(dir.path(), "full", |_, _| [0, 0, 0, 0], fixture::ROWS);
+        let (body, bm) = sheet_set(dir.path(), "full", |_, _| [0, 0, 0, 0], fixture::ROWS);
         let short = sheet_atlas(dir.path(), "short", |_, _| [0, 0, 0, 0], 1);
         let mut s = Stage::new(f);
 
         let Err(err) = s.paint_composited(
-            &body,
+            (&body, &bm),
             Some(&worn_with(short, &["idle"])),
             (1, 0),
             AssetKey::Idle,
@@ -771,7 +893,7 @@ mod tests {
         );
         assert!(err.contains("图集只有 1 行"), "要带上图集自己的说法: {err}");
 
-        let Err(err) = s.paint_composited(&body, None, (5, 0), AssetKey::Idle) else {
+        let Err(err) = s.paint_composited((&body, &bm), None, (5, 0), AssetKey::Idle) else {
             panic!("本体图集只有 2 行 ⇒ 行 5 必须失败");
         };
         assert!(err.starts_with("blit"), "本体侧不该被写成配件的错: {err}");
@@ -786,14 +908,15 @@ mod tests {
     /// 这条先红，而不是让矩形档/宠物档在屏上悄悄分叉。
     #[test]
     fn the_plain_paint_wrapper_is_exactly_a_composite_without_accessory() {
-        let a = fixture::probe_atlas();
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (a, am) = probe_set(dir.path());
         for cell in [fixture::SILHOUETTE, fixture::ALPHA_PROBES, fixture::EMPTY] {
             let mut plain = Stage::new(probe_frame());
-            plain.paint(&a, cell.0, cell.1).expect("paint");
+            plain.paint((&a, &am), cell.0, cell.1).expect("paint");
             let mut comp = Stage::new(probe_frame());
             // `key` 在无配件时**不该被读** —— 故意给一个配件永不会声明的组合也无妨，
             // 这一条同时钉住"`worn` 缺席 ⇒ 不碰清单"。
-            comp.paint_composited(&a, None, cell, AssetKey::Climb)
+            comp.paint_composited((&a, &am), None, cell, AssetKey::Climb)
                 .expect("paint_composited");
             assert_eq!(
                 plain.bytes(),
@@ -809,19 +932,19 @@ mod tests {
     fn compositing_is_replace_not_accumulate() {
         let dir = tempfile::tempdir().expect("临时目录");
         let f = probe_frame();
-        let body = sheet_atlas(dir.path(), "body2", |_, _| [0, 0, 255, 255], fixture::ROWS);
+        let (body, bm) = sheet_set(dir.path(), "body2", |_, _| [0, 0, 255, 255], fixture::ROWS);
         let acc = worn_with(
             sheet_atlas(dir.path(), "hat2", |_, _| [0, 255, 0, 128], fixture::ROWS),
             &["idle"],
         );
         let mut s = Stage::new(f);
-        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Idle)
+        s.paint_composited((&body, &bm), Some(&acc), (0, 0), AssetKey::Idle)
             .expect("first");
         let once = s.bytes().to_vec();
-        s.paint_composited(&body, Some(&acc), (0, 0), AssetKey::Idle)
+        s.paint_composited((&body, &bm), Some(&acc), (0, 0), AssetKey::Idle)
             .expect("second");
         assert_eq!(s.bytes(), once, "连叠两次不逐字节同 ⇒ 在累加不是在替换");
-        s.paint_composited(&body, None, (0, 0), AssetKey::Idle)
+        s.paint_composited((&body, &bm), None, (0, 0), AssetKey::Idle)
             .expect("脱下");
         for y in 0..f.cell_phys().1 {
             for x in 0..f.cell_phys().0 {
@@ -832,5 +955,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **拆分彩排的宿主读数**：同一批像素，"一张存"与"两张存"必须**逐字节**画出同一个窗口。
+    ///
+    /// 为什么两家客户端都要有自己的一份（数学本身钉在 `overlay-common::atlas` 的
+    /// `split_manifest` 那一族测里）：那条库层断言证明的是"`AtlasSet::blit` 会换算段号"，
+    /// 而**客户端有没有真的把清单交给它**是另一件事 —— 漏一处就是把 `row` 当段内行号用，
+    /// 症状是宠物身上混两批像素、一错都不报。这一条读的是 `Stage` 的最终字节，也就是
+    /// `UpdateLayeredWindow` 要拿走的那一份，所以它是屏上那一格的替身。
+    ///
+    /// 样本 = 每格一颗由 `(row,col)` 唯一决定的颜色 ⇒ 任何行号错位都会改掉至少一格。
+    #[test]
+    fn a_split_body_paints_bit_identical_to_one_sheet() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let f = probe_frame();
+        const ROWS: u32 = 4;
+        const EACH: usize = 2;
+        let (rgba, w, _) = cell_rgba(
+            |r, c| {
+                [
+                    40 + c as u8 * 20,
+                    60 + r as u8 * 50,
+                    200 - c as u8 * 12,
+                    255,
+                ]
+            },
+            ROWS,
+        );
+        let one = (ROWS * fixture::CELL * w * 4) as usize;
+        assert_eq!(
+            rgba.len(),
+            one,
+            "像素表按 {} 列 × {ROWS} 行算 ⇒ 尺寸错说明样本造错了",
+            SHEET_COLS
+        );
+        let half = (EACH as u32 * fixture::CELL * w * 4) as usize;
+
+        // 一张：`body_manifest` 那条 format 2 旧路径。
+        let (single, sm) = set_in(dir.path(), "one.webp", &rgba, ROWS);
+        // 两张：像素按行切，清单 = format 3 + 两段各 2 行（名字与 `split_manifest` 一致）。
+        std::fs::write(
+            dir.path().join("top.webp"),
+            overlay_common::atlas::encode_lossless_rgba(
+                &rgba[..half],
+                SHEET_COLS * fixture::CELL,
+                EACH as u32 * fixture::CELL,
+            )
+            .expect("encode top"),
+        )
+        .expect("write top");
+        std::fs::write(
+            dir.path().join("bot.webp"),
+            overlay_common::atlas::encode_lossless_rgba(
+                &rgba[half..],
+                SHEET_COLS * fixture::CELL,
+                EACH as u32 * fixture::CELL,
+            )
+            .expect("encode bot"),
+        )
+        .expect("write bot");
+        let split_m = split_manifest("top.webp", "bot.webp", EACH);
+        let split = AtlasSet::load(dir.path(), &split_m).expect("两段该装得起来");
+        assert_eq!(
+            split.len(),
+            2,
+            "这份清单就是两段 ⇒ 集合数不对说明装载没读 sheets"
+        );
+
+        let mut a = Stage::new(f);
+        let mut b = Stage::new(f);
+        for row in 0..ROWS {
+            for col in 0..SHEET_COLS {
+                a.paint((&single, &sm), row, col).expect("单张 paint");
+                b.paint((&split, &split_m), row, col).expect("拆分 paint");
+                assert_eq!(
+                    a.bytes(),
+                    b.bytes(),
+                    "格 ({row},{col})：拆分前后不逐字节同 ⇒ 段号换算漂了"
+                );
+            }
+        }
+
+        // **反向对照**（这条测有没有牙）：把两段的先后写反 ⇒ 必须至少有一格不同。
+        // 少了这一段，上面那个循环在"代码根本没读 sheets、一直拿第一张"时也会绿。
+        let crossed_m = split_manifest("bot.webp", "top.webp", EACH);
+        let crossed = AtlasSet::load(dir.path(), &crossed_m).expect("反序也装得起来");
+        let mut c = Stage::new(f);
+        let mut differ = 0;
+        for row in 0..ROWS {
+            for col in 0..SHEET_COLS {
+                c.paint((&crossed, &crossed_m), row, col)
+                    .expect("反序 paint");
+                if c.bytes() != a.bytes() {
+                    differ += 1;
+                }
+            }
+        }
+        assert!(
+            differ > 0,
+            "段序写反而每一格都画得一样 ⇒ 集合根本没按清单分段取像素，上面那条是假绿"
+        );
     }
 }

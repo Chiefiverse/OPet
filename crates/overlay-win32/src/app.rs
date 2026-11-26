@@ -132,7 +132,9 @@ impl Default for Options {
             monitor: None,
             panel_top: None,
             panel_bottom: None,
-            seed: 1,
+            // 与 Wayland 那份同值（含"为什么是 24"那条注释，见 overlay-wayland/src/app.rs）
+            // ⇒ 两平台裸跑看到的是同一齣戏。
+            seed: 24,
             lang: None,
             motion: None,
             allow_unowned_accessories: false,
@@ -202,7 +204,7 @@ mod win {
     use petcore::world::{Monitor, World, WorldEvent};
 
     use overlay_common::accounting::{Counters, Source, Tick, attribute_of, classify_tick};
-    use overlay_common::atlas::{ALPHA_HIT_THRESHOLD, Atlas};
+    use overlay_common::atlas::{ALPHA_HIT_THRESHOLD, AtlasSet};
     use overlay_common::dress::{
         DressView, PickWear, dress_exempt_for, plan_pick_wear, plan_restore, split_body_row,
     };
@@ -241,7 +243,9 @@ mod win {
     /// 双击折叠的时间窗与半径，**与 Wayland 逐字同值**（`app.rs:99-100` 的 320 ms / 24 逻辑 px）。
     ///
     /// 同值不是对齐好看：`Command::DoubleTap` 是确定性输入的一部分，而两平台必须从同一次
-    /// 真实点击里折叠出同一条 `Command` 序列。半径是**逻辑**像素（内核坐标），不是物理像素。
+    /// 真实点击里折叠出同一条 `Command` 序列 —— 自 §3.5-j 起这条序列是**双击 = `Unpin` 后
+    /// `DoubleTap`、单击按下 = `DragStart`**（见 `on_press` 的 dbl 臂），三枚指令的先后与
+    /// 归属必须两平台逐字一致。半径是**逻辑**像素（内核坐标），不是物理像素。
     const DOUBLE_TAP_GAP: Duration = Duration::from_millis(320);
     const DOUBLE_TAP_RADIUS: f32 = 24.0;
 
@@ -589,7 +593,10 @@ mod win {
         /// leak），而 `BodyCandidate::leaked` 返的也是 `&'static` ⇒ 换本体 = 换一个 `'static`，
         /// 不需要重排任何生命周期。
         manifest: &'static Manifest,
-        atlas: Option<Atlas>,
+        /// 本体的**全部像素**：N 张 sheet 的集合（DESIGN §6.1.27 裁决 1 = 行号全局连续、
+        /// 分段只是存放）。取格只经 [`AtlasSet::blit`]，段号由 [`Manifest::locate`] 现算 ⇒
+        /// 这里不可能出现"清单说 40 行而手里只有第 2 张"的半只宠物。
+        atlas: Option<AtlasSet>,
         /// 行为内核。**它借的那份清单是 `Box::leak` 出来的 `&'static Manifest`**（`load_manifest`
         /// 那里说明为什么必须 leak），M7d 起换本体走 [`Sim::swap_manifest`] ⇒ 这份 `'static`
         /// 必须同时记在 [`App::manifest`]，否则下一次重跑配件发现时无处可取。
@@ -1163,12 +1170,19 @@ mod win {
                 ),
                 Tick::Buffer => {
                     let painted = match (sprite, self.atlas.as_ref()) {
-                        (Some(((row, col), key)), Some(atlas)) => {
+                        (Some(((row, col), key)), Some(set)) => {
                             // 本体 + （若穿着）配件 → 同一块 DIB。`worn` 是 `None` 时这一句与
                             // 第一批的 `paint` **逐像素等价**（`paint_composited` 就是它加上
                             // 一次 `covers` 判断与一趟 `blit_over`，M5b 那两条测例钉着等价）。
+                            // 清单跟着集合一起给：`row` 是全局行号，段号只在 `locate` 那里换算。
+                            let manifest = self.manifest;
                             self.stage_buf
-                                .paint_composited(atlas, self.worn.as_ref(), (row, col), key)
+                                .paint_composited(
+                                    (set, manifest),
+                                    self.worn.as_ref(),
+                                    (row, col),
+                                    key,
+                                )
                                 .and_then(|()| {
                                     client.present(SurfaceKind::Pet, at, self.stage_buf.bytes())
                                 })
@@ -1338,14 +1352,16 @@ mod win {
                 .unwrap_or(self.pointer_world);
             self.grab_offset =
                 Vec2::new(self.pointer_world.x - feet.x, self.pointer_world.y - feet.y);
-            self.drag = true;
+            // 双击不发起抓取（§3.5-j，与 Wayland 同文同序）：否则"解钉→跑开→同手被抓回→
+            // 松手又钉回"，双击永远解不掉。抽卡反馈只发 DoubleTap（另一处），所以它不解钉。
+            self.drag = !dbl;
             if let Some(sim) = self.sim.as_mut() {
-                // 顺序照 Wayland：`DoubleTap` 先、`DragStart` 后。同一次点击里"被叫了一下"
-                // 与"被抓住"是两件事，而内核按到达顺序处理指令。
                 if dbl {
+                    sim.send(Command::Unpin);
                     sim.send(Command::DoubleTap);
+                } else {
+                    sim.send(Command::DragStart);
                 }
-                sim.send(Command::DragStart);
             }
         }
 
@@ -2351,12 +2367,15 @@ mod win {
         /// "判定全在写入之前"和"账排最后"。
         ///
         /// ⚠️ **顺序就是它的全部安全性**，两条最承重的：
-        /// * [`Atlas::reload`]（第 3 步）是**不可回头的那一条线**之前唯一的写点，而它自己的
-        ///   几何自检（列×行×格）排在它第一笔像素写之前 ⇒ 半换形状构造不出来。
+        /// * 像素只有一个写点：同段形走 [`AtlasSet::reload_segments`]（内部先逐张读头再解，任何一张
+        ///   对不上都在**碰像素之前**退出），不同段形走 [`AtlasSet::load`]。两条都是"几何自检排在
+        ///   第一笔像素写之前" ⇒ 半换形状构造不出来。
         /// * 第 2 步（先释放帽子）排在第 3 步之前不是顺手：反过来就瞬间有"旧本体 + 新本体 + 帽"
         ///   在场，而 ≈147 MB **仍落在 ≤200 MiB 门禁内 ⇒ 什么都不会红**。所以这条防线的读数是
-        ///   两处：验收量一次 `VmHWM`，以及源级门禁数 `atlas.reload(` 恰好 1 次 + `take_worn`
-        ///   排在它前面（`dress.rs` 的 `the_pixels_and_the_ledger_are_written_by_one_function_each`）。
+        ///   两处：验收量一次 `VmHWM`，以及源级门禁数 `set.reload_segments` = 1 / `AtlasSet::load` = 2
+        ///   （needle **不带**左括号：这条门禁数的是 `code.matches(…)`，注释与代码同张纸，写了括号
+        ///   就是把自己数进去）+ 次序（`take_worn` 排在取像素之前、`fits` 排在 `reload_segments` 之前）加"整只重解那一臂
+        ///   必须打「**峰值两只本体**」"（`dress.rs` 的 `the_pixels_and_the_ledger_are_written_by_one_function_each`）。
         ///
         /// 非目标（写在这里以免被读宽）：**不做**"换回默认本体"这一档 ⇒ `body` 行永远只有 UPSERT、
         /// 没有 DELETE（换本体是"换到某一只"，不是"脱下"；屏幕上任何时刻都有一只本体）。
@@ -2389,13 +2408,11 @@ mod win {
             }
             // 四道都过 ⇒ 这一格必然在库里。仍用 `get`：取不到就多打一行后返回，不赌一次 panic
             // （硬约束 3：宠物崩溃不能影响桌面）。
-            let Some((pet_slug, sheet)) = self.bodies.get(i).map(|b| (b.slug.clone(), b.sheet()))
+            // ⚠️ 取的是**目录**不是某张 sheet：文件名归清单（[`Manifest::sheet_segments`]），这里
+            // 拼死一个名字就是第二个事实源（旧形状 = `b.sheet()` 写回 `sheet.webp`）。
+            let Some((pet_slug, dir)) = self.bodies.get(i).map(|b| (b.slug.clone(), b.dir.clone()))
             else {
                 eprintln!("ui: 换本体 ⇒ 判定放行而 {name} 这一格取不到 ⇒ 不动（判据与库对不上）");
-                return;
-            };
-            let Some(sheet_str) = sheet.to_str().map(|s| s.to_string()) else {
-                eprintln!("ui: 换本体 ⇒ {name} 的 sheet 路径不是 UTF-8 ⇒ 本体不动");
                 return;
             };
 
@@ -2421,10 +2438,36 @@ mod win {
                 );
             }
 
-            // —— 第 3 步：解新 sheet（母本的第 4 步）。这一步之后就没有可回头的失败了。
+            // —— 第 3 步：解新本体的像素（母本的第 4 步）。这一步之后就没有可回头的失败了。
+            // 清单**先取**（[`BodyCandidate::leaked`] 只泄几 KB 元数据、一像素不碰 ⇒ 排在"可回头"这侧
+            // 安全），因为段表只能从清单读；**赋给 `self.manifest` 仍是第 4 步那唯一一处**（那条赋值
+            // 由形状门禁数着，"新清单 + 旧像素"必须只有一个落点）。
+            let m = self.bodies[i].leaked();
             match self.atlas.as_mut() {
-                Some(atlas) => {
-                    if let Err(e) = atlas.reload(&sheet_str) {
+                Some(set) => {
+                    // 两条路，按**段形是否相同**分岔（`fits` 是那条判据），与 Wayland 同形：
+                    // * 相同 ⇒ 逐段原地换 ⇒ 峰值 = 一只本体，与单张时代同一个数。
+                    // * 不同（单张 ↔ 分段、或 2+2 ↔ 1+3）⇒ 原地接不住，只能整只 `load`。⚠️ 那一刻
+                    //   内存里是**两只**本体（≈147 MB），它落在 ≤200 MiB 门禁内 ⇒ 没有任何测例会为它
+                    //   变红，所以那一行日志是它唯一的读数；在册产物切法相同，正常轮不走到这里。
+                    let swapped: Result<(), String> = if set.fits(m) {
+                        set.reload_segments(&dir, m).map_err(|e| e.to_string())
+                    } else {
+                        match AtlasSet::load(&dir, m) {
+                            Ok(fresh) => {
+                                eprintln!(
+                                    "ui: 换本体 ⇒ {name} 的 sheet 切法与当前本体不同（{} 段 → {} 段）\
+                                     ⇒ 整只重解，**峰值两只本体**",
+                                    set.len(),
+                                    fresh.len(),
+                                );
+                                *set = fresh;
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    };
+                    if let Err(e) = swapped {
                         eprintln!(
                             "ui: 换本体 ⇒ {name} 的 sheet 解不开（{e}）⇒ **本体没换**，屏上仍是 {cur}\
                              （帽子已在第 2 步释放，库里那一行还在：点「穿上」就回来，重启也会回来）",
@@ -2447,12 +2490,12 @@ mod win {
                 }
             }
 
-            // —— 第 4 步：提交元数据。清单的 `&'static` 在这里才泄（第一次用上它，见
-            // [`BodyCandidate::leaked`]）⇒ 一份进程内每只不同的宠物只泄几 KB，不是每次换都泄。
+            // —— 第 4 步：提交元数据。**唯一一处** `self.manifest` 赋值（形状门禁数它）：清单的
+            // `&'static` 在第 3 步就取好了（`leaked` 只泄元数据），像素先落、清单后落 ⇒ 中间任何
+            // 失败分支上"本体没换"那句话都是真的。
             //
             // `cell` **不动**：第 1 步的 `same_grid` 已经保证新清单的格子档与身上这一只逐字节相同
             // （不同档在 `plan_swap_body` 就被拒了），所以 `Frame` / 窗口 / buffer 一个都不必重建。
-            let m = self.bodies[i].leaked();
             self.manifest = m;
             self.body_id = name.clone();
             if let Some(sim) = self.sim.as_mut() {
@@ -3014,17 +3057,20 @@ mod win {
         Ok(Box::leak(Box::new(m)))
     }
 
-    /// 解**起点本体**那一张 sheet。`body_dir` = `plan_body_override` 判定要覆盖时那一只的
+    /// 解**起点本体**的全部像素。`body_dir` = `plan_body_override` 判定要覆盖时那一只的
     /// 目录；`None` = 用 `--manifest` 那个目录的父级（= 老行为）。
     ///
     /// ⚠️ 本平台**没有 polygon 的消费者**（命中读的是叠完之后的 canvas alpha，见 `stage.rs`），
-    /// 所以这里只取 `sheet.webp`。这不影响 [`discover_pets`] 仍按三件套要求本体 —— 两家同一本账，
+    /// 所以这里只读清单点名的那些 sheet。这不影响 [`discover_pets`] 仍按三件套要求本体 —— 两家同一本账，
     /// 差别只在"谁在什么时候读哪一份"，不在"产物必须长什么样"。
+    ///
+    /// ⚠️ 文件名**只能来自清单**（`AtlasSet::load` 读 `sheet_segments`）：这里写死一个 `sheet.webp`
+    /// 就是第二个"像素从哪来"的事实源，症状是清单改了名而屏上还在读旧那张、一错都不报（§6.1.27 裁决 6）。
     fn load_atlas(
         opts: &Options,
         manifest: &Manifest,
         body_dir: Option<&std::path::Path>,
-    ) -> Result<Option<Atlas>, String> {
+    ) -> Result<Option<AtlasSet>, String> {
         if opts.test_rect {
             return Ok(None);
         }
@@ -3038,34 +3084,35 @@ mod win {
             None => {
                 owned_dir = path
                     .parent()
-                    .ok_or_else(|| format!("{} 没有父目录 ⇒ 找不到 sheet.webp", path.display()))?
+                    .ok_or_else(|| format!("{} 没有父目录 ⇒ 找不到像素", path.display()))?
                     .to_path_buf();
                 &owned_dir
             }
         };
-        let sheet = dir.join("sheet.webp");
-        let sheet_str = sheet.to_str().ok_or("sheet 路径不是 UTF-8")?;
-        let atlas = Atlas::load(
-            sheet_str,
-            manifest.grid.cols as u32,
-            manifest.grid.rows as u32,
-            manifest.grid.w,
-            manifest.grid.h,
-        )
-        .map_err(|e| format!("{sheet_str}: {e}"))?;
+        let set = AtlasSet::load(dir, manifest).map_err(|e| format!("{}: {e}", dir.display()))?;
+        // 逐张一行：一张满 sheet 是 45 MiB 那一档，"两张里哪一张贵"必须看得见（D16 的输入）。
+        // 文案与 Wayland 的 `load_asset` 逐字同 ⇒ Wine 与真机那两份日志能用同一条 grep 读。
+        for (index, (file, sheet)) in set.segments().enumerate() {
+            eprintln!(
+                "asset: 第 {} 张 {file} {}x{} {} KB → 解码 {} ms / {:.3} MiB",
+                index + 1,
+                sheet.width,
+                sheet.height,
+                sheet.encoded_bytes / 1024,
+                sheet.decode_ms,
+                sheet.decoded_bytes() as f64 / (1024.0 * 1024.0),
+            );
+        }
         eprintln!(
-            "asset: sheet {}x{} {} KB → 解码 {} ms / {:.3} MiB（{} 列 × {} 行，格 {}x{}）",
-            atlas.width,
-            atlas.height,
-            atlas.encoded_bytes / 1024,
-            atlas.decode_ms,
-            atlas.decoded_bytes() as f64 / (1024.0 * 1024.0),
+            "asset: 合计 {} 张 · 解码 {:.3} MiB（{} 列 × {} 行，格 {}x{}）",
+            set.len(),
+            set.decoded_bytes() as f64 / (1024.0 * 1024.0),
             manifest.grid.cols,
             manifest.grid.rows,
             manifest.grid.w,
             manifest.grid.h,
         );
-        Ok(Some(atlas))
+        Ok(Some(set))
     }
 
     pub(super) fn run(options: Options) -> Result<(), String> {

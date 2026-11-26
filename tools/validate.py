@@ -16,6 +16,8 @@ import sys
 import numpy as np
 from PIL import Image
 
+import sheets as sheet_layout
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
@@ -47,19 +49,21 @@ def load_json(path):
         return json.load(fh)
 
 
-def measure_rss_mb(sheet_path):
-    """真实驻留峰值：子进程解码整张 sheet 后读 VmHWM，而不是只做 w*h*4 算术。"""
+def measure_rss_mb(sheet_paths):
+    """真实驻留峰值：子进程把这些 sheet 全解码后读 VmHWM，而不是只做 w*h*4 算术。
+
+    分段存放时**必须一次解码全部**，否则量到的是一段的钱。
+    """
     code = (
         "import resource, sys\n"
         "from PIL import Image\n"
-        "im = Image.open(sys.argv[1]).convert('RGBA')\n"
-        "px = im.tobytes()\n"
-        "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)\n"
+        "keep = [Image.open(p).convert('RGBA').tobytes() for p in sys.argv[1:]]\n"
+        "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, len(keep))\n"
     )
-    out = subprocess.run([sys.executable, "-c", code, sheet_path], capture_output=True, text=True)
+    out = subprocess.run([sys.executable, "-c", code] + list(sheet_paths), capture_output=True, text=True)
     if out.returncode != 0:
         return None, out.stderr.strip()
-    return int(out.stdout.strip()) / 1024.0, None
+    return int(out.stdout.split()[0]) / 1024.0, None
 
 
 def main():
@@ -72,23 +76,72 @@ def main():
 
     d = args.dir or os.path.join(REPO, "assets", "pets", args.pet or "cat_shiro")
     manifest = load_json(os.path.join(d, "pet.json"))
-    sheet_path = os.path.join(d, manifest["sheet"])
-    if not os.path.exists(sheet_path):
-        sys.exit("缺少图集: %s" % sheet_path)
     frames_dir = os.path.join(d, "frames")
 
     grid = manifest["grid"]
     w, h, cols, rows = grid["w"], grid["h"], grid["cols"], grid["rows"]
     rep = Report()
 
+    # 分段存放（format 3 + `sheets`）与单张走同一条路：段表为空时就是"一张，从 0 数到 rows"。
+    bad_layout = sheet_layout.check(manifest)
+    segs = sheet_layout.segments(manifest)
+    paths = [os.path.join(d, f) for f, _, _ in segs]
+    missing_sheets = [p for p in paths if not os.path.exists(p)]
+    rep.add(
+        "分段描述",
+        " / ".join("%s=%d行" % (f, n) for f, _, n in segs),
+        "平铺 grid.rows=%d 且文件都在" % rows,
+        not bad_layout and not missing_sheets,
+        "; ".join(bad_layout + ["缺少图集: " + p for p in missing_sheets]),
+    )
+    if bad_layout or missing_sheets:
+        sys.exit(
+            "图集分段读不出来，后面的像素项无从判起: %s"
+            % "; ".join(bad_layout + ["缺少图集: " + p for p in missing_sheets])
+        )
+
     rep.add("grid.cols == 8", cols, "必须 8", cols == FACING_COLUMNS, "内核 FACING_COLUMNS 硬校验")
 
-    sheet = np.asarray(Image.open(sheet_path).convert("RGBA"))
+    arrays = [np.asarray(Image.open(p).convert("RGBA")) for p in paths]
+
+    def cell_block(row, col):
+        """全局行号 → 那一格的 alpha。唯一取格口，与内核的 `locate` 同一条换算。"""
+        hit = sheet_layout.locate(manifest, row)
+        if hit is None:
+            raise KeyError("全局行 %s 没有归属" % row)
+        idx, _, local = hit
+        arr = arrays[idx]
+        return arr[local * h : (local + 1) * h, col * w : (col + 1) * w, 3]
+
+    orphans = [
+        (name, r)
+        for name, track in manifest["states"].items()
+        for r in track["rows"]
+        if sheet_layout.locate(manifest, r) is None
+    ]
     rep.add(
-        "图集尺寸",
-        "%dx%d" % (sheet.shape[1], sheet.shape[0]),
-        "%dx%d" % (cols * w, rows * h),
-        sheet.shape[1] == cols * w and sheet.shape[0] == rows * h,
+        "行号都有段可归",
+        "%d 个越界" % len(orphans),
+        "0 个",
+        not orphans,
+        str(orphans[:3]),
+    )
+    if orphans:
+        sys.exit("有状态引用的行落在所有段之外: %s" % str(orphans[:6]))
+
+    size_rows = []
+    size_ok = True
+    for (f, _, n), arr in zip(segs, arrays):
+        want = (cols * w, n * h)
+        got = (arr.shape[1], arr.shape[0])
+        size_ok = size_ok and got == want
+        size_rows.append("%s %dx%d(应 %dx%d)" % (f, got[0], got[1], want[0], want[1]))
+    rep.add(
+        "图集尺寸（逐文件）",
+        " / ".join(size_rows),
+        "每张 = cols*w × 该段行数*h",
+        size_ok,
+        "%d 张分段存放" % len(segs) if len(segs) > 1 else "单张",
     )
 
     # 逐格：源帧存在性 + 尺寸 + 覆盖率
@@ -104,7 +157,7 @@ def main():
                 img = Image.open(src)
                 if img.size != (w, h):
                     bad_size.append("%s=%s" % (src, img.size))
-                block = sheet[row * h : (row + 1) * h, col * w : (col + 1) * w, 3]
+                block = cell_block(row, col)
                 pct = 100.0 * float((block > ALPHA_THRESHOLD).mean())
                 coverage[(row, col)] = pct
                 if pct < COVERAGE_MIN_PCT:
@@ -211,7 +264,7 @@ def main():
         grid = {}
         for row in manifest["states"]["idle"]["rows"]:
             for col in range(cols):
-                block = sheet[row * h : (row + 1) * h, col * w : (col * w) + w, 3] > ALPHA_THRESHOLD
+                block = cell_block(row, col) > ALPHA_THRESHOLD
                 ys = np.nonzero(block.any(axis=1))[0]
                 grid[(row, col)] = int(ys.max()) if ys.size else -1
         by_col = {}
@@ -252,19 +305,29 @@ def main():
     else:
         rep.add("polygon.json 存在", "缺失", "必须存在", False)
 
-    # 体积与内存
-    webp_bytes = os.path.getsize(sheet_path)
+    # 体积与内存。4 MiB 那道闸的归属 = **逐文件**（分段存放时并集没有意义：装载方是一张一张
+    # 读进来的，而 §3.5 那条预算说的就是"一个文件不许把内存吃穿"）。
+    sizes = [(f, os.path.getsize(p)) for (f, _, _), p in zip(segs, paths)]
+    worst = max(n for _, n in sizes)
+    total_bytes = sum(n for _, n in sizes)
     rep.add(
-        "sheet.webp 体积",
-        "%.1f KB" % (webp_bytes / 1024),
-        "<= %.1f MB" % (SHEET_BYTES_LIMIT / 1048576),
-        webp_bytes <= SHEET_BYTES_LIMIT,
-        "§3.5 单只宠物门禁",
+        "图集体积（逐文件）",
+        " / ".join("%s=%.1f KB" % (f, n / 1024) for f, n in sizes),
+        "每张 <= %.1f MB" % (SHEET_BYTES_LIMIT / 1048576),
+        worst <= SHEET_BYTES_LIMIT,
+        "§3.5 门禁按文件判；%d 张合计 %.1f KB" % (len(sizes), total_bytes / 1024),
     )
     decoded_mb = cols * w * rows * h * 4 / 1048576
     full_mb = cols * w * FULL_GRID_ROWS * h * 4 / 1048576
-    rss_mb, err = measure_rss_mb(sheet_path)
-    rep.add("本轮图集解码后（算术）", "%.3f MB" % decoded_mb, "—", True, "本轮 %d 行 → 全量 %d 行外推 %.2f MiB" % (rows, FULL_GRID_ROWS, full_mb))
+    rss_mb, err = measure_rss_mb(paths)
+    rep.add(
+        "解码总字节（算术）",
+        "%.3f MB" % decoded_mb,
+        "—",
+        True,
+        "全部 %d 张常驻 = %dx%d × %d 行 × 4 B；本轮 %d 行 → 全量 %d 行外推 %.2f MiB"
+        % (len(segs), cols * w, h, rows, rows, FULL_GRID_ROWS, full_mb),
+    )
     if rss_mb is None:
         rep.add("解码驻留 RSS 实测", "测不了: %s" % err, "<= %.0f MB 的 %4.0f%%" % (RSS_BUDGET_MB, 100 * full_mb / RSS_BUDGET_MB), False)
     else:

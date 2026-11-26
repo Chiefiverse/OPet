@@ -28,6 +28,10 @@ pub enum Motion {
     Airborne,
     /// 被指针拖着走：位置由外部输入决定，不积分
     Dragged,
+    /// 无重力飘行（§3.5-k）：y 由行为层速度决定、夹进 `[ceiling, ground]`，
+    /// **不产任何 StepOutcome** —— 落地/搭台的迁移由行为层用 `settle_on` 收口，
+    /// 物理层若打 `landed` 会发出一条迁移表里不存在的 `Walk→Land`。
+    Float,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,6 +82,15 @@ impl Body {
 
     pub fn airborne(&self) -> bool {
         self.motion == Motion::Airborne
+    }
+
+    pub fn floating(&self) -> bool {
+        self.motion == Motion::Float
+    }
+
+    /// 冻结在墙上（爬升中被行为层停住）：`on_stage_change` 判"挂墙钉"用。
+    pub fn climb_frozen(&self) -> bool {
+        self.motion == Motion::Climbing && self.vel.y == 0.0
     }
 
     /// 起跳：`v0 = √(2gh)`，向上为负。
@@ -155,6 +168,13 @@ impl Body {
         self.vel.x = speed;
     }
 
+    /// 竖直速度只在 Float 档生效（与 `set_climb_speed` 同族写法：写入点自守档）。
+    pub fn set_vertical_speed(&mut self, v: f32) {
+        if self.motion == Motion::Float {
+            self.vel.y = v;
+        }
+    }
+
     pub fn stop_horizontal(&mut self) {
         self.vel.x = 0.0;
     }
@@ -168,6 +188,7 @@ impl Body {
             Motion::Grounded => self.settle_on_support(world, &mut out),
             Motion::Climbing => self.integrate_climb(dt, world, &mut out),
             Motion::Airborne => self.integrate_airborne(dt, world, &mut out),
+            Motion::Float => self.integrate_float(dt, world),
         }
 
         out
@@ -213,6 +234,29 @@ impl Body {
                 out.slipped_off = true;
                 self.motion = Motion::Airborne;
                 self.support = None;
+                self.vel.y = 0.0;
+            }
+        }
+    }
+
+    /// 无重力飘行（§3.5-k）：y 单调走向目标，两端夹住并归零对应分量。
+    /// **不查 `world.landing()`、不产任何 outcome** —— 巡线穿平台顶边是登记在册的限制，
+    /// 收口（`settle_on` → Grounded）由行为层在到达时做。
+    fn integrate_float(&mut self, dt: f32, world: &World) {
+        if self.vel.y == 0.0 {
+            return;
+        }
+        self.pos.y += self.vel.y * dt;
+        let ceiling = world.ceiling_y();
+        let ground = world.ground_y();
+        if self.pos.y <= ceiling {
+            self.pos.y = ceiling;
+            if self.vel.y < 0.0 {
+                self.vel.y = 0.0;
+            }
+        } else if self.pos.y >= ground {
+            self.pos.y = ground;
+            if self.vel.y > 0.0 {
                 self.vel.y = 0.0;
             }
         }
@@ -282,9 +326,49 @@ impl Body {
         }
     }
 
+    /// 钉住落位（§3.5-j）：把"坐在某支撑面上"做成唯一的写入点方法，
+    /// 与 `drag_to`/`perch`/`snap_to_stage` 同族——不变量立在写入点。
+    pub fn settle_on(&mut self, support: Support, y: f32) {
+        self.motion = Motion::Grounded;
+        self.support = Some(support);
+        self.pos.y = y;
+        self.vel = Vec2::ZERO;
+    }
+
+    /// 悬空钉（§3.5-j′，E1b）：Float + 零速 + 位置夹进舞台，与 `settle_on` 同族
+    /// —— "停在半空"这件事只有这一个写入点。
+    pub fn hold_in_air(&mut self, world: &World) {
+        self.motion = Motion::Float;
+        self.support = None;
+        self.vel = Vec2::ZERO;
+        self.pos.x = world.clamp_x(self.pos.x, self.half_width);
+        self.pos.y = self.pos.y.clamp(world.ceiling_y(), world.ground_y());
+    }
+
+    /// 起飞进 Float（§3.5-k）。**故意不清 `vel.y`**：dy=0 的指令目标不许真的离地
+    /// （见 machine 侧 `apply_motion_speeds` 的 `|dy|>0` 门槛），而万一带着残留竖直速度
+    /// 起飞，`settle_on_support` 对 vel≠0 的无支撑体是救不回来的。
+    pub fn begin_float(&mut self) {
+        self.motion = Motion::Float;
+        self.support = None;
+    }
+
+    /// 放生悬空钉（E5）：交还重力。`release_climb` 对 Float 是 no-op，故必须独立写入点。
+    pub fn release_hold(&mut self) {
+        if self.motion == Motion::Float {
+            self.motion = Motion::Airborne;
+            self.vel.y = 0.0;
+        }
+    }
+
     /// 舞台几何变化后强制重新落位（Phase B 第 5 步：拔屏/改分辨率）。
     pub fn snap_to_stage(&mut self, world: &World) {
         self.pos.x = world.clamp_x(self.pos.x, self.half_width);
+        // 悬空钉/巡线换屏：保高度、只夹 x/y —— "钉跟着显示器走"（§3.5-j 拍板③的空中支）
+        if self.motion == Motion::Float {
+            self.pos.y = self.pos.y.clamp(world.ceiling_y(), world.ground_y());
+            return;
+        }
         if self.motion != Motion::Grounded {
             return;
         }
@@ -542,5 +626,89 @@ mod tests {
         assert_eq!(b.pos.y, 600.0);
         assert_eq!(b.support, Some(Support::Ground));
         assert_eq!(b.pos.x, 900.0);
+    }
+
+    /// §3.5-j′ E1b：悬空钉必须**逐位不动**，且永远不产出 landed。
+    #[test]
+    fn a_hold_does_not_fall() {
+        let w = world();
+        let mut b = Body::new(Vec2::new(500.0, 300.0), 16.0);
+        b.hold_in_air(&w);
+        assert_eq!(b.motion, Motion::Float);
+        assert_eq!(b.support, None);
+        let pinned_at = b.pos;
+        let mut outcomes = 0;
+        for _ in 0..600 {
+            let o = b.step(DT, &w);
+            outcomes += usize::from(o.landed.is_some() || o.perched.is_some() || o.slipped_off);
+        }
+        assert_eq!(outcomes, 0, "Float 档不许产任何迁移素材");
+        assert_eq!(b.pos, pinned_at, "悬空钉 10 秒逐位不动");
+        assert_eq!(b.vel, Vec2::ZERO);
+    }
+
+    #[test]
+    fn float_follows_a_2d_target_and_clamps_at_both_ends() {
+        let w = world();
+        let mut b = Body::new(Vec2::new(500.0, 300.0), 16.0);
+        b.begin_float();
+        b.vel = Vec2::new(-60.0, -120.0); // 向左上
+        for _ in 0..600 {
+            b.step(DT, &w);
+        }
+        assert!(b.pos.x < 500.0, "x 应随速度走");
+        assert_eq!(b.pos.y, w.ceiling_y(), "越顶必须夹住");
+        assert_eq!(b.vel.y, 0.0);
+        b.vel = Vec2::new(0.0, 240.0); // 直落
+        for _ in 0..600 {
+            let o = b.step(DT, &w);
+            assert!(
+                o.landed.is_none(),
+                "落到地面也不许打 landed（表外边 Walk→Land）"
+            );
+        }
+        assert_eq!(b.pos.y, w.ground_y());
+        assert_eq!(b.vel.y, 0.0);
+        assert_eq!(b.motion, Motion::Float, "收口是行为层的事，物理留在 Float");
+    }
+
+    #[test]
+    fn release_hold_hands_the_body_to_gravity() {
+        let w = world();
+        let mut b = Body::new(Vec2::new(500.0, 300.0), 16.0);
+        b.hold_in_air(&w);
+        b.release_hold();
+        assert_eq!(b.motion, Motion::Airborne);
+        assert_eq!(b.vel.y, 0.0);
+        b.step(DT, &w);
+        assert!(b.pos.y > 300.0, "放生后必须开始下坠");
+        // release_hold 对其他档是 no-op（地面钉不许被误抛空）
+        b.motion = Motion::Grounded;
+        b.release_hold();
+        assert_eq!(b.motion, Motion::Grounded);
+    }
+
+    #[test]
+    fn snap_to_stage_keeps_a_hover_pin_inside_the_new_stage() {
+        let w = world();
+        let mut b = Body::new(Vec2::new(900.0, 300.0), 16.0);
+        b.hold_in_air(&w);
+        assert_eq!(b.pos, Vec2::new(900.0, 300.0));
+        // 换成更矮更窄的舞台：x 夹进新墙、y 夹进新地面、档与速度不动
+        let narrow = World::single("m", 400.0, 200.0, 1.0);
+        b.snap_to_stage(&narrow);
+        assert_eq!(b.pos.x, narrow.right_wall() - b.half_width);
+        assert_eq!(
+            b.pos.y,
+            narrow.ground_y(),
+            "新地面更高 ⇒ 夹上去，不许沉到屏外"
+        );
+        assert_eq!(b.motion, Motion::Float);
+        // 高度仍在新舞台带内时：保高度（"钉跟着显示器走"的空中支）
+        let tall = World::single("m", 1000.0, 600.0, 1.0);
+        b.hold_in_air(&tall);
+        let at = b.pos;
+        b.snap_to_stage(&tall);
+        assert_eq!(b.pos, at);
     }
 }

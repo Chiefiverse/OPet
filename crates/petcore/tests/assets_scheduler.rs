@@ -158,3 +158,85 @@ fn sleep_commits_exactly_one_frame_then_freezes() {
         );
     }
 }
+
+/// **批1 的地基判据**：把像素拆成两张存放（`format = 3` + `sheets`），行表 `states.*.rows`
+/// 与 `grid.rows` 逐字不动 ⇒ 内核每 tick 交出来的格子必须**与单张时代完全相同**
+/// （含"这格没变所以不提交"的 `None`）。这条等式成立，才允许说"行号空间与像素存放解耦"。
+///
+/// 反向对照 = 把每档行表整体右移一行 ⇒ 序列必须不同。没有这一句，上面的等式可能
+/// 只是"两边都算了同一个错数"（本轮已抓到过两次假绿，见 DESIGN §6.1.27）。
+#[test]
+fn a_split_sheet_yields_the_same_sprite_stream() {
+    use petcore::assets::DEFAULT_MANIFEST_JSON;
+    use petcore::sim::Sim;
+    use petcore::world::World;
+    use std::collections::BTreeSet;
+
+    /// 十只本体的行表都是"一格一行、首尾相接"，40 行拆 20+20 是拆分彩排的最小形状。
+    fn split(json: &str, half: usize) -> String {
+        json.replace("\"format\": 2", "\"format\": 3").replace(
+            "\"sheet\": \"sheet.webp\",",
+            &format!(
+                "\"sheets\": [ {{ \"file\": \"sheet_0.webp\", \"rows\": {half} }}, \
+                 {{ \"file\": \"sheet_1.webp\", \"rows\": {half} }} ],"
+            ),
+        )
+    }
+
+    fn stream(m: &Manifest, ticks: u64) -> Vec<Option<petcore::assets::SpriteFrame>> {
+        let mut sim = Sim::new(
+            World::single("m", 1920.0, 1080.0, 1.0),
+            m,
+            24,
+            petcore::behavior::BehaviorConfig::default(),
+        );
+        (0..ticks).map(|_| sim.step().1.sprite).collect()
+    }
+
+    let ticks = 6_000;
+    let single = Manifest::parse(DEFAULT_MANIFEST_JSON).unwrap();
+    let split = Manifest::parse(&split(DEFAULT_MANIFEST_JSON, 20)).unwrap();
+
+    // 拆分确实改了归属，没改行号
+    assert_eq!(single.locate(25), Some((0, 25)));
+    assert_eq!(split.locate(25), Some((1, 5)));
+    for key in AssetKey::ALL {
+        assert_eq!(
+            single.track(key).map(|t| t.rows.clone()),
+            split.track(key).map(|t| t.rows.clone()),
+            "{key:?} 的行表被拆分改动了"
+        );
+    }
+
+    let base = stream(&single, ticks);
+    let got = stream(&split, ticks);
+    assert_eq!(
+        base, got,
+        "分段存放改变了内核交出来的格子 ⇒ 行号空间没有被真正解耦"
+    );
+
+    // 覆盖面：样本必须真的走过第二段的行，否则上面那条等式是空的
+    let rows: BTreeSet<usize> = base.iter().flatten().map(|f| f.row).collect();
+    assert!(
+        rows.iter().any(|&r| r < 20) && rows.iter().any(|&r| r >= 20),
+        "{ticks} tick 只走到这些行 {rows:?} ⇒ 样本没跨进第二段，这条对照不作数"
+    );
+    assert!(
+        base.iter().flatten().count() > 100 && base.iter().any(|f| f.is_none()),
+        "样本里既要有提交的格子，也要有『没变所以不提交』的 tick，否则等式退化成比空表"
+    );
+
+    // 反向对照：行表整体右移一行（仍然合法，因为平铺没动）
+    let mut shifted = split.clone();
+    for track in shifted.states.values_mut() {
+        for row in &mut track.rows {
+            *row = (*row + 1) % shifted.grid.rows;
+        }
+    }
+    shifted.validate().expect("右移后的行表本身仍应合法");
+    let moved = stream(&shifted, ticks);
+    assert_ne!(
+        base, moved,
+        "行表动了，格子序列却一模一样 ⇒ 这条等式测的是别的东西，不是寻址"
+    );
+}

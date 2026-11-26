@@ -173,6 +173,44 @@ pub fn cfg_always_jump() -> BehaviorConfig {
     }
 }
 
+/// 旧的"松手抛出"语义（pin_on_release=false 对照组）：保住表行
+/// `(Dragged, Fall, PointerUp)` 的**非钉**样本。
+pub fn cfg_throwing() -> BehaviorConfig {
+    BehaviorConfig {
+        pin_on_release: false,
+        ..cfg_quiet()
+    }
+}
+
+/// 骰子必中 walk，路线链开关显式给（§3.5-i 的 gate 测例用）。
+/// 关爬墙与睡眠：撞墙走 `到墙即停` 支，出发的骰子账才干净可数。
+/// `patrol_share = 0`：j′/k 批起本测例族仍以**地面形状**为对照，巡线另有专夹具。
+pub fn cfg_routes(max: u8, bias: f32, pause: f32) -> BehaviorConfig {
+    BehaviorConfig {
+        route_max: max,
+        route_zone_bias: bias,
+        route_pause: pause,
+        patrol_share: 0.0,
+        enabled: EnabledActions {
+            climb: false,
+            sleep: false,
+            ..EnabledActions::all()
+        },
+        ..cfg_always_walk()
+    }
+}
+
+/// 骰子必中 walk 且**每次出发都升空巡线**（§3.5-k 专用）：patrol_share=1.0 ⇒
+/// walk 带内全部转巡线（几何允许时）；关爬墙与睡眠，出发的骰子账可数。
+pub fn cfg_patrol(max: u8, pause: f32) -> BehaviorConfig {
+    BehaviorConfig {
+        route_max: max,
+        route_pause: pause,
+        patrol_share: 1.0,
+        ..cfg_routes(max, 0.35, pause)
+    }
+}
+
 /// 允许爬墙的配置。
 pub fn cfg_climbing(speed: f32, stamina: f32) -> BehaviorConfig {
     BehaviorConfig {

@@ -4,8 +4,8 @@ mod common;
 
 use common::*;
 use petcore::behavior::{Action, Command, State, Trigger};
-use petcore::geom::Vec2;
-use petcore::world::Support;
+use petcore::geom::{Rect, Vec2};
+use petcore::world::{Support, WorldEvent};
 use std::collections::HashSet;
 
 /// 从 Spawn 走到 Idle。
@@ -116,7 +116,11 @@ fn jump_chain() -> HashSet<EdgeKey> {
     h.assert_edge(State::Idle, State::Jump, Trigger::Command);
     h.assert_edge(State::Jump, State::Land, Trigger::TouchedDown);
     h.assert_edge(State::Land, State::Idle, Trigger::SquashDone);
-    assert_eq!(h.sim.body.support, Some(Support::Ground));
+    assert!(
+        h.sim.body.support.is_some(),
+        "跳完该有支撑，实际 {:?}",
+        h.sim.body.support
+    );
     h.fired
 }
 
@@ -209,9 +213,10 @@ fn restless_sitter() -> HashSet<EdgeKey> {
     h.fired
 }
 
-/// 抓起、抛出、落地。
+/// 抓起、抛出、落地。⚠️ 必须走 `cfg_throwing()`：默认 `pin_on_release=true` 之后，
+/// 这条场景保留的是**旧抛出语义**的 `(Dragged, Fall, PointerUp)` 非钉样本。
 fn drag_and_throw() -> HashSet<EdgeKey> {
-    let mut h = Harness::new(cfg_quiet(), 81, stage(1000.0, 600.0));
+    let mut h = Harness::new(cfg_throwing(), 81, stage(1000.0, 600.0));
     h.goto_state(State::Idle, 300);
     h.send(Command::DragStart);
     h.run(2);
@@ -225,6 +230,278 @@ fn drag_and_throw() -> HashSet<EdgeKey> {
     h.run_until_state(State::Idle, 6000);
     h.assert_edge(State::Dragged, State::Fall, Trigger::PointerUp);
     h.assert_edge(State::Fall, State::Land, Trigger::TouchedDown);
+    assert!(!h.sim.machine.pinned(), "抛出语义不许留下钉住旗");
+    h.fired
+}
+
+/// E1 松手即钉（§3.5-j）：脚落在支撑面上 ⇒ Dragged→Idle 钉坐；
+/// 钉坐稳态 = 零骰子（rng counter 在 1200 tick 里不许走）。
+fn pin_ground_release() -> HashSet<EdgeKey> {
+    let mut h = Harness::new(cfg_quiet(), 82, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    h.send(Command::DragStart);
+    h.run(2);
+    let g = h.sim.world.ground_y();
+    let x = h.sim.body.pos.x + 150.0;
+    h.send(Command::DragMove {
+        to: Vec2::new(x, g - 0.2),
+    });
+    h.run(1);
+    h.send(Command::DragEnd);
+    h.run(1);
+    h.assert_edge(State::Dragged, State::Idle, Trigger::PointerUp);
+    assert!(h.sim.machine.pinned(), "支撑面松手必须钉住");
+    assert_eq!(h.sim.body.pos.y, g, "settle_on 应把脚吸附到地面线");
+    assert_eq!(h.sim.body.motion, petcore::physics::Motion::Grounded);
+    let c0 = h.sim.machine.rng().counter();
+    h.run(1200);
+    assert_eq!(
+        h.sim.machine.rng().counter(),
+        c0,
+        "钉坐稳态的 RNG 消耗必须是 0（骰子、interval、入睡倒计时都不许走）"
+    );
+    assert_eq!(
+        h.state(),
+        State::Idle,
+        "钉坐不许自己醒来、也不许被拖走后自动入睡"
+    );
+    h.fired
+}
+
+/// E2 + E3：贴墙半空松手 ⇒ 挂墙钉；爬速与体力全冻结；Unpin ⇒ 脱墙坠落。
+/// 体力 3s ≪ 观察窗 20s：若"冻结"没生效，`StaminaDepleted` 早把宠物摔下来了（反假绿对照）。
+fn pin_wall_release_and_unpin() -> HashSet<EdgeKey> {
+    let mut h = Harness::new(cfg_climbing(200.0, 3.0), 83, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    h.send(Command::DragStart);
+    h.run(2);
+    let x = h.sim.world.right_wall();
+    h.send(Command::DragMove {
+        to: Vec2::new(x, 300.0),
+    });
+    h.run(4);
+    h.send(Command::DragEnd);
+    h.run(1);
+    h.assert_edge(State::Dragged, State::Climb, Trigger::PointerUp);
+    assert!(h.sim.machine.pinned(), "贴墙半空松手必须挂墙钉");
+    assert_eq!(h.sim.body.pos.y, 300.0);
+    let y = h.sim.body.pos.y;
+    h.run(20 * 60);
+    assert_eq!(
+        h.state(),
+        State::Climb,
+        "20s 后还该挂在墙上（体力冻结、不滑不落）"
+    );
+    assert_eq!(h.sim.body.pos.y, y, "挂墙钉不许动");
+    h.send(Command::Unpin);
+    h.run(1);
+    h.assert_edge(State::Climb, State::Fall, Trigger::Command);
+    assert!(!h.sim.machine.pinned());
+    h.run_until_state(State::Idle, 6000);
+    h.assert_edge(State::Fall, State::Land, Trigger::TouchedDown);
+    h.fired
+}
+
+/// E4 挂墙钉 + 舞台变宽 ⇒ 墙根移走，宠物脱墙坠落、**解钉重活**（悬空钉不走这行，
+/// Float 随舞台浮动；2026-11-26 翻向，旧语义"落地改钉坐"随悬空钉批作废）。
+/// ⚠️ 本场景最易自欺：钉在**旧右墙** x=936，再把舞台从 1000 扩到 1200 ⇒ 新墙根 1136，
+/// 旧墙根成了舞台内部。中间那组断言就是"这确实是个会发生的场景"的手工验。
+/// 尾段在新墙**重钉**一次：(Dragged,Climb,PointerUp) 的样本只有这一处，删了会红覆盖门禁。
+fn pin_wall_stage_detach() -> HashSet<EdgeKey> {
+    let mut h = Harness::new(cfg_climbing(200.0, 600.0), 84, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    h.send(Command::DragStart);
+    h.run(2);
+    let x = h.sim.world.right_wall();
+    h.send(Command::DragMove {
+        to: Vec2::new(x, 300.0),
+    });
+    h.run(4);
+    h.send(Command::DragEnd);
+    h.run(1);
+    h.assert_edge(State::Dragged, State::Climb, Trigger::PointerUp);
+    assert!(h.sim.machine.pinned());
+
+    h.world_event(WorldEvent::MonitorGeometry {
+        monitor: "m".into(),
+        rect: Rect::new(0.0, 0.0, 1200.0, 600.0),
+        scale: 1.0,
+        panel_bottom: 0.0,
+    });
+    // 手工验"场景是真的"：resize 后旧墙根必须已经**不贴**新墙，否则 E4 是永不触发的假场景
+    let lo = h.sim.world.left_wall() + h.sim.body.half_width;
+    let hi = h.sim.world.right_wall() - h.sim.body.half_width;
+    assert!(
+        h.sim.body.pos.x > lo + 1.0 && h.sim.body.pos.x < hi - 1.0,
+        "resize 后宠物应位于新舞台内部，实际 x={} ∈ [{lo},{hi}]",
+        h.sim.body.pos.x
+    );
+    h.run(1);
+    h.assert_edge(State::Climb, State::Fall, Trigger::SupportGone);
+    h.run_until_state(State::Idle, 6000);
+    assert!(
+        !h.sim.machine.pinned(),
+        "E4 翻向：墙根没了 = 挂着的东西消失，钉该解开让它重新生活"
+    );
+    assert_eq!(
+        h.sim.body.pos.y,
+        h.sim.world.ground_y(),
+        "坠落该落地，不许悬空"
+    );
+
+    // 重钉段：舞台扩到 1200 后，把宠物拖到**新右墙**再松手 ⇒ (Dragged,Climb,PointerUp) 再现
+    h.send(Command::DragStart);
+    h.run(2);
+    h.send(Command::DragMove {
+        to: Vec2::new(h.sim.world.right_wall(), 300.0),
+    });
+    h.run(4);
+    h.send(Command::DragEnd);
+    h.run(1);
+    h.assert_edge(State::Dragged, State::Climb, Trigger::PointerUp);
+    assert!(
+        h.sim.machine.pinned(),
+        "新墙重钉必须仍然成立 = 拖到墙上松手挂墙，和舞台改没改过无关"
+    );
+    h.fired
+}
+
+/// E1b 悬空钉 + E5 双击放生（§3.5-j′）：半空松手钉住 ⇒ Idle+Float 逐格纹丝不动、
+/// 稳态零骰子；`Unpin` 才交还重力 ⇒ (Idle,Fall,Command) → (Fall,Land,TouchedDown) → 落地。
+/// ⚠️ 悬空段必须**逐 tick** 比位置：只比末尾会把"慢慢漏下去"读成通过。
+fn pin_hover_release_and_drop() -> HashSet<EdgeKey> {
+    let mut h = Harness::new(cfg_quiet(), 87, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    h.send(Command::DragStart);
+    h.run(2);
+    h.send(Command::DragMove {
+        to: Vec2::new(h.sim.body.pos.x + 150.0, 320.0),
+    });
+    h.run(1);
+    h.send(Command::DragEnd);
+    h.run(1);
+    h.assert_edge(State::Dragged, State::Idle, Trigger::PointerUp);
+    assert!(h.sim.machine.pinned());
+    assert!(h.sim.body.floating(), "半空松手该悬空，不该已落地");
+    assert!(
+        h.sim.body.pos.y < h.sim.world.ground_y() - 1.0,
+        "悬空高度要真实存在"
+    );
+    let hover = h.sim.body.pos;
+    let c0 = h.sim.machine.rng().counter();
+    for _ in 0..1200 {
+        h.tick();
+        assert_eq!(h.sim.body.pos, hover, "悬空钉每 tick 都该纹丝不动");
+        assert_eq!(h.state(), State::Idle, "悬空钉期间不许离开 Idle");
+    }
+    assert_eq!(
+        h.sim.machine.rng().counter(),
+        c0,
+        "悬空钉稳态不该吃任何骰子"
+    );
+
+    h.send(Command::Unpin);
+    h.run(1);
+    h.assert_edge(State::Idle, State::Fall, Trigger::Command);
+    assert!(!h.sim.body.floating(), "放生后该交还重力");
+    h.run_until_state(State::Idle, 6000);
+    h.assert_edge(State::Fall, State::Land, Trigger::TouchedDown);
+    assert_eq!(
+        h.sim.body.pos.y,
+        h.sim.world.ground_y(),
+        "双击放生最终必须落回地面"
+    );
+    h.fired
+}
+
+/// 全屏升空巡线（§3.5-k）：patrol_share=1.0 ⇒ 每次出发都试图升空。
+/// 断言形状 = 活性而不是运气：**升到过空**（min y 明显高于地面）、**落得回地**
+/// （终点 grounded、hops 归零）、单段悬空有界（不许有一次飞行接近一小时）。
+fn patrol_full_screen() -> HashSet<EdgeKey> {
+    let mut h = Harness::new(cfg_patrol(3, 0.9), 88, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    let ground = h.sim.world.ground_y();
+    let mut min_y = f32::MAX;
+    let mut max_float_run = 0u32;
+    let mut float_run = 0u32;
+    let mut departures = 0;
+    let mut prev_departures = 0;
+    let mut ever_walk_2d = false;
+    for _ in 0..60 * 60 * 20 {
+        h.tick();
+        if h.sim.body.floating() {
+            float_run += 1;
+            max_float_run = max_float_run.max(float_run);
+            if matches!(h.state(), State::Walk | State::Run) {
+                ever_walk_2d = true;
+            }
+            min_y = min_y.min(h.sim.body.pos.y);
+        } else {
+            float_run = 0;
+        }
+        let d = h.sim.machine.patrol_departures();
+        if d != prev_departures {
+            departures = d;
+            prev_departures = d;
+        }
+    }
+    assert!(
+        departures > 0,
+        "patrol_share=1.0 却一次都没升空 = 开关没接线"
+    );
+    assert!(
+        min_y < ground - 200.0,
+        "20 分钟里最高只到 y={min_y}（地面 {ground}）⇒ 没有真正升空"
+    );
+    assert!(ever_walk_2d, "空中腿必须以 Walk/Run 姿态行进（裁决①=侧滑）");
+    assert!(
+        max_float_run < 3600,
+        "最长一段连续悬空 {max_float_run} tick（= {} s）⇒ 疑似卡空中",
+        max_float_run as f64 / 60.0
+    );
+    // 收尾不要求"正好在地上"（停表时刻可以合法地在飞行腿中间），只要求**回得来**：
+    // 从任意悬空中断点起，一模拟分钟内必须落回地面态且飞行预算归零。
+    let mut back = 0;
+    while h.sim.body.floating() && back < 3600 {
+        h.tick();
+        back += 1;
+    }
+    assert!(!h.sim.body.floating(), "悬空中断点后 60 s 内没落回地面");
+    assert_eq!(
+        h.sim.machine.patrol_hops(),
+        0,
+        "落地后不该留未归零的飞行预算"
+    );
+    assert!(
+        h.sim.body.grounded_at(),
+        "巡线终点必须回到地面态，实际 {:?}",
+        h.sim.body.support
+    );
+    h.fired
+}
+
+/// 几何定升不升：矮舞台（带宽 < 2×eps 或被 floor_gap 压没）⇒ **永不 Float**、
+/// `patrol_departures == 0`，但行走照旧发生（= 退化舞台是"退回旧形状"，不是死机）。
+fn patrol_blocked_by_geometry() -> HashSet<EdgeKey> {
+    let mut h = Harness::new(cfg_patrol(3, 0.9), 89, stage(1000.0, 100.0));
+    h.goto_state(State::Idle, 300);
+    let mut walked = 0;
+    let mut prev = h.state();
+    for _ in 0..60 * 60 * 10 {
+        h.tick();
+        assert!(!h.sim.body.floating(), "矮舞台不许升空");
+        let st = h.state();
+        if prev == State::Idle && st == State::Walk {
+            walked += 1;
+        }
+        prev = st;
+    }
+    assert!(walked > 0, "窄矮舞台仍应正常地面漫游，实测 0 次出发");
+    assert_eq!(
+        h.sim.machine.patrol_departures(),
+        0,
+        "air_band 退化成 None 时不该计数巡线出发"
+    );
     h.fired
 }
 
@@ -289,6 +566,12 @@ fn all_scenarios() -> HashSet<EdgeKey> {
         climb_runs_out_of_stamina(),
         restless_sitter(),
         drag_and_throw(),
+        pin_ground_release(),
+        pin_wall_release_and_unpin(),
+        pin_wall_stage_detach(),
+        pin_hover_release_and_drop(),
+        patrol_full_screen(),
+        patrol_blocked_by_geometry(),
         double_tap(),
         sleeping(),
     ] {
@@ -325,4 +608,164 @@ fn off_table_check_catches_extras() {
 #[should_panic(expected = "没被走过")]
 fn coverage_check_catches_missing_rows() {
     assert_all_table_rows_covered(&HashSet::new());
+}
+
+/// 抽卡反馈的双击（只发 `DoubleTap`，D14 那条复用）**不解钉、不跑开**：
+/// 钉住的宠物原地扭一下。放生走客户端 dbl 臂那两条 `Unpin → DoubleTap`。
+#[test]
+fn gacha_double_tap_never_unpins() {
+    let mut h = Harness::new(cfg_quiet(), 85, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    let g = h.sim.world.ground_y();
+    h.send(Command::DragStart);
+    h.run(2);
+    h.send(Command::DragMove {
+        to: Vec2::new(h.sim.body.pos.x + 150.0, g - 0.2),
+    });
+    h.run(1);
+    h.send(Command::DragEnd);
+    h.run(1);
+    assert!(h.sim.machine.pinned());
+    let c0 = h.sim.machine.rng().counter();
+    h.send(Command::DoubleTap);
+    h.run(2);
+    assert!(h.sim.machine.pinned(), "抽卡 DoubleTap 不许顺手解钉");
+    assert_eq!(h.state(), State::Idle, "钉住的宠物被 react 不许跑开");
+    assert_eq!(h.sim.machine.rng().counter(), c0, "钉住时纯 react 不掷骰子");
+
+    // 放生形状（客户端 dbl 臂 = Unpin 先、DoubleTap 后，同一 tick 消费）⇒ 解钉 + 跑开
+    h.send(Command::Unpin);
+    h.send(Command::DoubleTap);
+    h.run(1);
+    assert!(!h.sim.machine.pinned(), "Unpin 必须先解钉");
+    h.assert_edge(State::Idle, State::Run, Trigger::DoubleTap);
+
+    // 悬空钉（E1b）同判：只发 DoubleTap ⇒ 钉、位置、高度、骰子全不动（不顺手放生）。
+    // ⚠️ 这里杀的是"悬空钉其实会掉、只是没人看见"那类假绿：y 与 motion 逐格断言，不比末尾。
+    let mut w = Harness::new(cfg_quiet(), 86, stage(1000.0, 600.0));
+    w.goto_state(State::Idle, 300);
+    w.send(Command::DragStart);
+    w.run(2);
+    w.send(Command::DragMove {
+        to: Vec2::new(w.sim.body.pos.x + 150.0, 320.0),
+    });
+    w.run(1);
+    w.send(Command::DragEnd);
+    w.run(1);
+    assert!(w.sim.machine.pinned(), "半空松手应钉住");
+    assert!(w.sim.body.floating(), "半空钉应是 Float，不是已落地");
+    let hover = w.sim.body.pos;
+    let c1 = w.sim.machine.rng().counter();
+    for _ in 0..600 {
+        w.tick();
+        assert_eq!(
+            w.sim.body.pos, hover,
+            "悬空钉被 DoubleTap 之前不许有一格漂移"
+        );
+    }
+    w.send(Command::DoubleTap);
+    w.run(2);
+    assert!(w.sim.machine.pinned(), "抽卡 DoubleTap 不许顺手解悬空钉");
+    assert!(w.sim.body.floating(), "抽卡 DoubleTap 不许把悬空钉打落");
+    assert_eq!(w.sim.body.pos, hover, "react 不该挪位置");
+    assert_eq!(w.state(), State::Idle, "悬空钉 react 后仍应停着");
+    assert_eq!(
+        w.sim.machine.rng().counter(),
+        c1,
+        "悬空钉纯 react 不掷骰子（同地面钉的口径）"
+    );
+}
+
+/// 路线链（§3.5-i）：一次出发、多跳途经点；**续跳只吃 2 枚骰子**（选半区 + 采样），
+/// 不再掷出发骰/interval —— 这是"续跳复用 ActionDice/TargetFar 表键但不走 roll_action"的证据。
+#[test]
+fn route_multi_hop_single_departure() {
+    // 400 窄舞台（默认清单半宽 64 ⇒ 可达区间 272px < run_distance ⇒ 全程 Walk）；pause 0 ⇒ 到点即走
+    let mut h = Harness::new(cfg_routes(6, 0.0, 0.0), 301, stage(400.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    // 出发骰里的链长是 rng 决定的：固定 seed 下循环定位，不是碰运气
+    let mut hops = 0;
+    for _ in 0..64 {
+        h.goto_state(State::Walk, 6000);
+        hops = h.sim.machine.route_remaining();
+        if hops > 0 {
+            break;
+        }
+        h.goto_state(State::Idle, 6000);
+    }
+    assert!(hops > 0, "64 次出发没有起过一条路线链");
+    h.goto_state(State::Idle, 12000);
+    let c0 = h.sim.machine.rng().counter();
+    h.goto_state(State::Walk, 12000);
+    let d = h.sim.machine.rng().counter() - c0;
+    assert_eq!(
+        d, 2,
+        "路线续跳应只吃 2 枚骰子（chance+uniform），实测 {d} ⇒ 混进了出发骰/interval"
+    );
+    assert_eq!(h.sim.machine.route_remaining(), hops - 1);
+}
+
+/// 半区偏好绊线（非概率证明，固定 seed 的回归栅栏）：5 模拟分钟里两个半区都要有
+/// 出发，且偏多一边不许超过 75%；bias=0 的对照同样不许窝在一边。
+#[test]
+fn route_zone_balance() {
+    for bias in [0.35_f32, 0.0] {
+        let mut h = Harness::new(cfg_routes(9, bias, 0.0), 302, stage(1000.0, 600.0));
+        h.goto_state(State::Idle, 3000);
+        let mid = (h.sim.world.left_wall() + h.sim.world.right_wall()) * 0.5;
+        let mut left = 0usize;
+        let mut right = 0usize;
+        let mut prev = h.state();
+        for _ in 0..5 * 60 * 60 {
+            h.tick();
+            let st = h.state();
+            if prev == State::Idle && matches!(st, State::Walk | State::Run) {
+                // enter(Walk/Run) 不清 target，出发当刻的落点可读
+                if let Some(t) = h.sim.machine.target() {
+                    if (t.x - mid).abs() > 0.5 {
+                        if t.x < mid {
+                            left += 1;
+                        } else {
+                            right += 1;
+                        }
+                    }
+                }
+            }
+            prev = st;
+        }
+        let total = left + right;
+        assert!(total >= 20, "bias={bias}: 5 模拟分钟出发次数不足: {total}");
+        let share = left.max(right) as f64 / total as f64;
+        assert!(
+            share <= 0.75,
+            "bias={bias}: 半区分布失衡 L={left} R={right}（偏好机制失效或装反）"
+        );
+    }
+}
+
+/// `route_max ≤ 1` 必须逐位保住旧单跳形状：与"完全关链"（route_max=0）同 seed 对照，
+/// 每 tick 骰子消耗 / 位置 / 状态全同。`Rng::range(0,0)` 空区间不吃子是这条等价的另一半依据。
+#[test]
+fn route_max_1_matches_old_shape() {
+    let mut a = Harness::new(cfg_routes(0, 0.35, 0.9), 303, stage(1000.0, 600.0));
+    let mut b = Harness::new(cfg_routes(1, 0.35, 0.9), 303, stage(1000.0, 600.0));
+    for t in 0..5 * 60 * 60 {
+        a.tick();
+        b.tick();
+        assert_eq!(
+            a.sim.machine.rng().counter(),
+            b.sim.machine.rng().counter(),
+            "tick {t}: route_max=1 比关链多吃了子"
+        );
+        assert_eq!(a.sim.body.pos, b.sim.body.pos, "tick {t}: 轨迹分叉");
+        assert_eq!(a.state(), b.state(), "tick {t}: 状态分叉");
+        assert_eq!(a.sim.machine.route_remaining(), 0);
+        assert_eq!(b.sim.machine.route_remaining(), 0, "第 {t} tick 起了续跳");
+    }
+    assert!(
+        a.fired
+            .iter()
+            .any(|(f, t, _)| *f == State::Idle && *t == State::Walk),
+        "对照组从未走过路 = 这条测例是空的"
+    );
 }

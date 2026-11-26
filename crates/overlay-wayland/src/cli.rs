@@ -15,7 +15,7 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
   --panel-bottom N   底边面板高度（逻辑像素，默认 0；决定地面往上抬多少）
   --panel-top N      顶边栏高度（逻辑像素，默认 0）。layer-shell 的 margin 从可用区量起，
                      顶部有栏时不给这个值 ⇒ 宠物整体下移一个栏高、脚掉到屏幕外
-  --seed N           内核随机种子（默认 1）
+  --seed N           内核随机种子（默认 24）
   --db PATH          抽取落库的 sqlite 存档（绝对路径）。**不给就是内存库**：菜单与结果卡
                      一律打 DRYRUN 标、不产生任何文件 —— 与 `opet pull` 的默认存档红线同族，
                      别让一条随手起的 overlay 写脏用户真存档
@@ -174,7 +174,7 @@ impl Args {
             monitor: self.monitor.clone(),
             panel_bottom: pb,
             panel_top: pt,
-            seed: self.seed.unwrap_or(1),
+            seed: self.seed.unwrap_or(24),
             db: self.db.clone(),
             test_rect: self.test_rect,
             no_cursor: self.no_cursor,
@@ -318,6 +318,23 @@ mod tests {
         // 不给 seconds ⇒ 默认 3 秒（live 会话上绝不能无限赖着）
         let b = parse(&v(&["--test-rect"])).unwrap();
         assert_eq!(b.options().unwrap().seconds, Some(3.0));
+    }
+
+    /// 缺省内核种子 = **24**，且帮助行写的数必须与实现同值（两平台各钉一遍 ⇒ `--seed` 缺省
+    /// 漂移会红）。为什么不是 1：真机舞台几何下 300 s 探针里 seed 1 只升空 1 次、飞 6 s，
+    /// 24 是 7 次、首飞 3 s ⇒ 裸跑就得看得见"偶尔升空"。**只挪演示起点，不动分佈**
+    /// （`BehaviorConfig` 一字未改 ⇒ 基线指纹 `ed2a7a7df379e3c8` 不受影响）。
+    #[test]
+    fn the_default_seed_is_the_showcase_value_and_usage_agrees() {
+        let a = parse(&v(&["--test-rect"])).unwrap();
+        assert_eq!(
+            a.options().unwrap().seed,
+            24,
+            "缺省 seed 必须与 overlay-win32 那份同值（两家裸跑看同一齣戏）"
+        );
+        let b = parse(&v(&["--test-rect", "--seed", "1"])).unwrap();
+        assert_eq!(b.options().unwrap().seed, 1, "挪缺省不许让显式 --seed 失效");
+        assert!(USAGE.contains("默认 24"), "USAGE 里的缺省数与实现漂移");
     }
 
     #[test]

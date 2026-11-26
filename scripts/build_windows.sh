@@ -176,7 +176,7 @@ if [ "$QUICK" = 0 ]; then
   }
   if grep -q '^warning' "$CLOG"; then
     grep '^warning' "$CLOG" | head -5
-    fail "宿主 clippy 有警告 ⇒ 零警告口径破了（完整日志 = $CLOG。⚠️ 判据是 `^warning` 的行数，**不是** cargo 末行那句 `Finished`：重新检查时警告不落屏，Finished 照样打）"
+    fail "宿主 clippy 有警告 ⇒ 零警告口径破了（完整日志 = $CLOG。⚠️ 判据是 '^warning' 的行数，**不是** cargo 末行那句 'Finished'：重新检查时警告不落屏，Finished 照样打）"
   fi
   echo "   ✅ 宿主 clippy 0 warning（原文 = $CLOG）"
 else

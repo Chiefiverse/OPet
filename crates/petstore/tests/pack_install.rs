@@ -466,6 +466,118 @@ fn verify_reports_which_item_is_unloadable_without_touching_disk() {
     assert!(store.owned().unwrap().is_empty());
 }
 
+/// 同一只本体的**分段存放**版（`format = 3` + 两张，行号仍全局连续 = DESIGN §6.1.27 裁决 1）。
+/// 这里不写 `"sheet"`：写了就是两个像素事实源，而 `manifest.rs` 的 validate 会拒。
+const SPLIT_PET_JSON: &str = r#"{"format":3,"slug":"pack_demo_cat",
+"sheets":[{"file":"sheet_a.webp","rows":1},{"file":"sheet_b.webp","rows":1}],
+"grid":{"cols":8,"rows":2,"w":96,"h":96},"states":{"idle":{"rows":[0,1],"fps":5.0}},
+"anchor":{"feet":[48.0,90.0]}}"#;
+
+/// `verify` 与 `install` 都必须按**清单声明的那一串名字**逐张查，而不是拼死 `sheet.webp`。
+/// 这条是"多 sheet 生效"的包侧防线：只查第一张 = 装完必然"清单加载成功而装备失败"。
+#[test]
+fn a_split_body_is_checked_and_installed_sheet_by_sheet() {
+    let h = Harness::new();
+    let manifest = toml("split_01", "pets", &["pack_demo_cat"], "free", None);
+    // 正面对照：两张都在 ⇒ check 全绿、两张都落盘、归属清单各一行。
+    let good = h.zip(
+        "good_split.petpack",
+        &[
+            (pack::MANIFEST_MEMBER, manifest.as_bytes()),
+            ("pets/pack_demo_cat/pet.json", SPLIT_PET_JSON.as_bytes()),
+            ("pets/pack_demo_cat/sheet_a.webp", SHEET),
+            ("pets/pack_demo_cat/sheet_b.webp", SHEET),
+        ],
+    );
+    let pack = pack::Pack::open(&good, MAX_PACK_MB).unwrap();
+    let check = pack.check(&empty_catalog());
+    assert_eq!(check.bad_items(), 0, "{:?}", check.items[0].problems);
+
+    let mut store = Store::in_memory().unwrap();
+    let out = pack::install(
+        &pack,
+        &h.env,
+        &mut store,
+        &empty_catalog(),
+        &InstallOpts::default(),
+    )
+    .unwrap();
+    assert_eq!(out.files, 3, "清单 + 两张像素都要落盘");
+    assert_eq!(
+        std::fs::read_to_string(h.pets.join(pack::OWNER_DIR).join("split_01")).unwrap(),
+        "pack_demo_cat/pet.json\npack_demo_cat/sheet_a.webp\npack_demo_cat/sheet_b.webp\n"
+    );
+
+    // 反向对照：第二张没进包 ⇒ 必须**点名是第 1 张、叫什么**，不许只报"这一件坏了"。
+    let partial = h.zip(
+        "half_split.petpack",
+        &[
+            (pack::MANIFEST_MEMBER, manifest.as_bytes()),
+            ("pets/pack_demo_cat/pet.json", SPLIT_PET_JSON.as_bytes()),
+            ("pets/pack_demo_cat/sheet_a.webp", SHEET),
+        ],
+    );
+    let pack2 = pack::Pack::open(&partial, MAX_PACK_MB).unwrap();
+    let check2 = pack2.check(&empty_catalog());
+    assert_eq!(check2.bad_items(), 1);
+    let problems = &check2.items[0].problems;
+    assert_eq!(problems.len(), 1, "第一张在 ⇒ 只报缺的那一张: {problems:?}");
+    assert!(
+        problems[0].contains("第 1 张") && problems[0].contains("sheet_b.webp"),
+        "要点名段序与成员名: {problems:?}"
+    );
+
+    // 越界名写进 `sheets[]` 而不是 `sheet` ⇒ 装载路径那一族仍拦得住（源侧那条同名测的双生）。
+    // 今天走的是 `Ok` 那一支：`open` 只看 zip 索引，越界名只是清单里的一个字符串 ⇒
+    // 它在"逐张查成员在不在"（check）与"门禁一整包拒绝"（install）这两处出局。
+    // 上面那支留给以后"open 也验清单名"的加强 ⇒ 那时要红得有声，不许变成静默放行。
+    // ⚠️ 这一支用**另一个 harness**：共用上面那次成功安装的根，"没留下半个包"就永远读不空。
+    let h2 = Harness::new();
+    let evil = SPLIT_PET_JSON.replace("sheet_b.webp", "../../etc/shadow");
+    let evil_path = h2.zip(
+        "evil_split.petpack",
+        &[
+            (pack::MANIFEST_MEMBER, manifest.as_bytes()),
+            ("pets/pack_demo_cat/pet.json", evil.as_bytes()),
+            ("pets/pack_demo_cat/sheet_a.webp", SHEET),
+        ],
+    );
+    let pack3 = pack::Pack::open(&evil_path, MAX_PACK_MB);
+    match pack3 {
+        Err(e) => assert!(e.contains("shadow") || e.contains("越界"), "{e}"),
+        Ok(p) => {
+            let c = p.check(&empty_catalog());
+            assert_eq!(
+                c.bad_items(),
+                1,
+                "越界段名必须被点名，不许放行: {:?}",
+                c.items
+            );
+            assert!(
+                c.items[0].problems[0].contains("../../etc/shadow"),
+                "{:?}",
+                c.items[0].problems
+            );
+            let mut store = Store::in_memory().unwrap();
+            let err = pack::install(
+                &p,
+                &h2.env,
+                &mut store,
+                &empty_catalog(),
+                &InstallOpts::default(),
+            )
+            .unwrap_err();
+            assert!(err.contains("shadow") || err.contains("越界"), "{err}");
+            assert_eq!(
+                h2.top(&h2.pets),
+                Vec::<String>::new(),
+                "越界段名不许留下半个包"
+            );
+            assert!(store.owned().unwrap().is_empty());
+        }
+    }
+}
+
 #[test]
 fn a_manifest_that_does_not_parse_is_named_not_swallowed() {
     let h = Harness::new();

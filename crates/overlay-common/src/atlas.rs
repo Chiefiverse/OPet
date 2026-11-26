@@ -24,6 +24,7 @@ use std::io::Read;
 use std::time::Instant;
 
 use image_webp::{ColorType, WebPDecoder, WebPEncoder};
+use petcore::assets::Manifest;
 
 #[derive(Debug)]
 pub enum AtlasError {
@@ -40,6 +41,16 @@ pub enum AtlasError {
         col: u32,
         detail: String,
     },
+    /// **分段存放里某一张自己读不来**（`AtlasSet::load` 专用）。
+    ///
+    /// 这一档存在的理由不是好看：三段装载时，"第 2 张尺寸不符"与"图集尺寸不符"是两句话，
+    /// 前者告诉你**重烘哪一段**、后者什么都不告诉你。少了段序，装载失败在日志里就是一句
+    /// 无法行动的谎（"这只宠物的像素坏了"，而像素其实有两张是好的）。
+    Sheet {
+        index: usize,
+        file: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for AtlasError {
@@ -55,6 +66,11 @@ impl std::fmt::Display for AtlasError {
             AtlasError::Bounds { row, col, detail } => {
                 write!(f, "取格 ({row},{col}) 越界: {detail}")
             }
+            AtlasError::Sheet {
+                index,
+                file,
+                reason,
+            } => write!(f, "第 {index} 张（{file}）读不来: {reason}"),
         }
     }
 }
@@ -197,6 +213,42 @@ impl Atlas {
         Ok(())
     }
 
+    /// 只读**文件头**（尺寸、有无 alpha），一像素都不解。
+    ///
+    /// 它存在的唯一理由 = [`AtlasSet::reload_segments`] 的第一趟：整只换本体时，"第三张对不上"
+    /// 必须在碰第一张的像素**之前**就知道 —— 分段把"半换"的代价从一只宠物放大成一只宠物的几段。
+    /// 它**不是** [`Self::load`] 的替代品（解码长度、真正的解码都在后面）。
+    /// 读进内存的是编码字节（磁盘侧 ≤4 MiB 那一档），不是解码后的像素 ⇒ 不碰峰值。
+    pub fn peek(
+        path: &str,
+        cols: u32,
+        rows: u32,
+        grid_w: u32,
+        grid_h: u32,
+    ) -> Result<(), AtlasError> {
+        let mut buf = Vec::new();
+        std::fs::File::open(path)
+            .map_err(|e| AtlasError::Io(format!("{path}: {e}")))?
+            .read_to_end(&mut buf)
+            .map_err(|e| AtlasError::Io(format!("{path}: {e}")))?;
+        let decoder = WebPDecoder::new(std::io::Cursor::new(buf))
+            .map_err(|e| AtlasError::Decode(e.to_string()))?;
+        let (width, height) = decoder.dimensions();
+        let expected = (cols * grid_w, rows * grid_h);
+        if (width, height) != expected {
+            return Err(AtlasError::Geometry {
+                expected,
+                got: (width, height),
+            });
+        }
+        if !decoder.has_alpha() {
+            return Err(AtlasError::Decode(format!(
+                "{path} 没有 alpha 通道，无法做点击穿透"
+            )));
+        }
+        Ok(())
+    }
+
     /// 单格左上角的字节偏移（格内第 0 行）；越界返回 `None`。
     ///
     /// 注意跨距是**整张 sheet 的宽度**，不是格子宽度 —— 少乘一个 `width` 就会串格。
@@ -322,6 +374,297 @@ impl Atlas {
     /// 解码后的字节数（RSS 门禁的直接输入）。
     pub fn decoded_bytes(&self) -> usize {
         self.pixels.len()
+    }
+}
+
+/// 一只本体的**全部像素**：N 张 sheet 的集合，取格只有一个口。
+///
+/// 为什么要有这一层（而不是让客户端拿 `Vec<Atlas>` 自己索引）：分段存放（DESIGN §6.1.27
+/// 裁决 1）之后，"全局第 row 行在哪一张"这件事**必须**由 [`Manifest::locate`] 回答。
+/// 若每个取格点各自 `locate` 一次再索引，就有了 N 份"我猜它归第几张"的写法，而漏掉任何一次
+/// 都是**静默取到另一张的同序号行** —— 症状是一只宠物身上混着两批像素，没有任何一处报错。
+/// 这一层把那个形状收敛成 [`AtlasSet::at`] 一个函数：段序号只从这里出。
+#[derive(Debug)]
+pub struct AtlasSet {
+    sheets: Vec<Atlas>,
+    /// 装载那一刻从清单抄来的文件名，顺序 = 段序号（摘要与报错都读它，不许再拼）
+    files: Vec<String>,
+}
+
+impl AtlasSet {
+    /// 逐张装载：文件名与**每张自己的行数**都来自 [`Manifest::sheet_segments`]。
+    ///
+    /// ⚠️ 校验用的是那张**自己声明的高度**，不是全局 `grid.rows`：拿全局行数去比第二段必然
+    /// 报"尺寸不符"，而那只宠物可能是好的 —— 那是我们把两个数混成一个的错，不是产物的错。
+    /// 任一张读不来就整只失败（不留"两张里的一张"这种半只宠物），且点名是哪一张。
+    pub fn load(dir: &std::path::Path, manifest: &Manifest) -> Result<Self, AtlasError> {
+        let mut sheets = Vec::new();
+        let mut files = Vec::new();
+        for (index, (file, rows)) in manifest.sheet_segments().into_iter().enumerate() {
+            let path = dir.join(file);
+            let loaded: Result<Atlas, String> = match path.to_str() {
+                None => Err("路径不是 UTF-8".to_owned()),
+                Some(s) => Atlas::load(
+                    s,
+                    manifest.grid.cols as u32,
+                    rows as u32,
+                    manifest.grid.w,
+                    manifest.grid.h,
+                )
+                .map_err(|e| e.to_string()),
+            };
+            match loaded {
+                Ok(atlas) => {
+                    sheets.push(atlas);
+                    files.push(file.to_owned());
+                }
+                Err(reason) => {
+                    return Err(AtlasError::Sheet {
+                        index,
+                        file: file.to_owned(),
+                        reason,
+                    });
+                }
+            }
+        }
+        Ok(Self { sheets, files })
+    }
+
+    pub fn len(&self) -> usize {
+        self.sheets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sheets.is_empty()
+    }
+
+    /// 装载用的文件名表（段序）。摘要行"这张像素来自哪个文件"只能读它。
+    pub fn files(&self) -> &[String] {
+        &self.files
+    }
+
+    pub fn sheet(&self, index: usize) -> Option<&Atlas> {
+        self.sheets.get(index)
+    }
+
+    /// 逐段 `(文件名, 图集)`，序 = 段序。日志与摘要读它，不许自己拿 `files()` 去配 `sheet(i)`
+    /// —— 那样两处任一为空就静默少打一行，而"两张 sheet 只报告了一张"正是本层要消灭的形状。
+    pub fn segments(&self) -> impl Iterator<Item = (&str, &Atlas)> {
+        self.files
+            .iter()
+            .zip(&self.sheets)
+            .map(|(f, a)| (f.as_str(), a))
+    }
+
+    /// **本 crate 里唯一**把全局行号换成"哪一张的哪一行"的函数：换算整包交给
+    /// [`Manifest::locate`]，这里只加两道它管不着的检查（段序在装载过的集合里、列在格子里）。
+    /// 在别处再写一遍段表遍历 = 第二个换算口，那正是本层要消灭的东西。
+    pub fn at<'a>(
+        &'a self,
+        manifest: &Manifest,
+        row: u32,
+        col: u32,
+    ) -> Result<(&'a Atlas, u32, u32), AtlasError> {
+        let (index, local) = manifest
+            .locate(row as usize)
+            .ok_or_else(|| AtlasError::Bounds {
+                row,
+                col,
+                detail: format!(
+                    "全局行 {row} 落不进任何一张（清单共 {} 行）",
+                    manifest.total_rows()
+                ),
+            })?;
+        let sheet = self.sheets.get(index).ok_or_else(|| AtlasError::Bounds {
+            row,
+            col,
+            detail: format!(
+                "清单说这一行在第 {index} 张，而那只本体只装来 {} 张",
+                self.sheets.len()
+            ),
+        })?;
+        if col >= sheet.cols {
+            return Err(AtlasError::Bounds {
+                row,
+                col,
+                detail: format!("列越界：那张只有 {} 列", sheet.cols),
+            });
+        }
+        Ok((sheet, local as u32, col))
+    }
+
+    /// 按**段序**原地重载那一张（P5 换本体是整只换、走 [`Self::load`]；这一档留给"同一段的
+    /// 像素要重读"那一族，比如惰性加载批）。参数与失败形状同 [`Atlas::reload`]。
+    ///
+    /// 失败一律翻成 [`AtlasError::Sheet`]：底层的 `Geometry`/`Decode`/`Io` 病因留在
+    /// `reason` 文字里（那是"为什么"），段序与文件名是这一层才知道的"是哪一张"。
+    /// 只有越界那一段没有名字可报 ⇒ `file` 留空，不许编一个。
+    pub fn reload(&mut self, index: usize, path: &str) -> Result<(), AtlasError> {
+        let have = self.sheets.len();
+        let file = self.files.get(index).cloned().unwrap_or_default();
+        let Some(sheet) = self.sheets.get_mut(index) else {
+            return Err(AtlasError::Sheet {
+                index,
+                file,
+                reason: format!("集合里只有 {have} 张"),
+            });
+        };
+        sheet.reload(path).map_err(|e| AtlasError::Sheet {
+            index,
+            file,
+            reason: e.to_string(),
+        })
+    }
+
+    /// 当前集合能不能**原地**接住这份清单 = 段数与各段行数逐段相同。
+    ///
+    /// P5 换本体读它，判据故意**窄**：只有同段形才谈得上"原地"。不同段形（单张 ↔ 分段）
+    /// 不是错误，只是接不住 ⇒ 调用方那条路走整只 [`Self::load`]，那一刻峰值是两只本体。
+    /// 格子档（`cols/w/h`）**不在这里比**：行数相同而档不同是合法输入，它由
+    /// [`reload_segments`](Self::reload_segments) 第一趟的 [`Atlas::peek`] 逐张兜住（按新清单的
+    /// 期望尺寸报"图集尺寸不符"），而 [`Atlas::reload`] 自己还有一道同尺寸自检 ⇒ 两处都失败关闭。
+    pub fn fits(&self, manifest: &Manifest) -> bool {
+        let segs = manifest.sheet_segments();
+        segs.len() == self.sheets.len()
+            && segs
+                .iter()
+                .zip(&self.sheets)
+                .all(|((_, rows), atlas)| *rows as u32 == atlas.rows)
+    }
+
+    /// **整只原地**换像素：逐段 [`Self::reload`]，并把 [`Self::files`] 换成新清单里的名字。
+    ///
+    /// 两趟是这条函数的全部形状：
+    /// 1. 第一趟只 [`Atlas::peek`]（读文件头）⇒ 任何一张对不上都在**碰像素之前**退出，
+    ///    留下的仍是原来那只完整的宠物。分段之后"半换"比单张时更糟（身上混两只宠物的段），
+    ///    所以这一趟不是优化，是它存在的理由。
+    /// 2. 第二趟逐段原地解（每段自己的三条自检照旧，见 [`Atlas::reload`]）。
+    ///
+    /// ⚠️ 残余风险照旧继承 [`Atlas::reload`] 那一段：头过了而 `read_image` 中途失败（文件被截断）
+    /// 仍会留下一张残缺的。这里为此多做一步 —— 第二趟一旦失败，把**已经换掉的**那几张按旧名字
+    /// 回读回去（回滚再失败会在 `reason` 里点名是哪一张），因为调用方在失败分支上打的是
+    /// "本体没换"，而那句话必须是真的。前提 = 旧文件还在原地，这换了本体的那一刻成立。
+    ///
+    /// `files` 是**最后一步整体赋值**，不在循环里逐段改：回滚只还原像素，名字若已先走一步，
+    /// 失败之后摘要与报错读的就是"新那只"的文件名（`a_body_that_passes_the_header_but_fails_to_decode_is_rolled_back`
+    /// 抓的就是这个形状）。
+    ///
+    /// 两道防线各有一条"只有它能守住"的输入 ⇒ 都不可删：peek 那趟在**旧件已删**时是唯一防线
+    /// （[`the_header_pass_is_the_only_defense_when_the_old_sheet_is_gone`]），回滚那步在**头过而解码崩**
+    /// （截断件）时是唯一防线。
+    pub fn reload_segments(
+        &mut self,
+        dir: &std::path::Path,
+        manifest: &Manifest,
+    ) -> Result<(), AtlasError> {
+        let segs = manifest.sheet_segments();
+        if !self.fits(manifest) {
+            return Err(AtlasError::Sheet {
+                index: self.sheets.len().min(segs.len()),
+                file: String::new(),
+                reason: format!(
+                    "段形不同：集合 {} 段，清单 {} 段",
+                    self.sheets.len(),
+                    segs.len()
+                ),
+            });
+        }
+        for (index, &(file, _)) in segs.iter().enumerate() {
+            let path = dir.join(file);
+            // 期望尺寸取**这一段自己的**参数（`Atlas::reload` 待会儿比的正是这三个数）⇒
+            // peek 是 reload 的严格子集：第一趟说过的每一张，第二趟都不会再翻脸。
+            let a = &self.sheets[index];
+            let reason = match path.to_str() {
+                None => "路径不是 UTF-8".to_owned(),
+                Some(s) => match Atlas::peek(s, a.cols, a.rows, a.cell_w, a.cell_h) {
+                    Ok(()) => continue,
+                    Err(e) => e.to_string(),
+                },
+            };
+            return Err(AtlasError::Sheet {
+                index,
+                file: file.to_owned(),
+                reason,
+            });
+        }
+        let old_files = self.files.clone();
+        let mut pending = Vec::with_capacity(segs.len());
+        for (index, seg) in segs.iter().enumerate() {
+            let file = seg.0.to_owned();
+            let path = dir.join(&file).to_string_lossy().into_owned();
+            if let Err(e) = self.reload(index, &path) {
+                // 回滚已换掉的那几张（0..index）。失败也继续试完，把回滚的失败一起带进报错。
+                // `files` 到此刻还是旧名字（下面 `pending` 只在全部成功后才落账）⇒ 回滚像素之后
+                // 两个事实源自然对齐，不需要另外还原名字表。
+                let mut rollback = String::new();
+                for (j, back_name) in old_files.iter().enumerate().take(index) {
+                    let back = dir.join(back_name).to_string_lossy().into_owned();
+                    if let Err(r) = self.reload(j, &back) {
+                        rollback.push_str(&format!("；回滚第 {j} 张也失败（{r}）"));
+                    }
+                }
+                return Err(match e {
+                    AtlasError::Sheet { reason, .. } => AtlasError::Sheet {
+                        index,
+                        file,
+                        reason: format!("{reason}（已换的 {index} 张已回读旧件{rollback}）"),
+                    },
+                    other => other,
+                });
+            }
+            pending.push(file);
+        }
+        self.files = pending;
+        Ok(())
+    }
+
+    /// **全集**的解码字节数 = RSS 门禁的直接输入（单张时代它就是 `Atlas::decoded_bytes`）。
+    pub fn decoded_bytes(&self) -> usize {
+        self.sheets.iter().map(|a| a.decoded_bytes()).sum()
+    }
+
+    /// 逐格 blit（全局行号）。见 [`Self::at`] 为什么行号换算只能走一处。
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit(
+        &self,
+        manifest: &Manifest,
+        row: u32,
+        col: u32,
+        dst: &mut [u8],
+        dst_w: u32,
+        dst_h: u32,
+        dst_stride: usize,
+    ) -> Result<(), AtlasError> {
+        let (sheet, local, col) = self.at(manifest, row, col)?;
+        sheet
+            .blit(local, col, dst, dst_w, dst_h, dst_stride)
+            .map_err(|e| match e {
+                // 段内行号对调用方没有意义（它给的是全局行），换回全局号再报，
+                // 否则日志里那一行指不到任何一帧。
+                AtlasError::Bounds { detail, .. } => AtlasError::Bounds { row, col, detail },
+                other => other,
+            })
+    }
+
+    /// 逐格叠加（source-over），形状与 [`Self::blit`] 完全一致 —— 共用 [`Self::at`]。
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_over(
+        &self,
+        manifest: &Manifest,
+        row: u32,
+        col: u32,
+        dst: &mut [u8],
+        dst_w: u32,
+        dst_h: u32,
+        dst_stride: usize,
+    ) -> Result<(), AtlasError> {
+        let (sheet, local, col) = self.at(manifest, row, col)?;
+        sheet
+            .blit_over(local, col, dst, dst_w, dst_h, dst_stride)
+            .map_err(|e| match e {
+                AtlasError::Bounds { detail, .. } => AtlasError::Bounds { row, col, detail },
+                other => other,
+            })
     }
 }
 
@@ -881,6 +1224,7 @@ mod tests {
                 AtlasError::Decode(_) => "Decode",
                 AtlasError::Geometry { .. } => "Geometry",
                 AtlasError::Bounds { .. } => "Bounds",
+                AtlasError::Sheet { .. } => "Sheet",
             };
             assert_eq!(got, want, "{why} 必须报 {want}");
             assert_eq!(
@@ -920,5 +1264,590 @@ mod tests {
             &[0, 0, 128, 128],
             "reload 之后第 0 格必须是**预乘**的 BGRA"
         );
+    }
+
+    // ---- AtlasSet：分段存放（DESIGN §6.1.27 裁决 1「行号全局连续，sheet 只是分段存放」）----
+
+    /// 4 个全局行各自一种纯色（RGBA）。行号是**全局**的，所以同一张表能横跨两段。
+    /// 全用不透明 ⇒ 预乘退化成通道换序，像素判据读的是"取到哪一段"而不是取整。
+    const ROW_RGBA: [[u8; 4]; 4] = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 255, 255],
+    ];
+
+    /// 不透明时 `premultiply_in_place` 只做 RGBA→BGRA 换序，期望值可以直接写出。
+    fn bgra(rgba: [u8; 4]) -> [u8; 4] {
+        [rgba[2], rgba[1], rgba[0], rgba[3]]
+    }
+
+    /// 一整段像素：`cols` 恒 8（清单硬约束）、格子 4×4，第 `i` 行整行涂 `colors[i]`。
+    fn solid_segment(colors: &[[u8; 4]]) -> Vec<u8> {
+        let (cols, cell) = (8u32, 4u32);
+        let (w, h) = (cols * cell, colors.len() as u32 * cell);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for (r, col) in colors.iter().enumerate() {
+            for y in 0..cell {
+                for x in 0..w {
+                    let i = (((r as u32 * cell + y) * w + x) * 4) as usize;
+                    rgba[i..i + 4].copy_from_slice(col);
+                }
+            }
+        }
+        rgba
+    }
+
+    /// 分段清单：4 全局行拆成两张各 2 行（`a` 盖 0-1，`b` 盖 2-3）。
+    fn split_manifest(a: &str, b: &str) -> Manifest {
+        split_manifest_at(a, b, 2)
+    }
+
+    /// 同上，但**切法**可给：`first` 行进 `a`、其余进 `b`（1+3 与 2+2 段数相同而形状不同）。
+    fn split_manifest_at(a: &str, b: &str, first: usize) -> Manifest {
+        let second = 4 - first;
+        Manifest::parse(&format!(
+            r#"{{"format": 3, "slug": "split_probe",
+                "grid": {{"cols": 8, "rows": 4, "w": 4, "h": 4}},
+                "states": {{
+                  "idle": {{"rows": [0, 1], "fps": 8, "loop": true}},
+                  "walk": {{"rows": [2, 3], "fps": 8, "loop": true}}}},
+                "anchor": {{"feet": [2, 3]}},
+                "input_polygon": "auto_from_alpha",
+                "sheets": [{{"file": "{a}", "rows": {first}}}, {{"file": "{b}", "rows": {second}}}]}}"#
+        ))
+        .expect("分段样本清单应当合法")
+    }
+
+    /// 单张老路径清单（`format = 2`、只有 `sheet`）。
+    fn legacy_manifest(sheet: &str, rows: usize) -> Manifest {
+        let track = (0..rows).collect::<Vec<_>>();
+        Manifest::parse(&format!(
+            r#"{{"format": 2, "slug": "legacy_probe", "sheet": "{sheet}",
+                "grid": {{"cols": 8, "rows": {rows}, "w": 4, "h": 4}},
+                "states": {{"idle": {{"rows": {track:?}, "fps": 8, "loop": true}}}},
+                "anchor": {{"feet": [2, 3]}},
+                "input_polygon": "auto_from_alpha"}}"#
+        ))
+        .expect("单张样本清单应当合法")
+    }
+
+    /// 写一段像素：行数 = `colors.len()` ⇒ 坏样本就是靠"少给一行颜色"造出来的。
+    fn write_segment(dir: &std::path::Path, name: &str, colors: &[[u8; 4]]) {
+        let webp = encode_lossless_rgba(&solid_segment(colors), 8 * 4, colors.len() as u32 * 4)
+            .expect("编码");
+        std::fs::write(dir.join(name), webp).expect("写临时段");
+    }
+
+    /// 走 `AtlasSet::blit` 真路径取全局 `(row, col)` 格的第 0 个像素（预乘 BGRA）。
+    fn pixel(set: &AtlasSet, m: &Manifest, row: u32, col: u32) -> [u8; 4] {
+        let mut dst = vec![0u8; (4 * 4 * 4) as usize];
+        set.blit(m, row, col, &mut dst, 4, 4, 16).expect("取格");
+        let mut out = [0u8; 4];
+        out.copy_from_slice(&dst[..4]);
+        out
+    }
+
+    /// 装载点名"第几张读不来"，而且**不跳过**：半只宠物在屏上的症状是身上混两批像素、
+    /// 没有任何一处报错，所以这里必须是失败关闭 + 可行动的出处（重烘哪一段）。
+    #[test]
+    fn a_bad_second_sheet_is_named_not_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = split_manifest("sheet_a.webp", "sheet_b.webp");
+        // 第二段只烘出 1 行（`--at` 抄错、或重烘中途被打断的形状），第一段是好的。
+        write_segment(dir.path(), "sheet_a.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "sheet_b.webp", &ROW_RGBA[2..3]);
+        // 单看这一张，底层只会说"图集尺寸不符"——它不知道自己是第几段。
+        let solo = Atlas::load(
+            &dir.path().join("sheet_b.webp").to_string_lossy(),
+            8,
+            2,
+            4,
+            4,
+        );
+        assert!(
+            matches!(solo, Err(AtlasError::Geometry { .. })),
+            "前提：底层那一句本来给不出段序: {solo:?}"
+        );
+
+        let err = AtlasSet::load(dir.path(), &m).expect_err("坏段必须整只失败，不许跳过后继续");
+        match &err {
+            AtlasError::Sheet {
+                index,
+                file,
+                reason,
+            } => {
+                assert_eq!(*index, 1, "第二段坏掉不许报成第 0 张");
+                assert_eq!(file, "sheet_b.webp", "要报**清单里**的文件名，重烘才有目标");
+                assert!(
+                    reason.contains("图集尺寸不符"),
+                    "底层的病因不许丢: {reason}"
+                );
+            }
+            other => panic!("分段装载失败必须报 Sheet 档，拿到 {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("第 1 张（sheet_b.webp）"),
+            "日志要能直接行动: {err}"
+        );
+
+        // 换一张坏的 ⇒ 段序跟着走。少了这半，上面的 `index == 1` 可能只是恒打 1 的谎。
+        std::fs::write(dir.path().join("sheet_a.webp"), b"not a webp at all").expect("写坏第一段");
+        let first = AtlasSet::load(dir.path(), &m).expect_err("第一段坏掉也要失败");
+        match first {
+            AtlasError::Sheet {
+                index,
+                file,
+                reason,
+            } => {
+                assert_eq!(
+                    (index, file.as_str()),
+                    (0, "sheet_a.webp"),
+                    "点名必须跟着坏的那一张走"
+                );
+                assert!(reason.contains("WebP"), "病因还是那一句: {reason}");
+            }
+            other => panic!("拿到 {other:?}"),
+        }
+    }
+
+    /// `decoded_bytes` 是 RSS 门禁（D16 ≤200 MiB）的直接输入 ⇒ 分段之后它必须给**全集**。
+    /// 反向对照 = 同一批像素合成一张：总字节必须分毫不差，否则"只是换个存放"就不成立。
+    #[test]
+    fn the_set_reports_total_decoded_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = split_manifest("sheet_a.webp", "sheet_b.webp");
+        write_segment(dir.path(), "sheet_a.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "sheet_b.webp", &ROW_RGBA[2..]);
+        let set = AtlasSet::load(dir.path(), &m).expect("装载分段本体");
+        assert_eq!(set.len(), 2, "两张都在，不是只装来第一张");
+        assert!(!set.is_empty());
+        let one = 8 * 4 * 2 * 4 * 4; // 8 列 × 4px × 2 行 × 4px × 4 字节
+        assert_eq!(
+            set.decoded_bytes(),
+            one * 2,
+            "全集读数 = 两张之和（只报第一张或最大那张，预算就少算一半）"
+        );
+        let sum: usize = (0..set.len())
+            .map(|i| set.sheet(i).expect("段序在集合里").decoded_bytes())
+            .sum();
+        assert_eq!(set.decoded_bytes(), sum, "同一个预算只能有一把尺");
+
+        // 反向对照：同样 4 行走单张路径 ⇒ 字节数与分段完全相等。
+        let whole = legacy_manifest("all.webp", 4);
+        write_segment(dir.path(), "all.webp", &ROW_RGBA);
+        let single = AtlasSet::load(dir.path(), &whole).expect("装载单张本体");
+        assert_eq!(single.len(), 1, "老路径就是一张，不许凭空多一段");
+        assert_eq!(
+            single.decoded_bytes(),
+            set.decoded_bytes(),
+            "分段只改存放：像素预算必须逐字节不变"
+        );
+    }
+
+    /// 正面钉住"行号全局连续"这条裁决：两张各自的第 0 行在**命中表**与**像素**里都是两回事。
+    /// 若 `Regions` 的键换成段内行号（`region.rs:145` 那个裸 `(row,col)`），第二条会覆盖第一条
+    /// ⇒ 症状是某一行永远点不中，而装载与像素全绿，只有眼睛看不见。
+    #[test]
+    fn two_sheets_do_not_collide_in_the_region_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = split_manifest("sheet_a.webp", "sheet_b.webp");
+        write_segment(dir.path(), "sheet_a.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "sheet_b.webp", &ROW_RGBA[2..]);
+        // 全局行 0（第一段的第 0 行）与全局行 2（第二段的第 0 行）各写一份**不同**轮廓；
+        // 行 1 给空 spans = 全透明帧（"什么都不遮"那一档），行 3 干脆不写 = 表里没有这格。
+        std::fs::write(
+            dir.path().join("polygon.json"),
+            r#"{"cell": {"w": 4, "h": 4}, "threshold": 8, "frames": [
+                 {"row": 0, "col": 0, "spans": [[0, 0, 3], [2, 1, 1]]},
+                 {"row": 1, "col": 0, "spans": []},
+                 {"row": 2, "col": 0, "spans": [[1, 0, 1]]}]}"#,
+        )
+        .expect("写 polygon");
+        let regions = crate::region::Regions::load(
+            &dir.path().join("polygon.json").to_string_lossy(),
+            4,
+            4,
+            0.0,
+        )
+        .expect("读 polygon");
+        let r0 = regions.rects(0, 0).expect("全局行 0 在表里");
+        let r2 = regions.rects(2, 0).expect("全局行 2 在表里");
+        assert_eq!(r0.len(), 2, "两个不相连的 run 不该被合并");
+        assert_eq!(r2.len(), 1);
+        assert_ne!(r0, r2, "段内同号的两行必须各自成一条记录，不许互相覆盖");
+        assert_eq!(
+            regions.rects(1, 0),
+            Some(&[][..]),
+            "全透明帧 = 空表（什么都不遮），与「表里没这格」是两件事"
+        );
+        assert_eq!(
+            regions.rects(3, 0),
+            None,
+            "没写过的格子不该被别张的同序号行顶替"
+        );
+
+        // 像素那一半：`at` 给的是两个不同的 Atlas，段内行号却都是 0。
+        let set = AtlasSet::load(dir.path(), &m).expect("装载分段本体");
+        let (sa, la, _) = set.at(&m, 0, 0).expect("全局行 0");
+        let (sb, lb, _) = set.at(&m, 2, 0).expect("全局行 2");
+        assert_eq!(
+            (la, lb),
+            (0, 0),
+            "两行在各自段内的序号相同 = 全局行号才是唯一的键"
+        );
+        assert!(
+            !std::ptr::eq(sa, sb),
+            "同序号行必须落在不同张上，否则它们就是同一个格"
+        );
+        assert_eq!(pixel(&set, &m, 0, 0), bgra(ROW_RGBA[0]));
+        assert_eq!(pixel(&set, &m, 2, 0), bgra(ROW_RGBA[2]));
+    }
+
+    /// 装载用的文件名**只从清单来**：目录里另放一份名叫 `sheet.webp` 的诱饵，老写法
+    /// （`app.rs:736` 那一族拼死文件名）在这份样本上会安静画出错的那只、且全链无错。
+    #[test]
+    fn sheet_names_come_from_the_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // other.webp = 红/绿；诱饵 sheet.webp = 蓝/白。两份都合法，只有名字不同。
+        write_segment(dir.path(), "other.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "sheet.webp", &ROW_RGBA[2..]);
+        let named = legacy_manifest("other.webp", 2);
+        let set = AtlasSet::load(dir.path(), &named).expect("按清单装载");
+        assert_eq!(
+            set.files().to_vec(),
+            vec!["other.webp".to_owned()],
+            "装载用的名字必须是从清单抄来的那一个"
+        );
+        assert_eq!(
+            pixel(&set, &named, 0, 0),
+            bgra(ROW_RGBA[0]),
+            "清单点 other.webp，就许拿它的像素（拿到诱饵 = 文件名被拼死了）"
+        );
+
+        // 老路径的另一半：清单写的就是 sheet.webp ⇒ 照旧读它（这条不许被上面那半顺带改掉）。
+        let plain = legacy_manifest("sheet.webp", 2);
+        let set2 = AtlasSet::load(dir.path(), &plain).expect("单张老路径");
+        assert_eq!(set2.files(), vec!["sheet.webp".to_owned()].as_slice());
+        assert_eq!(pixel(&set2, &plain, 0, 0), bgra(ROW_RGBA[2]));
+
+        // 分段路径同理，而且名字不必长成 sheet_0/sheet_1。
+        let m3 = split_manifest("head.webp", "tail.webp");
+        write_segment(dir.path(), "head.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "tail.webp", &ROW_RGBA[2..]);
+        let set3 = AtlasSet::load(dir.path(), &m3).expect("装载自造段名的本体");
+        assert_eq!(
+            set3.files().to_vec(),
+            vec!["head.webp".to_owned(), "tail.webp".to_owned()],
+            "段序 = 清单里 sheets 的顺序"
+        );
+        assert_eq!(pixel(&set3, &m3, 0, 0), bgra(ROW_RGBA[0]));
+        assert_eq!(pixel(&set3, &m3, 3, 0), bgra(ROW_RGBA[3]));
+        // 全局行号越界要报"落不进任何一张"，不许回绕到某一张的第 0 行。
+        let over = set3
+            .at(&m3, 4, 0)
+            .expect_err("4 行本体的第 4 行不存在（全局号从 0 数）");
+        assert!(
+            matches!(over, AtlasError::Bounds { .. }),
+            "越界报 Bounds: {over:?}"
+        );
+    }
+
+    /// 按段重载：**别的段一个字节都不许动**，坏段与越界段都不许留下半张新图。
+    ///
+    /// 计划第 ④ 步的四条测之外多加的一条：`AtlasSet::reload` 接受的是**段序**，
+    /// 越界那一支若没人测，就是一个"永远不红的死分支"（`Atlas::reload` 的三条自检
+    /// 只保证单张内不半换，管不到"索引指向集合外"）。
+    #[test]
+    fn a_segment_reloads_without_disturbing_the_other() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m = split_manifest("sheet_a.webp", "sheet_b.webp");
+        write_segment(dir.path(), "sheet_a.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "sheet_b.webp", &ROW_RGBA[2..]);
+        let mut set = AtlasSet::load(dir.path(), &m).expect("装载分段本体");
+        let bytes_before = set.decoded_bytes();
+        let b_before = pixel(&set, &m, 2, 0);
+
+        // 越界段序：报"只有 2 张"，不许 panic、也不许动任何一段。
+        let err = set
+            .reload(7, &dir.path().join("sheet_a.webp").to_string_lossy())
+            .expect_err("第 7 段不存在");
+        match err {
+            AtlasError::Sheet {
+                index,
+                file,
+                ref reason,
+            } => {
+                assert_eq!(index, 7);
+                assert!(file.is_empty(), "越界那一段没有名字，不许编一个: {file}");
+                assert!(reason.contains("只有 2 张"), "要给出集合的大小: {reason}");
+            }
+            other => panic!("越界要报 Sheet 档，拿到 {other:?}"),
+        }
+        assert_eq!(
+            pixel(&set, &m, 0, 0),
+            bgra(ROW_RGBA[0]),
+            "越界重载不该动第一段"
+        );
+
+        // 坏件：段 1 换成单行张 ⇒ 失败关闭，像素与预算读数都留在原样。
+        write_segment(dir.path(), "broken.webp", &ROW_RGBA[..1]);
+        let bad = set
+            .reload(1, &dir.path().join("broken.webp").to_string_lossy())
+            .expect_err("档不同必须失败");
+        assert!(
+            matches!(bad, AtlasError::Sheet { index: 1, .. }),
+            "重载失败也要点名是第几段: {bad}"
+        );
+        assert_eq!(pixel(&set, &m, 2, 0), b_before, "坏件不许留下半张新图");
+        assert_eq!(set.decoded_bytes(), bytes_before, "失败之后预算读数不变");
+
+        // 好件：段 1 换成"同样两行、颜色不同"的一张 ⇒ 只有段 1 变，段 0 与总字节不动。
+        write_segment(dir.path(), "swapped.webp", &[ROW_RGBA[1], ROW_RGBA[0]]);
+        set.reload(1, &dir.path().join("swapped.webp").to_string_lossy())
+            .expect("同档的另一张必须成功");
+        assert_eq!(
+            pixel(&set, &m, 2, 0),
+            bgra(ROW_RGBA[1]),
+            "段 1 的像素要真的换掉"
+        );
+        assert_eq!(
+            pixel(&set, &m, 0, 0),
+            bgra(ROW_RGBA[0]),
+            "段 0 不许被顺带换掉"
+        );
+        assert_eq!(
+            set.decoded_bytes(),
+            bytes_before,
+            "同档重载 = 原地，不留第二份"
+        );
+    }
+
+    /// P5 换本体的分段版：**要么整只换过去，要么一笔像素都不动**。
+    ///
+    /// 承重的那半是负例 2：坏的那张在**第二段**，而第一段是好的 ⇒ 没有"先逐张读头"那一趟的话，
+    /// 第一段已经被换成新本体、函数却返回 Err，调用方打的是"本体没换"——屏上却是两只宠物的段
+    /// 混在一起。这条测就是那一趟的证据（也是 `fits` 与"段形不同不许硬原地"的证据）。
+    #[test]
+    fn a_whole_body_swaps_in_place_or_not_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = split_manifest("sheet_a.webp", "sheet_b.webp");
+        write_segment(dir.path(), "sheet_a.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "sheet_b.webp", &ROW_RGBA[2..]);
+        let mut set = AtlasSet::load(dir.path(), &old).expect("装载起点本体");
+        let bytes_before = set.decoded_bytes();
+
+        // 正例：同样两段、换个名字与一套新像素 ⇒ 原地换掉，预算不变，名字表跟过去。
+        let new = split_manifest("head.webp", "tail.webp");
+        assert!(
+            set.fits(&new),
+            "同段形必须报 fits，否则调用方会白付一次双份峰值"
+        );
+        write_segment(dir.path(), "head.webp", &[ROW_RGBA[3], ROW_RGBA[0]]);
+        write_segment(dir.path(), "tail.webp", &[ROW_RGBA[1], ROW_RGBA[2]]);
+        set.reload_segments(dir.path(), &new)
+            .expect("同段形的整只换必须成功");
+        assert_eq!(
+            set.files().to_vec(),
+            vec!["head.webp".to_owned(), "tail.webp".to_owned()],
+            "摘要与报错读的文件名要跟着新清单走（旧名字留着 = 两个事实源）"
+        );
+        assert_eq!(
+            pixel(&set, &new, 0, 0),
+            bgra(ROW_RGBA[3]),
+            "段 0 换成了新件"
+        );
+        assert_eq!(
+            pixel(&set, &new, 2, 0),
+            bgra(ROW_RGBA[1]),
+            "段 1 换成了新件"
+        );
+        assert_eq!(
+            set.decoded_bytes(),
+            bytes_before,
+            "整只原地换不留第二份缓冲"
+        );
+
+        // 负例 1：段形不同（单张 ↔ 分段）⇒ 报"段形不同"，像素一个字节都不动。
+        let single = legacy_manifest("one.webp", 4);
+        write_segment(dir.path(), "one.webp", &ROW_RGBA);
+        assert!(!set.fits(&single), "一段 vs 两段必须报不 fits");
+        let err = set
+            .reload_segments(dir.path(), &single)
+            .expect_err("段形不同不许硬原地");
+        assert!(
+            matches!(&err, AtlasError::Sheet { reason, .. } if reason.contains("段形不同")),
+            "要说出为什么接不住: {err}"
+        );
+        assert_eq!(
+            pixel(&set, &new, 0, 0),
+            bgra(ROW_RGBA[3]),
+            "被拒之后仍是刚才那只"
+        );
+
+        // 负例 1b：**段数相同而切法不同**（1+3 vs 2+2）⇒ 一样不许硬原地。
+        // 这一格管的是"客户端选哪条路"，不是报错文案：`swap_body` 读 `fits` 决定原地换还是整只
+        // `load`，`fits` 若只数段数，一条本来走得通的整只换会被换成一条必然失败的原地换
+        // （`fits-blind-to-rows` 变异 = 全绿 ⇒ 曾没有测例看着它）。
+        let uneven = split_manifest_at("uneven_a.webp", "uneven_b.webp", 1);
+        write_segment(dir.path(), "uneven_a.webp", &ROW_RGBA[..1]);
+        write_segment(dir.path(), "uneven_b.webp", &ROW_RGBA[1..]);
+        assert!(
+            !set.fits(&uneven),
+            "同段数不同切法必须报不 fits（逐段行数就是比这个）"
+        );
+        let err = set
+            .reload_segments(dir.path(), &uneven)
+            .expect_err("切法不同接不住，要退回整只装载");
+        assert!(
+            matches!(&err, AtlasError::Sheet { reason, .. } if reason.contains("段形不同")),
+            "要说出为什么接不住: {err}"
+        );
+        assert_eq!(
+            [pixel(&set, &new, 0, 0), pixel(&set, &new, 2, 0)],
+            [bgra(ROW_RGBA[3]), bgra(ROW_RGBA[1])],
+            "被拒之后两只都没动"
+        );
+
+        // 负例 2（承重）：**第二段**坏、第一段好 ⇒ 第一趟就要退，第一段一个像素都不许换。
+        let also = split_manifest("good.webp", "broken.webp");
+        assert!(set.fits(&also), "段形相同，坏的是内容不是形状");
+        write_segment(dir.path(), "good.webp", &[ROW_RGBA[2], ROW_RGBA[2]]);
+        write_segment(dir.path(), "broken.webp", &ROW_RGBA[..1]);
+        let err = set
+            .reload_segments(dir.path(), &also)
+            .expect_err("坏段必须失败");
+        match &err {
+            AtlasError::Sheet {
+                index,
+                file,
+                reason,
+            } => {
+                assert_eq!(
+                    (*index, file.as_str()),
+                    (1, "broken.webp"),
+                    "点名坏的那一张"
+                );
+                assert!(reason.contains("图集尺寸不符"), "病因要留住: {reason}");
+            }
+            other => panic!("拿到 {other:?}"),
+        }
+        assert_eq!(
+            [pixel(&set, &new, 0, 0), pixel(&set, &new, 2, 0)],
+            [bgra(ROW_RGBA[3]), bgra(ROW_RGBA[1])],
+            "失败之后屏上还是同一只 —— 第一段没被换成新本体（那趟 peek 的意义）"
+        );
+        assert_eq!(
+            set.files().to_vec(),
+            vec!["head.webp".to_owned(), "tail.webp".to_owned()],
+            "名字表也不许先走一步"
+        );
+    }
+
+    /// 第一趟 peek 唯一不可替代的那一格 = **旧件已经不在盘上**，回滚这条路本身断了。
+    ///
+    /// 上一条测里"坏段"被接住其实有两道防线（先逐张读头、失败后回读旧件），互为冗余 ⇒ 只问那条
+    /// 测红不红，答不了"第一趟是不是死重"（现场事实第 10 条同族：一条防线被另一条遮住时，删掉它
+    /// 测例照样绿）。这一条把冗余拆掉：旧文件删了，"没碰像素"只能由第一趟保证。
+    /// ⚠️ 反过来它也只是**防线顺序**的证据，不是最常见失败形状的证据 —— 真机上旧件通常还在。
+    #[test]
+    fn the_header_pass_is_the_only_defense_when_the_old_sheet_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = split_manifest("gone_a.webp", "gone_b.webp");
+        write_segment(dir.path(), "gone_a.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "gone_b.webp", &ROW_RGBA[2..]);
+        let mut set = AtlasSet::load(dir.path(), &old).expect("装载起点本体");
+        std::fs::remove_file(dir.path().join("gone_a.webp")).expect("删掉第一段旧件");
+        std::fs::remove_file(dir.path().join("gone_b.webp")).expect("删掉第二段旧件");
+        let before = [pixel(&set, &old, 0, 0), pixel(&set, &old, 2, 0)];
+
+        let bad_tail = split_manifest("good.webp", "broken.webp");
+        // 新第一段与旧第一段**不同色**（旧 = 红/绿）⇒ 换过没换过在像素上看得见；同色的话
+        // "半换"与"整只没动"是同一个读数，这条测就成了恒绿的假仪器。
+        write_segment(dir.path(), "good.webp", &[ROW_RGBA[3], ROW_RGBA[2]]);
+        write_segment(dir.path(), "broken.webp", &ROW_RGBA[..1]);
+        let err = set
+            .reload_segments(dir.path(), &bad_tail)
+            .expect_err("第二段坏必须整体失败");
+        assert!(
+            matches!(&err, AtlasError::Sheet { index: 1, file, .. } if file == "broken.webp"),
+            "拿到 {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("回滚"),
+            "旧件已删 ⇒ 守住只可能是第一趟的功劳，报错里不许出现回滚的痕迹: {err}"
+        );
+        assert_eq!(
+            [pixel(&set, &old, 0, 0), pixel(&set, &old, 2, 0)],
+            before,
+            "第一段一个像素都没动（回滚在这里做不到）"
+        );
+        assert_eq!(
+            set.files().to_vec(),
+            vec!["gone_a.webp".to_owned(), "gone_b.webp".to_owned()],
+            "名字表也不许先走一步"
+        );
+    }
+
+    /// 回滚唯一不可替代的那一格 = **文件头过了、解码中途崩**（截断的 webp）。
+    ///
+    /// 与上一条配成一对：那条把回滚拆掉（旧件删了），这一条把 peek 拆掉（截断件读得出尺寸、
+    /// 解不出像素）⇒ 两道防线各自都有一条"只有它能守住"的输入，谁都不是死重。
+    /// 前提那句 `peek` 必须 `Ok` 是这条测的意义所在：否则红的是第一趟，不是回滚。
+    /// ⚠️ 顺带一条实测：截断 1 字节的 lossless webp 连 `reload` 都能过（探针里 163/164 = `Ok`）
+    /// ⇒ 体积/像素类门禁管不到"少一个字节"，那归 zip 的 CRC 与 sha256（见 §6.1.27）。
+    #[test]
+    fn a_body_that_passes_the_header_but_fails_to_decode_is_rolled_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = split_manifest("keep_a.webp", "keep_b.webp");
+        write_segment(dir.path(), "keep_a.webp", &ROW_RGBA[..2]);
+        write_segment(dir.path(), "keep_b.webp", &ROW_RGBA[2..]);
+        let mut set = AtlasSet::load(dir.path(), &old).expect("装载起点本体");
+        let before = [pixel(&set, &old, 0, 0), pixel(&set, &old, 2, 0)];
+        let bytes_before = set.decoded_bytes();
+
+        // 新第一段用**另一套颜色**：照抄旧件的话，"换过了"与"回滚了"在像素上不可分辨，
+        // 这条测就成了恒绿的假仪器（`rollback-off` 变异第一次就是这么活下来的）。
+        let whole =
+            encode_lossless_rgba(&solid_segment(&ROW_RGBA[2..]), 8 * 4, 2 * 4).expect("编码");
+        assert_ne!(
+            bgra(ROW_RGBA[2]),
+            before[0],
+            "前提：新第一段要与旧第一段不同色，否则回滚有没有发生根本看不见"
+        );
+        std::fs::write(dir.path().join("ok.webp"), &whole).expect("写完整件");
+        std::fs::write(dir.path().join("trunc.webp"), &whole[..whole.len() / 2]).expect("写截断件");
+        let trunc = dir.path().join("trunc.webp");
+        let trunc = trunc.to_string_lossy().into_owned();
+        assert!(
+            Atlas::peek(&trunc, 8, 2, 4, 4).is_ok(),
+            "前提：截断件要能过第一趟，否则这条测的不是回滚"
+        );
+        let mut probe = Atlas::load(&dir.path().join("ok.webp").to_string_lossy(), 8, 2, 4, 4)
+            .expect("完整件装载");
+        assert!(
+            matches!(probe.reload(&trunc), Err(AtlasError::Decode(_))),
+            "前提：同一个文件在 `reload` 那里必须失败"
+        );
+
+        let half_new = split_manifest("ok.webp", "trunc.webp");
+        let err = set
+            .reload_segments(dir.path(), &half_new)
+            .expect_err("解不开的段必须整体失败");
+        assert!(
+            matches!(&err, AtlasError::Sheet { index: 1, file, .. } if file == "trunc.webp"),
+            "拿到 {err:?}"
+        );
+        assert_eq!(
+            [pixel(&set, &old, 0, 0), pixel(&set, &old, 2, 0)],
+            before,
+            "第一段先换过去又解不开第二段 ⇒ 必须回读旧件，屏上仍是原来那只"
+        );
+        assert_eq!(
+            set.files().to_vec(),
+            vec!["keep_a.webp".to_owned(), "keep_b.webp".to_owned()],
+            "回滚之后名字表也要留在旧的那只"
+        );
+        assert_eq!(set.decoded_bytes(), bytes_before, "失败之后预算读数不变");
     }
 }

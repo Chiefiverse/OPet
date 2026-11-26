@@ -5,7 +5,7 @@
 
 use petcore::assets::Manifest;
 use petcore::behavior::{BehaviorConfig, Command, EnabledActions, State};
-use petcore::sim::{Sim, TICK_HZ, run_headless};
+use petcore::sim::{Sim, SimStats, TICK_HZ, run_headless};
 use petcore::world::World;
 
 const HOURS_8_TICKS: u64 = 8 * 3600 * TICK_HZ as u64;
@@ -314,4 +314,122 @@ fn swap_manifest_moves_half_width_and_clamps_x_immediately() {
         sim.check_invariants()
             .expect("不同档换本体之后不该出现漂移");
     }
+}
+
+/// 等价门（§3.5-k 的"地面为主"承诺的反证）：`patrol_share = 0` 时 8 小时行为剖面必须
+/// 与**升空巡线合入前**那份 release 二进制逐字段相同。
+///
+/// ⚠️ 对照面是**状态剖面**而不是指纹（与计划的偏离，已登记）：本批把 `patrol_hops` /
+/// `patrol_departures` / `body.motion` 混进了指纹配方，v4 指纹在数值上不可能等于 a852；
+/// 而剖面（逐状态 tick 数 + 迁移 + 三档提交计数）同样能把"骰子序列被改动过"钉死，
+/// 因为这一族改动只要偏 1 枚子，6 千多万 tick 的状态占比必然跟着变。
+/// 锚 = `~/.local/share/opet/scratch/pre_patrol_golden_8h.txt`（CLI 默认档、seed 1、
+/// 1920×1080 scale 1、默认清单，即 `opet sim headless --hours 8` 的读数面）。
+#[test]
+fn patrol_off_replays_the_pre_patrol_stream() {
+    const TICKS: u64 = 8 * 3600 * TICK_HZ as u64;
+    let expected = SimStats {
+        ticks: TICKS,
+        frames_presented: 299_794,
+        surface_moves: 784_570,
+        frames_skipped: 643_636,
+        transitions: 9_080,
+        state_ticks: [
+            (State::Spawn, 0),
+            (State::Idle, 666_211),
+            (State::Walk, 159_007),
+            (State::Run, 628_853),
+            (State::Stop, 32_336),
+            (State::Jump, 11_878),
+            (State::Land, 7_865),
+            (State::Climb, 208_365),
+            (State::WallSit, 0),
+            (State::Fall, 13_485),
+            (State::Dragged, 0),
+            (State::Sleep, 0),
+        ],
+    };
+    let m = Manifest::parse(petcore::assets::DEFAULT_MANIFEST_JSON).unwrap();
+    let cfg = BehaviorConfig {
+        patrol_share: 0.0,
+        ..BehaviorConfig::default()
+    };
+    let sim = Sim::new(world(), &m, 1, cfg);
+    let (stats, _fp) =
+        run_headless(sim, TICKS).unwrap_or_else(|e| panic!("patrol_share=0 长跑出现漂移: {e}"));
+    assert_eq!(
+        stats.state_ticks, expected.state_ticks,
+        "patrol_off 的逐状态剖面与 patrol 合入前分叉 ⇒ 出发骰序列被动过"
+    );
+    assert_eq!(stats.transitions, expected.transitions, "迁移计数分叉");
+    assert_eq!(
+        stats.frames_presented, expected.frames_presented,
+        "新 buffer 提交数分叉"
+    );
+    assert_eq!(stats.surface_moves, expected.surface_moves);
+    assert_eq!(stats.frames_skipped, expected.frames_skipped);
+}
+
+/// 全屏覆盖（§3.5-k 的验收面）：默认分佈（patrol_share 0.25）跑 1 模拟小时，
+/// 可达盒的 3×3 分格必须**每格都去过**，且升过空（顶部 25% 带内）、有真实出发数。
+/// 固定 seed ⇒ 这是一条回归栅栏，不是概率声明；随机化面在 `gacha-sim` 那边。
+#[test]
+fn air_patrol_covers_the_whole_stage() {
+    let m = Manifest::parse(petcore::assets::DEFAULT_MANIFEST_JSON).unwrap();
+    let mut sim = Sim::new(world(), &m, 4, BehaviorConfig::default());
+    let mut visited = [[0_u32; 3]; 3];
+    let mut min_y = f32::MAX;
+    let ticks = 3600 * TICK_HZ as u64;
+    for _ in 0..ticks {
+        sim.step();
+        sim.check_invariants().expect("巡线长跑不该出现漂移");
+        let stage = sim.world.stage().rect;
+        let gx = (((sim.body.pos.x - stage.left()) / stage.size.x) * 3.0)
+            .floor()
+            .clamp(0.0, 2.0) as usize;
+        let gy = (((sim.body.pos.y - stage.top()) / stage.size.y) * 3.0)
+            .floor()
+            .clamp(0.0, 2.0) as usize;
+        visited[gy][gx] += 1;
+        if sim.body.floating() {
+            min_y = min_y.min(sim.body.pos.y);
+        }
+    }
+    let cells = visited.iter().flatten().filter(|&&n| n > 0).count();
+    assert_eq!(cells, 9, "1 模拟小时没有走遍 3×3 分格: {visited:?}");
+    assert!(
+        min_y <= stage_top_band(&sim),
+        "最高只到 y={min_y} ⇒ 默认分佈下没有真正升空"
+    );
+    assert!(sim.machine.patrol_departures() >= 5);
+}
+
+/// 活性门：默认分佈 4 模拟小时里，**任何一段连续悬空**都必须远小于"永远回不来"的量级。
+/// 这是"卡空中"这一新失败类的直接反证（防线本体 = patrol_hops 有界 + 天花板逃逸 + 不变量）。
+#[test]
+fn air_is_never_sticky() {
+    let m = Manifest::parse(petcore::assets::DEFAULT_MANIFEST_JSON).unwrap();
+    let mut sim = Sim::new(world(), &m, 9, BehaviorConfig::default());
+    let mut run = 0u32;
+    let mut worst = 0u32;
+    for _ in 0..4 * 3600 * TICK_HZ as u64 {
+        sim.step();
+        if sim.body.floating() {
+            run += 1;
+            worst = worst.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    assert!(
+        worst < 3_600,
+        "连续悬空最长 {worst} tick（={} s），上限 60 s ⇒ 疑似卡空中",
+        worst as f64 / 60.0
+    );
+}
+
+/// 舞台顶向下 25% 的那条带的下沿（"升空要升够高"的判定点）。
+fn stage_top_band(sim: &Sim<'_>) -> f32 {
+    let r = sim.world.stage().rect;
+    r.top() + r.size.y * 0.25
 }

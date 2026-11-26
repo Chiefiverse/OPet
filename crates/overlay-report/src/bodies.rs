@@ -130,9 +130,17 @@ impl BodyCandidate {
         }
     }
 
-    /// 那只本体的 sheet 路径（`Atlas::reload` 的唯一输入，**在**门禁之内**不在**扫盘里读）。
-    pub fn sheet(&self) -> std::path::PathBuf {
-        self.dir.join("sheet.webp")
+    /// 那只本体的**全部像素文件**，段序同 [`Manifest::sheet_segments`]（单张时代就是一条）。
+    ///
+    /// ⚠️ 名字来自清单，不拼 `"sheet.webp"`：拼死文件名 = 第二个"像素从哪来"的事实源，而它
+    /// 只在清单恰好这么叫的时候对（§6.1.27 裁决 6）。`check_body` 第 ③ 道与 `AtlasSet` 装载
+    /// 读的都是这一条 ⇒ 三处同一个键。
+    pub fn sheets(&self) -> Vec<std::path::PathBuf> {
+        self.manifest
+            .sheet_files()
+            .into_iter()
+            .map(|f| self.dir.join(f))
+            .collect()
     }
 }
 
@@ -167,8 +175,14 @@ pub fn check_body(dir: &std::path::Path, cur: &Grid) -> Result<BodyCandidate, St
             manifest.slug, a.w, a.h, a.cols, a.rows, b.w, b.h, b.cols, b.rows
         ));
     }
-    // ③ 两件伴生产物**存在**（不读内容 ⇒ 把 `discovery_never_touches_the_sheet…` 那条扩到宠物）。
-    for what in ["sheet.webp", "polygon.json"] {
+    // ③ 伴生产物**存在**（不读内容 ⇒ 把 `discovery_never_touches_the_sheet…` 那条扩到宠物）。
+    //    像素那几件的名字逐条来自清单：分段本体少一张 = 拒绝（那只在收藏册里是只读行），
+    //    而不是"到点上才解不开"—— 那会让收藏册给一只装不出来的宠物画上强调条。
+    for what in manifest
+        .sheet_files()
+        .into_iter()
+        .chain(std::iter::once("polygon.json"))
+    {
         if !dir.join(what).is_file() {
             return Err(format!("拒绝本体 {}：目录里没有 {what}", manifest.slug));
         }

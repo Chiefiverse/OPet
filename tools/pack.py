@@ -29,12 +29,25 @@ import sys
 import numpy as np
 from PIL import Image
 
+import sheets as sheet_layout
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 FIXTURE = os.path.join(REPO, "crates", "petcore", "assets", "cat_shiro.pet.json")
 
 FACING_COLUMNS = 8  # manifest.rs 的 FACING_COLUMNS，硬校验
 ALPHA_THRESHOLD = 8  # 与 polygon.json、validate.py 同一口径
+MAX_SHEET_PX = 8192  # manifest.rs 的 MAX_SHEET_PX：**逐张**校验的上限（§6.1.27）
+
+
+def premul(a):
+    """预乘后的 RGB，装载方的视角。`atlas.rs` 装载时把直通 alpha 转成预乘 BGRA，
+    而 libwebp 的编码路径自己就预乘一次 ⇒ **全透明格（a=0）的 RGB 会被归零**，
+    这批字节差在 source-over 下零贡献、命中测试又只看 alpha ⇒ 不是像素漂移。
+    所以"切开的两张拼回来 == 原张"这条自校验只能比**预乘后**，比原始 RGBA 会假红。
+    """
+    return a[..., :3].astype(np.int32) * a[..., 3:4]
+
 # catalog.rs::Slot 的六个变体（serde(rename_all = "lowercase")）。写不存在的挂点在 Rust 侧是
 # 解析失败，而这里先拒能给出"你写了什么、合法的是哪六个"这句话，而不是 serde 的字段错误。
 # ⚠️ 这张表与 `schema.sql` 的 `accessories.slot` CHECK、`catalog.rs::Slot::ALL` 是三处同源，
@@ -504,6 +517,14 @@ def main():
         "那一只时）或 slug 本身；配件档不给就省略这个字段",
     )
     ap.add_argument("--fits", default="", help="逗号分隔的适配本体 slug；默认 = --body 那一只")
+    ap.add_argument(
+        "--split-rows",
+        type=int,
+        default=0,
+        help="本体档专用：**默认关**。给了就把一张 sheet 按行切成每段最多 N 张，"
+        "产物改成 format=3 + sheets=[{file,rows}]（行号仍是全局连续，见 DESIGN §6.1.27 裁决 1）。"
+        "不给 ⇒ 在册那十只本体的产物逐字节不变。",
+    )
     args = ap.parse_args()
 
     if args.accessory:
@@ -525,6 +546,12 @@ def main():
             sys.exit(
                 "--accessory %s 缺 --body ⇒ 配件清单的 grid 与逐状态 rows/fps/loop 必须**抄**本体那份，"
                 "没有本体就只能自派行号，而自派出来的清单过不了 validate_against。" % args.accessory
+            )
+        if args.split_rows:
+            sys.exit(
+                "--split-rows 只在**本体**那一档有意义：配件侧只认到 format 2（"
+                "`accessory.rs` 的 ACCESSORY_MAX_FORMAT），而它的行号是**抄**本体的整张 sheet 行号。"
+                "拆本体不会拆配件，配件也没那个装载口。"
             )
         pack_accessory(args)
         return
@@ -616,9 +643,10 @@ def main():
     # （`accessory.rs:157`）对今天这四只模型之间的错配**一个都拦不住**：一顶为老虎烘的帽子装到
     # 兔子身上全绿灯，只有像素（两批 `feet_px`）会露馅。所以本体身份 = `--pet` 那一只。
     #
-    # 这两列**不进指纹**：`Sim::fingerprint()`（`sim.rs:207-228`）混的是 tick / state / pos / vel /
-    # facing / rng.counter / `last_sprite` 的 row·col·frame，一个字符串都不读 ⇒ 改章不动基线
-    # `ea97139205536cd8`（这条由本文件末尾那条对照验过，不是推论）。
+    # 这两列**不进指纹**：`Sim::fingerprint()`（`sim.rs:240-265`）混的是 tick / state / pos / vel /
+    # facing / rng.counter / 钉住旗标与路线余量（i+j 批）/ `last_sprite` 的 row·col·frame，一个字符串都不读 ⇒ 改章不动基线
+    # `ed2a7a7df379e3c8`（2026-11-26 悬空钉+全屏升空巡线批起，**已当面签收**；上一代 `a852abc77565dfcb` 同日已签收；
+    # 旧值 `ea97139205536cd8` = 路线+钉住时代之前；这条由本文件末尾那条对照验过，不是推论）。
     body_slug = pet
     if body_slug == fixture.get("slug"):
         # 只有"这一份就是 fixture 那一只"时，fixture 的正式中文名才属于它。
@@ -663,10 +691,47 @@ def main():
     if anchors:
         manifest["outfit_anchors"] = anchors
 
-    sheet_path = os.path.join(out_dir, "sheet.webp")
-    sheet.save(sheet_path, format="WEBP", lossless=True, quality=90)
-
+    # ⚠️ 默认路径（`--split-rows` 不给）在下面**一字不改**地走老路：单张 `sheet.webp` +
+    # `format` 抄 fixture。这个开关只是"能把同一批像素分段写"，不是"改产物形状"⇒ 在册十只
+    # 本体的产物字节不变（裁决 7）。切点只落在全局行边界（裁决 1：行号全局连续，段只是存放），
+    # 而段高上限与 `manifest.rs` 的 MAX_SHEET_PX 同源 —— 超了会被内核逐张拒，这里先拦。
+    total_rows = manifest["grid"]["rows"]
     arr = np.asarray(sheet)
+    if args.split_rows:
+        if args.split_rows * cell > MAX_SHEET_PX:
+            sys.exit(
+                "--split-rows %d × cell %d = %d > MAX_SHEET_PX %d ⇒ 内核对**每一张**都按这条线校验，"
+                "这样切出来的段过不了 validate。"
+                % (args.split_rows, cell, args.split_rows * cell, MAX_SHEET_PX)
+            )
+        segs = []
+        at = 0
+        while at < total_rows:
+            n = min(args.split_rows, total_rows - at)
+            segs.append(("sheet_%d.webp" % len(segs), at, n))
+            at += n
+        manifest.pop("sheet", None)
+        manifest["format"] = 3
+        manifest["sheets"] = [{"file": f, "rows": n} for f, _, n in segs]
+        bad = sheet_layout.check(manifest)
+        if bad:
+            sys.exit("拆段后的清单自己都不合法（写侧的平铺逻辑有 bug）: %s" % "; ".join(bad))
+        for name, start, n in segs:
+            band = arr[start * cell : (start + n) * cell]
+            path = os.path.join(out_dir, name)
+            Image.fromarray(band).save(path, format="WEBP", lossless=True, quality=90)
+            # 读回来对一遍：**写进去的就是装载方会读到的**。判据 = alpha 逐位 + 预乘颜色逐位
+            # （libwebp 会把全透明格的 RGB 归零，那在屏上是零贡献；见 §6.1.27）。
+            back = np.asarray(Image.open(path).convert("RGBA"))
+            if (back[..., 3] != band[..., 3]).any() or not np.array_equal(premul(back), premul(band)):
+                sys.exit(
+                    "段 %s（全局行 %d..%d）读回来的像素与原张不符 ⇒ 切点或编码错了"
+                    % (name, start, start + n - 1)
+                )
+    else:
+        segs = [("sheet.webp", 0, total_rows)]
+        sheet.save(os.path.join(out_dir, "sheet.webp"), format="WEBP", lossless=True, quality=90)
+
     poly = {
         "cell": {"w": cell, "h": cell},
         "threshold": ALPHA_THRESHOLD,
@@ -687,7 +752,8 @@ def main():
     with open(os.path.join(out_dir, "polygon.json"), "w", encoding="utf-8") as fh:
         json.dump(poly, fh, ensure_ascii=False)
 
-    webp_bytes = os.path.getsize(sheet_path)
+    # 逐张报字节数：4 MiB 那道闸的归属是**文件**，不是并集（同 tools/validate.py 的口径）。
+    sizes = [(f, os.path.getsize(os.path.join(out_dir, f))) for f, _, _ in segs]
     decoded = FACING_COLUMNS * cell * manifest["grid"]["rows"] * cell * 4
     print(
         "PACK %s: %d 状态 %s / %d 格 → sheet %dx%d"
@@ -700,7 +766,15 @@ def main():
             manifest["grid"]["rows"] * cell,
         )
     )
-    print("PACK sheet.webp = %d B (%.1f KB)，解码后 RGBA = %.3f MB" % (webp_bytes, webp_bytes / 1024, decoded / 1048576))
+    for f, n in sizes:
+        print("PACK %s = %d B (%.1f KB)" % (f, n, n / 1024))
+    print(
+        "PACK 存放 = %s；解码后 RGBA 合计 = %.3f MB"
+        % (
+            "单张 " + sizes[0][0] if len(sizes) == 1 else "分段 " + "+".join("%s:%d行" % (f, n) for f, _, n in segs),
+            decoded / 1048576,
+        )
+    )
     print("PACK anchor.feet = %s" % anchor)
     # 两个目录要**并排**打出来：上面那次事故的全部可发现性就在于"读哪批帧"这行没有出处。
     print("PACK 帧目录 = %s（cell %d）" % (frames_dir, cell))

@@ -279,8 +279,8 @@ pub fn start_body_id(manifest_path: Option<&Path>, slug: &str) -> String {
 /// 只剩一道可能失败 = sheet 读不开，而它的产物是一个 `Err` 字符串（调用方打一行、停在未穿），
 /// 不是 panic。Wayland 那一份在这里多一步"取并集轮廓"，本平台没有那个对象（模块头差异 2）。
 pub fn decode(cand: &Candidate) -> Result<Worn, String> {
-    let sheet = cand.dir.join("sheet.webp");
     let acc = &cand.manifest;
+    let sheet = cand.dir.join(acc.sheet.as_str());
     let atlas = Atlas::load(
         sheet.to_str().ok_or("配件 sheet 路径不是 UTF-8")?,
         acc.grid.cols as u32,
@@ -934,43 +934,70 @@ mod tests {
              是旧的\"那个半换状态的另一半（实际 {} 处）",
             code.matches("self.manifest = ").count()
         );
-        // ⚠️ needle 带 `&`：`atlas.reload(` 这个字面量在 [`App::swap_body`] 那条**文档注释**里
-        // 也出现过（它把这条门禁的口径写在注释上），不带 `&` 会数到文档而不是代码。
+        // ⚠️ **计数口径自多 sheet 起换了 = 是新缝进来了，不是放宽**（与 Wayland 那条同一处改动、
+        // 同一句理由）。单张时代那"唯一一处" `atlas.reload(&` 现在是两臂（`set.reload_segments(`
+        // 原地 + `AtlasSet::load(` 整只），而它们仍是**同一条缝**：像素落进内存的位置在 `AtlasSet`
+        // 里只有一处。原来那句杀的是"load-then-swap ⇒ 峰值两只本体而 ≤200 MiB 门禁抓不到"；今天
+        // 照旧杀它，只多认一条**合法**例外（段形不同接不住），代价 = 那一臂必须自己打一行读数。
         assert_eq!(
-            code.matches("atlas.reload(&").count(),
+            code.matches(".reload(").count(),
+            0,
+            "客户端绕过 `AtlasSet` 去解单张 = 第二个像素写入点（段序在那一层之外，实际 {} 处）",
+            code.matches(".reload(").count()
+        );
+        assert_eq!(
+            code.matches("set.reload_segments(").count(),
             1,
-            "原地重载只许有一处 ⇒ 写成 load-then-swap（先 `Atlas::load` 再换掉）峰值就是**两只\
-             本体 + 一顶帽 ≈147 MB，而它落在 ≤200 MiB 门禁内 ⇒ 什么都不会红**，只有这一条 + \
-             验收那一次 `VmHWM` 能抓（实际 {} 处）",
-            code.matches("atlas.reload(&").count()
+            "原地逐段重载只许有一处 ⇒ 两处就会有两个\"哪一段坏了\"的答案（实际 {} 处）",
+            code.matches("set.reload_segments(").count()
+        );
+        assert_eq!(
+            code.matches("AtlasSet::load(").count(),
+            2,
+            "`AtlasSet::load` 只有两个落点：`load_atlas`（起点本体）+ `swap_body` 的段形不同那臂\
+             （峰值两只本体，必须自带那行日志）。多出来的第三处 = 有人又在别处装像素（实际 {} 处）",
+            code.matches("AtlasSet::load(").count()
+        );
+        // 那一臂的**唯一**读数就是这行日志（≤200 MiB 门禁抓不到 147 MB，没有任何测例会为它红）
+        // ⇒ 计数对而句子被删 = 屏幕后面偷偷多了一只本体，而盘上看不出来。
+        let swap_arm = fn_body(code, "swap_body");
+        assert!(
+            swap_arm.contains("**峰值两只本体**"),
+            "段形不同那一臂必须自带「峰值两只本体」那一行 ⇒ 它是那条合法例外唯一的读数"
         );
 
-        // ⑨′ **八步的次序**（本轮最承重的一族）。`reload` 是不可回头的那一条线，所以：
+        // ⑨′ **八步的次序**（本轮最承重的一族）。换像素是不可回头的那一条线，所以：
         //    判定与"卸下旧帽"排在它**前**（失败时屏上还是原来那只、账一个字不动），
         //    记账、`drawn_cell = None`、`candidates` 重跑排在它**后**。
         //    · 删掉 `drawn_cell = None` = 那边变异 G 的 P5 版：四份产物的行表逐字节相同 ⇒
         //      `cell != drawn_cell` 那道门永不开 ⇒ 五百多条全绿而真机失败（屏上静默不变）。
         //      ⇒ 这一行**只有**下面这条 textual 读数，真机上唯一的读数是一张截图。
+        //    ·  needle 用 `set.reload_segments(`：它是那两臂里**排在前面**的一臂（`if` 支），所以
+        //      它的位置 = 旧 needle `atlas.reload(&` 的位置，"不可回头的那一条线"含义没变。
         let swap = fn_body(code, "swap_body");
         let said = |needle: &str| {
             swap.find(needle)
                 .unwrap_or_else(|| panic!("`swap_body` 里没有 `{needle}` ⇒ 那八步被拆了"))
         };
         assert!(
-            said("plan_swap_body(") < said("atlas.reload(&"),
+            said("plan_swap_body(") < said("set.reload_segments("),
             "判定排在解像素之后 ⇒ 被拒的那一次已经改过图集，而日志说的是\"没换\""
         );
         assert!(
-            said("self.take_worn()") < said("atlas.reload(&"),
+            said("self.take_worn()") < said("set.reload_segments("),
             "旧帽没先卸下就去解新本体 ⇒ 峰值 = 本体 + 旧帽 + 新本体（那边 M1 档的 148,076 kB）"
         );
         assert!(
-            said("atlas.reload(&") < said("self.persist_body("),
+            said("set.fits(") < said("set.reload_segments("),
+            "原地那一臂没排在 `fits` 之后 ⇒ 两臂不再互斥，段形不同会被硬塞进原地换"
+        );
+        assert!(
+            said("set.reload_segments(") < said("self.persist_body("),
             "账排在像素之前 ⇒ 解码失败那一轮库里记着一只屏上没有的本体"
         );
         assert!(
-            said("atlas.reload(&") < said("self.drawn_cell = None"),
-            "`drawn_cell` 的复位没排在 `reload` 之后 ⇒ 换本体是一次屏上静默不变（变异 G 的 P5 版）"
+            said("set.reload_segments(") < said("self.drawn_cell = None"),
+            "`drawn_cell` 的复位没排在换像素之后 ⇒ 换本体是一次屏上静默不变（变异 G 的 P5 版）"
         );
         assert!(
             said("discover_accessories(") < said("let fresh = self.dress_view()"),

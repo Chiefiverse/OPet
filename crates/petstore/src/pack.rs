@@ -251,12 +251,17 @@ impl Pack {
             )),
             Some(h) => match h.read_text() {
                 Err(e) => problems.push(format!("清单读不出来: {}", e.message())),
-                Ok(text) => match sheet_of(kind, &text) {
+                Ok(text) => match sheets_of(kind, &text) {
                     Err(e) => problems.push(e),
-                    Ok(sheet) => {
-                        let member = format!("{}{id}/{sheet}", pack_prefix(kind));
-                        if !self.names_under(kind, id).contains(&member) {
-                            problems.push(format!("清单说 sheet 是 {sheet}，包里没有这个成员"));
+                    Ok(sheets) => {
+                        let present = self.names_under(kind, id);
+                        for (i, sheet) in sheets.iter().enumerate() {
+                            let member = format!("{}{id}/{sheet}", pack_prefix(kind));
+                            if !present.contains(&member) {
+                                problems.push(format!(
+                                    "清单说第 {i} 张像素是 {sheet}，包里没有这个成员"
+                                ));
+                            }
                         }
                     }
                 },
@@ -275,16 +280,18 @@ fn item_prefix(kind: ItemKind, id: &str) -> String {
     format!("{}{id}/", pack_prefix(kind))
 }
 
-/// 清单文本 → 那份清单声明的 sheet 成员名。**`verify`（读包内）与 INV 门禁（读盘上）共用这一把尺**：
+/// 清单文本 → 那份清单声明的**全部** sheet 成员名（单张 = 一个，分段 = 按段序多个）。
+/// **`verify`（读包内）与 INV 门禁（读盘上）共用这一把尺**：
 /// "能不能被加载器解析"这件事只有一处定义，于是"包验得过、装完 INV 却红"不可能出在解析这一步。
 /// （两边**各自**查成员存在性，那是必须的差别：包内查的是 zip 索引，盘上查的是 `is_file()`。）
-fn sheet_of(kind: ItemKind, text: &str) -> Result<String, String> {
+fn sheets_of(kind: ItemKind, text: &str) -> Result<Vec<String>, String> {
     match kind {
+        // 本体侧走 `sheet_files()` = 装载方真正会去读的那份名单，不在这里另拼一遍。
         ItemKind::Pet => petcore::assets::Manifest::parse(text)
-            .map(|m| m.sheet)
+            .map(|m| m.sheet_files().iter().map(|s| (*s).to_owned()).collect())
             .map_err(|e| format!("清单解析失败: {e}")),
         ItemKind::Accessory => petcore::assets::AccessoryManifest::parse(text)
-            .map(|m| m.sheet)
+            .map(|m| vec![m.sheet])
             .map_err(|e| format!("清单解析失败: {e}")),
     }
 }
@@ -914,16 +921,20 @@ pub fn inv_check(env: &Env, catalog: &Catalog, builtin: Option<&Path>) -> InvRep
                 let mut why = Vec::new();
                 match item.manifest().and_then(|h| h.read_text()) {
                     Err(e) => why.push(format!("清单读不出来: {}", e.message())),
-                    Ok(text) => match sheet_of(it.kind, &text) {
+                    Ok(text) => match sheets_of(it.kind, &text) {
                         Err(e) => why.push(e),
-                        Ok(sheet) => match item.member(&sheet) {
-                            Err(e) => why.push(e.message().to_string()),
-                            Ok(h) if h.exists() => {}
-                            Ok(h) => why.push(format!(
-                                "清单说 sheet 是 {sheet}，但这个文件不在：{}",
-                                h.describe()
-                            )),
-                        },
+                        Ok(sheets) => {
+                            for (i, sheet) in sheets.iter().enumerate() {
+                                match item.member(sheet) {
+                                    Err(e) => why.push(e.message().to_string()),
+                                    Ok(h) if h.exists() => {}
+                                    Ok(h) => why.push(format!(
+                                        "清单说第 {i} 张像素是 {sheet}，但这个文件不在：{}",
+                                        h.describe()
+                                    )),
+                                }
+                            }
+                        }
                     },
                 }
                 hit = Some(ItemCheck {

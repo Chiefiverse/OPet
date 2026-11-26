@@ -428,6 +428,42 @@ pub const TRANSITION_TABLE: &[Edge] = &[
         guard: "唤醒（原表缺 Sleep 的出边，实现补：任意输入或系统活跃）",
         added_in_impl: true,
     },
+    // ── i+j 批（随机路线 + 拖拽钉住，§3.5-j）+ 悬空续批（§3.5-j′/k）补充的 5 行 ──
+    Edge {
+        from: EdgeFrom::One(State::Dragged),
+        to: State::Idle,
+        trigger: Trigger::PointerUp,
+        guard: "E1 松手即钉：脚在支撑面（±SUPPORT_EPS）⇒ settle_on 钉坐；半空 ⇒ hold_in_air 悬空钉（Float+零速，Idle 姿不吃骰子）",
+        added_in_impl: true,
+    },
+    Edge {
+        from: EdgeFrom::One(State::Dragged),
+        to: State::Climb,
+        trigger: Trigger::PointerUp,
+        guard: "E2 贴墙半空松手 ⇒ 挂墙钉（begin_climb(0.0)，爬速/体力冻结）",
+        added_in_impl: true,
+    },
+    Edge {
+        from: EdgeFrom::One(State::Climb),
+        to: State::Fall,
+        trigger: Trigger::Command,
+        guard: "E3 Unpin 解钉 ⇒ release_climb 交重力（挂墙钉的唯一『主动』出边）",
+        added_in_impl: true,
+    },
+    Edge {
+        from: EdgeFrom::One(State::Climb),
+        to: State::Fall,
+        trigger: Trigger::SupportGone,
+        guard: "E4 换屏/改几何后不再贴墙 ⇒ 脱墙坠落并解钉（悬空钉不走这行，Float 随舞台浮动）",
+        added_in_impl: true,
+    },
+    Edge {
+        from: EdgeFrom::One(State::Idle),
+        to: State::Fall,
+        trigger: Trigger::Command,
+        guard: "E5 悬空钉被 Unpin 放生 ⇒ release_hold 交重力（Fall→Land→Idle）；钉坐/挂墙不在此行",
+        added_in_impl: true,
+    },
 ];
 
 /// 迁移记录：给单测、`session_log`（M3）与调试用。
@@ -451,7 +487,7 @@ pub fn transition_table_markdown() -> String {
     let mut out = String::from("| 从 | 到 | 触发 | 守卫 | 来源 |\n|---|---|---|---|---|\n");
     for e in TRANSITION_TABLE {
         let source = if e.added_in_impl {
-            "M1 实现补充"
+            "实现补充"
         } else {
             "§3.3 原表"
         };
