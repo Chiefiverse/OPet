@@ -33,8 +33,8 @@
 use petstore::config::Config;
 
 pub use overlay_common::ui::settings::{
-    FileUi, Motion, Settings, ValueSource, lang_codes, motion_codes, unknown_lang, unknown_motion,
-    validate_cli,
+    FileAudio, FileUi, Motion, Settings, VOLUME_DEFAULT, ValueSource, lang_codes, motion_codes,
+    unknown_lang, unknown_motion, unknown_volume, validate_cli,
 };
 
 /// 从真实进程环境取 `LC_ALL` → `LANG`（前者按 POSIX 约定覆盖后者）+ 从已读好的配置里取
@@ -45,6 +45,7 @@ pub use overlay_common::ui::settings::{
 pub fn from_process(
     cli_lang: Option<&str>,
     cli_motion: Option<&str>,
+    cli_volume: Option<&str>,
     cfg: &Config,
 ) -> Result<Settings, String> {
     let grab = |k| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -52,9 +53,14 @@ pub fn from_process(
     Settings::resolve(
         cli_lang,
         cli_motion,
+        cli_volume,
         FileUi {
             lang: cfg.ui.lang.as_deref(),
             motion: cfg.ui.motion.as_deref(),
+        },
+        FileAudio {
+            volume: cfg.audio.volume.as_deref(),
+            muted: cfg.audio.muted.as_deref(),
         },
         env_lang.as_deref(),
     )
@@ -106,7 +112,15 @@ mod tests {
                 read_back().path,
                 "{lang:?} 的落点不是 reader 看的那个文件"
             );
-            let s = Settings::resolve(None, None, ui(&read_back()), None).unwrap();
+            let s = Settings::resolve(
+                None,
+                None,
+                None,
+                ui(&read_back()),
+                FileAudio::default(),
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 (s.lang, s.lang_from),
                 (lang, ValueSource::ConfigFile),
@@ -119,7 +133,8 @@ mod tests {
             petstore::config::write_ui_key_in(&env, petstore::config::KEY_MOTION, motion.code())
                 .unwrap_or_else(|e| panic!("写动画码 {:?} 该成功：{e}", motion.code()));
             let cfg = read_back();
-            let s = Settings::resolve(None, None, ui(&cfg), None).unwrap();
+            let s =
+                Settings::resolve(None, None, None, ui(&cfg), FileAudio::default(), None).unwrap();
             assert_eq!(
                 (s.motion, s.motion_from),
                 (motion, ValueSource::ConfigFile),

@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use petcore::behavior::{Action, Command, State, Trigger};
+use petcore::behavior::{Action, AssetKey, Command, State, Trigger};
 use petcore::geom::{Rect, Vec2};
 use petcore::world::{Support, WorldEvent};
 use std::collections::HashSet;
@@ -767,5 +767,83 @@ fn route_max_1_matches_old_shape() {
             .iter()
             .any(|(f, t, _)| *f == State::Idle && *t == State::Walk),
         "对照组从未走过路 = 这条测例是空的"
+    );
+}
+
+#[test]
+fn one_shot_touches_nothing_but_the_overlay_slot() {
+    let mut h = Harness::new(cfg_quiet(), 501, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    let pre_state = h.state();
+    let pre_pinned = h.sim.machine.pinned();
+    let pre_route = h.sim.machine.route_remaining();
+    let pre_patrol = h.sim.machine.patrol_hops();
+    let pre_departures = h.sim.machine.patrol_departures();
+    let pre_rng = h.sim.machine.rng().counter();
+
+    h.sim.send(Command::OneShot(AssetKey::Dance));
+    let (transitions, _intent) = h.sim.step();
+
+    assert_eq!(h.state(), pre_state, "OneShot 不改状态");
+    assert_eq!(h.sim.machine.pinned(), pre_pinned);
+    assert_eq!(h.sim.machine.route_remaining(), pre_route);
+    assert_eq!(h.sim.machine.patrol_hops(), pre_patrol);
+    assert_eq!(h.sim.machine.patrol_departures(), pre_departures);
+    assert_eq!(h.sim.machine.rng().counter(), pre_rng, "OneShot 不掷骰");
+    assert!(
+        transitions.is_empty(),
+        "OneShot 在 Idle 下不发迁移: {transitions:?}"
+    );
+}
+
+#[test]
+fn one_shot_wakes_sleep_on_the_existing_edge() {
+    let mut h = Harness::new(cfg_sleepy(), 502, stage(1000.0, 600.0));
+    h.goto_state(State::Idle, 300);
+    h.send(Command::SystemIdle(true));
+    h.run_until_state(State::Sleep, 3000);
+    assert_eq!(h.state(), State::Sleep);
+
+    h.sim.send(Command::OneShot(AssetKey::Dance));
+    let (transitions, _intent) = h.sim.step();
+
+    let woke = transitions
+        .iter()
+        .any(|t| t.from == State::Sleep && t.to == State::Idle && t.trigger == Trigger::Wakeup);
+    assert!(
+        woke,
+        "OneShot 在 Sleep 下必须走 Wakeup 边醒来: {transitions:?}"
+    );
+}
+
+#[test]
+fn one_shot_after_double_tap_wins_the_slot() {
+    let mut a = Harness::new(cfg_quiet(), 503, stage(1000.0, 600.0));
+    a.goto_state(State::Idle, 300);
+    a.sim.send(Command::DoubleTap);
+    let (_, intent_a) = a.sim.step();
+
+    let mut b = Harness::new(cfg_quiet(), 503, stage(1000.0, 600.0));
+    b.goto_state(State::Idle, 300);
+    b.sim.send(Command::DoubleTap);
+    b.sim.send(Command::OneShot(AssetKey::Dance));
+    let (_, intent_b) = b.sim.step();
+
+    assert_eq!(
+        a.state(),
+        b.state(),
+        "DoubleTap 的 Run 迁移不受 OneShot 影响"
+    );
+    let key_a = intent_a.sprite.map(|s| s.key);
+    let key_b = intent_b.sprite.map(|s| s.key);
+    assert_eq!(
+        key_a,
+        Some(AssetKey::React),
+        "对照组: DoubleTap 的 react 叠加应生效（manifest 有 react 行）"
+    );
+    assert_ne!(
+        key_b,
+        Some(AssetKey::React),
+        "实验组: OneShot(Dance) 占了槽位后 react 不再生效（Dance 不在 manifest ⇒ 无叠加）"
     );
 }

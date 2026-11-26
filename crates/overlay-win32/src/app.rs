@@ -100,6 +100,8 @@ pub struct Options {
     pub lang: Option<String>,
     /// `--motion` 的**原始字符串**，同 [`Options::lang`] 那两条理由（三档 full/reduce/off）。
     pub motion: Option<String>,
+    /// `--volume 0..100`，存原始字符串；解释只在 `Settings::resolve` 一处。
+    pub volume: Option<String>,
     /// `--allow-unowned-accessories`：把"这一件我在库存里有没有"那道闸门整个放开。
     ///
     /// 第二批 M5e 起它转真了（消费者 = [`overlay_common::dress::DressView::select`] 的
@@ -119,6 +121,8 @@ pub struct Options {
     ///
     /// 无 `--db` 时它同样不生效（内存库没有"拥有"可查 ⇒ 一切照旧放行），判据仍在那一处。
     pub allow_unowned_pets: bool,
+    /// `--action-map`：触发→一次性叠加路由（批2 §3.5-a）。
+    pub action_map: overlay_common::action_map::ActionMap,
 }
 
 impl Default for Options {
@@ -137,23 +141,25 @@ impl Default for Options {
             seed: 24,
             lang: None,
             motion: None,
+            volume: None,
             allow_unowned_accessories: false,
             allow_unowned_pets: false,
+            action_map: overlay_common::action_map::ActionMap::default(),
         }
     }
 }
 
 impl Options {
-    /// 一行把十二个字段全打出来，供宿主桩与 Windows 的启动行共用。
+    /// 一行把十三个字段全打出来，供宿主桩与 Windows 的启动行共用。
     ///
-    /// 它存在的第二个理由更硬：**这里读到每一个字段** ⇒ 谁加了第十三个字段而忘了在下面列出来，
+    /// 它存在的第二个理由更硬：**这里读到每一个字段** ⇒ 谁加了第十四个字段而忘了在下面列出来，
     /// 只有 [`crate::cli`] 那条平权测试会红（`Options` 多一个字段而 `parse` 不产它 = 那个字段
     /// 恒 `None` = 屏上有东西没人能开）。结构体字面量在这里是**全字段**的，所以漏字段会在
     /// 编译期炸 —— 那是比测试更快的一道。
     pub fn describe(&self) -> String {
         let yes_no = |b: bool| if b { "是" } else { "否" };
         format!(
-            "manifest={:?} 矩形档={} 存档={:?} 秒数={:?} 显示器={:?} 顶部留白={:?} 底部留白={:?} 种子={} 语言={:?} 动效={:?} 未拥有配件放行={} 未拥有本体放行={}",
+            "manifest={:?} 矩形档={} 存档={:?} 秒数={:?} 显示器={:?} 顶部留白={:?} 底部留白={:?} 种子={} 语言={:?} 动效={:?} 未拥有配件放行={} 未拥有本体放行={} 叠加路由={:?}",
             self.manifest,
             yes_no(self.test_rect),
             self.db,
@@ -166,6 +172,7 @@ impl Options {
             self.motion,
             yes_no(self.allow_unowned_accessories),
             yes_no(self.allow_unowned_pets),
+            self.action_map,
         )
     }
 }
@@ -719,6 +726,8 @@ mod win {
         /// 退出请求（菜单"退出"行 = `--seconds` 之外的第二个退出路径，照 Wayland `quit_pet`）。
         /// `round` 读到它 ⇒ 关面、返回"该停了"，`drive` 走 `request_quit`，**摘要照打**。
         exit_requested: bool,
+        audio: Option<crate::audio::AudioPlayer>,
+        prev_sprite: Option<petcore::assets::SpriteFrame>,
     }
 
     impl App {
@@ -740,7 +749,12 @@ mod win {
             // CLI 那两级开关此刻真的传进来了（`cli.rs` 已在解析期把坏值判掉）：这里给错值
             // = `Err` 退出，文件/环境变量给错值 = 出声后按链条往下走（两条路的理由在
             // `crate::settings` 模块头，判分在共用层）。
-            let ui = settings::from_process(opts.lang.as_deref(), opts.motion.as_deref(), &cfg)?;
+            let ui = settings::from_process(
+                opts.lang.as_deref(),
+                opts.motion.as_deref(),
+                opts.volume.as_deref(),
+                &cfg,
+            )?;
             ui.announce();
 
             // 把本轮生效的语言写回 config，于是"首轮取环境语言、此后取上次退出语言"两条同时
@@ -986,6 +1000,14 @@ mod win {
             // 之后所有读取者（卡片水印、M5e 的换装过滤）都问这一个布尔，不在各自分支重算。
             let dry_run = opts.db.is_none();
 
+            let audio_dir = opts.manifest.as_ref().map(|m| {
+                std::path::Path::new(m)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(""))
+                    .to_path_buf()
+            });
+            let audio_volume = ui.volume;
+
             Ok((
                 App {
                     manifest,
@@ -1036,6 +1058,9 @@ mod win {
                     pending_menu_toggle: false,
                     pending_menu_close: false,
                     exit_requested: false,
+                    audio: audio_dir
+                        .and_then(|dir| crate::audio::AudioPlayer::new(dir, audio_volume)),
+                    prev_sprite: None,
                 },
                 client,
             ))
@@ -1109,7 +1134,12 @@ mod win {
                 if self.opts.test_rect {
                     self.rect_frame(client);
                 } else if let Some(sim) = self.sim.as_mut() {
-                    let (_, intent) = sim.step();
+                    let (transitions, intent) = sim.step();
+                    if let Some(ref audio) = self.audio {
+                        let cur = intent.sprite.as_ref();
+                        audio.play_for_tick(&transitions, cur, self.prev_sprite.as_ref());
+                    }
+                    self.prev_sprite = intent.sprite;
                     self.present(client, &intent)?;
                 }
             }
@@ -1359,6 +1389,9 @@ mod win {
                 if dbl {
                     sim.send(Command::Unpin);
                     sim.send(Command::DoubleTap);
+                    if let Some(k) = self.opts.action_map.dbl.filter(|k| self.manifest.has(*k)) {
+                        sim.send(Command::OneShot(k));
+                    }
                 } else {
                     sim.send(Command::DragStart);
                 }
@@ -2080,6 +2113,9 @@ mod win {
             }
             if let Some(sim) = self.sim.as_mut() {
                 sim.send(Command::DoubleTap);
+                if let Some(k) = self.opts.action_map.menu.filter(|k| self.manifest.has(*k)) {
+                    sim.send(Command::OneShot(k));
+                }
             }
         }
 

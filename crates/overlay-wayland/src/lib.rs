@@ -4,6 +4,7 @@
 //! 所以解码 sheet、预乘 alpha、写 shm buffer、把 alpha 区域翻成 `wl_region` 都在这里做。
 
 pub mod app;
+pub mod audio;
 pub mod cli;
 pub mod ipc;
 pub mod probe;

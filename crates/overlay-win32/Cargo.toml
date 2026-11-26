@@ -32,6 +32,10 @@ overlay-common = { workspace = true }
 # `Gacha`，注释写的是"与 Wayland `Gacha::pull` 同一份语义，逐条对齐"—— 对齐靠人，
 # 现在靠编译器：那一份删了，两家点同一个 `overlay_report::Gacha`。
 overlay-report = { workspace = true }
+# §3.5-d 音频基建：短音效播放（OGG Vorbis，cpal 经 WASAPI 出声）。
+# ⚠️ **本行在通用栏、不在 `[target.'cfg(windows)']` 栏**：rodio 的解码与 cpal 的初始化在两侧
+# 宿主都编译得动（Linux 上走 ALSA 后端），宿主测例因此能测到 AudioPlayer 的构造与降级逻辑。
+rodio = { workspace = true }
 
 # 只有 `window.rs` / `monitor.rs` / `app.rs`（`#[cfg(windows)]` 那三个）读得到这一栏。
 # 九个特性各自要什么：Foundation = HANDLE/RECT/LRESULT/WINDOWPOS · Graphics_Gdi = BITMAPINFO/

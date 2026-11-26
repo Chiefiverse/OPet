@@ -61,6 +61,7 @@ DO_CLEAN=0
 # 症状是一句"找不到 xxx.dll"而没有任何一行我们的输出 —— 那一轮会 entirely 丢掉证据。
 ALLOWED_DLLS=(
   "api-ms-win-core-synch-l1-2-0.dll"
+  "api-ms-win-core-winrt-error-l1-1-0.dll" # rodio→cubeb: WinRT 错误报告（音频设备枚举）
   "api-ms-win-crt-environment-l1-1-0.dll"
   "api-ms-win-crt-heap-l1-1-0.dll"
   "api-ms-win-crt-locale-l1-1-0.dll"
@@ -72,10 +73,14 @@ ALLOWED_DLLS=(
   "api-ms-win-crt-time-l1-1-0.dll"    # sqlite3.c 的 _localtime64（M4 接线带来，出处见上面）
   "api-ms-win-crt-utility-l1-1-0.dll" # sqlite3.c 的 qsort（同上）
   "bcryptprimitives.dll" # 种子的随机来源（Windows 8.1 起随系统）
-  "gdi32.dll"            # 显示器几何那一族（EnumDisplayMonitors / GetMonitorInfoW 侧）
+  "combase.dll"            # rodio→cubeb: COM 基类（WASAPI 初始化依赖）
+  "gdi32.dll"              # 显示器几何那一族（EnumDisplayMonitors / GetMonitorInfoW 侧）
   "kernel32.dll"
+  "mmdevapi.dll"           # rodio→cubeb: 多媒体设备枚举器（IMMDeviceEnumerator）
   "ntdll.dll"
-  "user32.dll"           # 分层窗口本体：CreateWindowExW / UpdateLayeredWindow / 消息与捕获
+  "ole32.dll"              # rodio→cubeb: CoInitializeEx（WASAPI 前置）
+  "oleaut32.dll"           # rodio→cubeb: OLE Automation（COM VARIANT 转换）
+  "user32.dll"             # 分层窗口本体：CreateWindowExW / UpdateLayeredWindow / 消息与捕获
 )
 
 # 这三个名字**只许缺席**，单列一遍是为了让失败消息直接说出病名，

@@ -73,7 +73,7 @@ impl State {
     }
 }
 
-/// `pet.json` 里 `states` 的九个键（§3.4）。图集行按此组织，列是 8 个朝向。
+/// `pet.json` 里 `states` 的键（§3.4）。图集行按此组织，列是 8 个朝向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AssetKey {
     Idle,
@@ -85,10 +85,12 @@ pub enum AssetKey {
     Sleep,
     Turn,
     React,
+    /// 批2 §3.5-a：仅一次性叠加（--action-map 路由），永不是 State::asset_key 的映射目标。
+    Dance,
 }
 
 impl AssetKey {
-    pub const ALL: [AssetKey; 9] = [
+    pub const ALL: [AssetKey; 10] = [
         AssetKey::Idle,
         AssetKey::Walk,
         AssetKey::Run,
@@ -98,6 +100,7 @@ impl AssetKey {
         AssetKey::Sleep,
         AssetKey::Turn,
         AssetKey::React,
+        AssetKey::Dance,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -111,6 +114,7 @@ impl AssetKey {
             AssetKey::Sleep => "sleep",
             AssetKey::Turn => "turn",
             AssetKey::React => "react",
+            AssetKey::Dance => "dance",
         }
     }
 
@@ -539,6 +543,28 @@ mod tests {
         assert_eq!(State::Sleep.asset_key(), AssetKey::Sleep);
         assert!(!State::Sleep.animates());
         assert!(State::Idle.animates());
+    }
+
+    #[test]
+    fn the_dance_key_appends_after_the_nine() {
+        assert_eq!(AssetKey::ALL.len(), 10);
+        assert_eq!(AssetKey::ALL[0], AssetKey::Idle);
+        assert_eq!(AssetKey::ALL[8], AssetKey::React);
+        assert_eq!(AssetKey::ALL[9], AssetKey::Dance);
+        assert_eq!(AssetKey::from_key("dance"), Some(AssetKey::Dance));
+        assert_eq!(AssetKey::from_key("dance2"), None);
+        assert!(!AssetKey::Dance.loops());
+    }
+
+    #[test]
+    fn no_state_ever_points_at_dance() {
+        for s in State::ALL {
+            assert_ne!(
+                s.asset_key(),
+                AssetKey::Dance,
+                "State::{s:?} must not map to Dance (it is one-shot only)"
+            );
+        }
     }
 
     #[test]

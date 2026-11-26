@@ -47,7 +47,9 @@
 //!   明写在 `dress.rs` 头部。
 
 pub mod accounting;
+pub mod action_map;
 pub mod atlas;
+pub mod audio;
 pub mod dress;
 pub mod region;
 pub mod ui;

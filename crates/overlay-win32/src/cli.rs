@@ -82,6 +82,9 @@ OPTIONS:
                         opens at 1/4 the size and does NOT flash white; off = the burst
                         is skipped entirely (submissions only go down). Neither tier
                         touches dwell, the rarity ribbon, or the pet's own animation.
+  --volume N            sound effect volume: integer 0-100 or `off` (= 0). Resolution
+                        chain same as --motion: CLI > config.toml [audio] > default 80.
+                        0 = muted (device still initializes, just no sound output).
   --allow-unowned-accessories
                         dev exemption: dress the pet with accessories the inventory
                         does not own. Default OFF - letting an unowned item through
@@ -113,6 +116,12 @@ OPTIONS:
                        answers nothing here, while adding dwmapi.dll would force a
                        re-measure of the whole DLL import whitelist) and per-monitor
                        DPI (needs a window).
+  --action-map SPEC   trigger→one-shot overlay animation routing (batch 2 §3.5-a).
+                       Comma-separated key=value pairs. Valid triggers: dbl (double-tap),
+                       menu (gacha/pull). Valid values: non-looping AssetKey names
+                       (idle / walk / run / jump / climb / react / dance …).
+                       Example: dbl=dance,menu=dance.
+                       Default = empty (no extra overlay routing → old behavior).
   -h, --help            print this text and exit.
 
 NOT IN THIS BUILD (the parser names the reason for each; use opet-overlay-wayland
@@ -147,6 +156,8 @@ pub const ACCEPTED: &[&str] = &[
     "--probe",
     "--allow-unowned-accessories",
     "--allow-unowned-pets",
+    "--action-map",
+    "--volume",
 ];
 
 /// 本片**明确拒绝**的开关与各自的理由。
@@ -226,8 +237,11 @@ pub struct Args {
     lang: Option<String>,
     /// `--motion` 的原始值，同上。
     motion: Option<String>,
+    /// `--volume` 的原始值，同上。
+    volume: Option<String>,
     allow_unowned_accessories: bool,
     allow_unowned_pets: bool,
+    action_map: Option<String>,
 }
 
 impl Args {
@@ -280,7 +294,17 @@ impl Args {
         // `--lang=` / `--motion=` 空值与任何不认识的值一样：**报错，不静默退默认**（R14）。
         // 判据表在共用层（`lang_codes()` / `motion_codes()`），这里不抄第二份 —— 抄了就有
         // "第五种语言加进 UI 而 Windows 的报错还写四种"那一族漂移（M7e 上提链的同一个理由）。
-        crate::settings::validate_cli(self.lang.as_deref(), self.motion.as_deref())?;
+        crate::settings::validate_cli(
+            self.lang.as_deref(),
+            self.motion.as_deref(),
+            self.volume.as_deref(),
+        )?;
+        let am = match self.action_map.as_deref() {
+            Some(s) => {
+                overlay_common::action_map::parse(s).map_err(|e| format!("--action-map: {e}"))?
+            }
+            None => overlay_common::action_map::ActionMap::default(),
+        };
         Ok(Options {
             manifest: self.manifest.clone(),
             test_rect: self.test_rect,
@@ -295,8 +319,10 @@ impl Args {
             seed: self.seed.unwrap_or(24),
             lang: self.lang.clone(),
             motion: self.motion.clone(),
+            volume: self.volume.clone(),
             allow_unowned_accessories: self.allow_unowned_accessories,
             allow_unowned_pets: self.allow_unowned_pets,
+            action_map: am,
         })
     }
 }
@@ -348,6 +374,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             // 家在"给了 en 而屏上是中文"这件事上必然同一个答案（两家各抄一张表才是漂移的入口）。
             "--lang" => a.lang = Some(next_val(&mut i)?),
             "--motion" => a.motion = Some(next_val(&mut i)?),
+            "--volume" => a.volume = Some(next_val(&mut i)?),
             // M7-f 转真。裸旗**拒收值**，与下面那两条豁免旗同形（同一个理由：`--probe=0`
             // 被读成"开了"就是静默换档）。⚠️ Wayland 那侧这一条是**吞** inline 的
             // （`a.probe = true` 不看值）⇒ 两边对同一个错误写法的读数不同，这条偏离与
@@ -390,6 +417,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
                 }
                 a.allow_unowned_pets = true;
             }
+            "--action-map" => a.action_map = Some(next_val(&mut i)?),
             other => return Err(refusal_message(other)),
         }
         i += 1;
@@ -422,7 +450,11 @@ pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
         // `--probe --lang=jap` 静默成功等于告诉用户"这个码是对的"，而他下次真起 overlay 时
         // 看到的仍是默认档。`options()` 在探测路径上会因"没给 --manifest"先炸，所以这里
         // 单独预检一次（与 Wayland `cli.rs` 那一条同一个理由、同一份共用层判据）。
-        crate::settings::validate_cli(parsed.lang.as_deref(), parsed.motion.as_deref())?;
+        crate::settings::validate_cli(
+            parsed.lang.as_deref(),
+            parsed.motion.as_deref(),
+            parsed.volume.as_deref(),
+        )?;
         let report = crate::probe::collect(
             parsed.monitor.as_deref(),
             parsed.panel_top,
@@ -998,5 +1030,36 @@ mod tests {
         // 参数要在报错里可见：否则"解析错了"与"没接线"在 stdout 上长得一样。
         // 读解析出来的值比写死缺省数稳（缺省 seed 挪过一次：1 → 24）。
         assert!(err.contains(&format!("种子={seed}")), "{err}");
+    }
+
+    #[test]
+    fn the_action_map_reaches_the_options_verbatim() {
+        let opts = parse(&v(&["--test-rect", "--action-map", "dbl=dance,menu=react"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(
+            opts.action_map.dbl,
+            Some(petcore::behavior::AssetKey::Dance)
+        );
+        assert_eq!(
+            opts.action_map.menu,
+            Some(petcore::behavior::AssetKey::React)
+        );
+        let none = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert_eq!(
+            none.action_map,
+            overlay_common::action_map::ActionMap::default()
+        );
+    }
+
+    #[test]
+    fn bad_action_map_is_an_error_and_never_a_silent_default() {
+        for bad in ["bogus=dance", "dbl=walk", "dbl=dance2", ""] {
+            let res = parse(&v(&["--test-rect", "--action-map", bad]))
+                .unwrap()
+                .options();
+            assert!(res.is_err(), "\"{bad}\" should be rejected");
+        }
     }
 }

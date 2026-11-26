@@ -384,6 +384,12 @@ impl Atlas {
 /// 若每个取格点各自 `locate` 一次再索引，就有了 N 份"我猜它归第几张"的写法，而漏掉任何一次
 /// 都是**静默取到另一张的同序号行** —— 症状是一只宠物身上混着两批像素，没有任何一处报错。
 /// 这一层把那个形状收敛成 [`AtlasSet::at`] 一个函数：段序号只从这里出。
+///
+/// **惰性加载缝（批2 登记，§6.1.29）**：本结构当前是 eager 的——`load()` 一次性解码所有段。
+/// 未来唯一的形变 = `sheets: Vec<Atlas>` → `Vec<Option<Atlas>>`（None = 已声明但未解码）。
+/// `at()` / `blit()` 入口加一个"确已装载"判定，冷路径复用 [`AtlasSet::reload`] 作为装载原语；
+/// `files()` / `segments()` / `decoded_bytes()` / `fits()` 需改为读描述符列表而非 `sheets.len()`。
+/// 本批不实现惰性解码，只登记接口方向。
 #[derive(Debug)]
 pub struct AtlasSet {
     sheets: Vec<Atlas>,

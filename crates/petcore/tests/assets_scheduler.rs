@@ -240,3 +240,117 @@ fn a_split_sheet_yields_the_same_sprite_stream() {
         "行表动了，格子序列却一模一样 ⇒ 这条等式测的是别的东西，不是寻址"
     );
 }
+
+/// 批2：舞步叠加 = 一次性，走 `one_shot` 通道，放完交还基底。
+fn dance_manifest(rows: usize) -> Manifest {
+    let json = format!(
+        r#"{{
+  "format": 2,
+  "slug": "test_dance",
+  "sheet": "sheet.webp",
+  "grid": {{ "cols": 8, "rows": {rows}, "w": 192, "h": 192 }},
+  "states": {{
+    "idle":  {{ "rows": [0,1,2,3], "fps": 8, "loop": true }},
+    "walk":  {{ "rows": [4,5,6,7,8,9,10,11], "fps": 12, "loop": true }},
+    "run":   {{ "rows": [12,13,14,15,16,17,18,19], "fps": 16, "loop": true }},
+    "stop":  {{ "rows": [20,21,22], "fps": 12, "loop": false }},
+    "jump":  {{ "rows": [23,24,25,26], "fps": 14, "loop": false }},
+    "climb": {{ "rows": [27,28,29,30], "fps": 10, "loop": true }},
+    "sleep": {{ "rows": [31,32], "fps": 4, "loop": true }},
+    "turn":  {{ "rows": [33,34,35,36], "fps": 12, "loop": false }},
+    "react": {{ "rows": [37,38,39], "fps": 12, "loop": false }},
+    "dance": {{ "rows": [40,41], "fps": 8, "loop": false }}
+  }},
+  "anchor": {{ "feet": [96, 180] }},
+  "facing": "sprite_rows_are_right_facing",
+  "input_polygon": "auto_from_alpha"
+}}"#
+    );
+    Manifest::parse(&json).expect("dance manifest must be valid")
+}
+
+#[test]
+fn dance_plays_over_the_base_and_hands_back() {
+    let m = dance_manifest(42);
+    assert!(m.has(AssetKey::Dance));
+    assert_eq!(m.track(AssetKey::Dance).unwrap().rows, vec![40, 41]);
+    assert!(!m.loops(AssetKey::Dance));
+
+    let mut s = Scheduler::new(&m, Facing::East);
+    s.set_fps_caps(30.0, 5.0);
+    let step = 0.1;
+    s.advance(step, State::Idle, Facing::East, None);
+    let d0 = s
+        .advance(step, State::Idle, Facing::East, Some(AssetKey::Dance))
+        .expect("dance frame 0");
+    assert_eq!((d0.key, d0.frame, d0.row), (AssetKey::Dance, 0, 40));
+
+    let d1 = s
+        .advance(step, State::Idle, Facing::East, None)
+        .expect("dance frame 1");
+    assert_eq!((d1.key, d1.frame, d1.row), (AssetKey::Dance, 1, 41));
+
+    let back = s
+        .advance(step, State::Idle, Facing::East, None)
+        .expect("after dance: idle");
+    assert_eq!(back.key, AssetKey::Idle, "dance 放完必须交还基底");
+}
+
+#[test]
+fn a_dance_spanning_two_sheets_streams_correct_cells() {
+    let split_json = r#"{
+  "format": 3,
+  "slug": "test_dance",
+  "sheets": [
+    { "file": "sheet_0.webp", "rows": 20 },
+    { "file": "sheet_1.webp", "rows": 22 }
+  ],
+  "grid": { "cols": 8, "rows": 42, "w": 192, "h": 192 },
+  "states": {
+    "idle":  { "rows": [0,1,2,3], "fps": 8, "loop": true },
+    "walk":  { "rows": [4,5,6,7,8,9,10,11], "fps": 12, "loop": true },
+    "run":   { "rows": [12,13,14,15,16,17,18,19], "fps": 16, "loop": true },
+    "stop":  { "rows": [20,21,22], "fps": 12, "loop": false },
+    "jump":  { "rows": [23,24,25,26], "fps": 14, "loop": false },
+    "climb": { "rows": [27,28,29,30], "fps": 10, "loop": true },
+    "sleep": { "rows": [31,32], "fps": 4, "loop": true },
+    "turn":  { "rows": [33,34,35,36], "fps": 12, "loop": false },
+    "react": { "rows": [37,38,39], "fps": 12, "loop": false },
+    "dance": { "rows": [40,41], "fps": 8, "loop": false }
+  },
+  "anchor": { "feet": [96, 180] },
+  "facing": "sprite_rows_are_right_facing",
+  "input_polygon": "auto_from_alpha"
+}"#
+    .to_string();
+    let split = Manifest::parse(&split_json).unwrap();
+
+    assert_eq!(split.locate(40), Some((1, 20)));
+    assert_eq!(split.locate(41), Some((1, 21)));
+
+    let mut s = Scheduler::new(&split, Facing::East);
+    s.set_fps_caps(30.0, 5.0);
+    let step = 0.1;
+    s.advance(step, State::Idle, Facing::East, None);
+    let d0 = s
+        .advance(step, State::Idle, Facing::East, Some(AssetKey::Dance))
+        .expect("dance frame 0");
+    assert_eq!((d0.key, d0.frame, d0.row), (AssetKey::Dance, 0, 40));
+    let d1 = s
+        .advance(step, State::Idle, Facing::East, None)
+        .expect("dance frame 1");
+    assert_eq!((d1.key, d1.frame, d1.row), (AssetKey::Dance, 1, 41));
+}
+
+#[test]
+fn a_pack_without_dance_never_touches_the_overlay() {
+    let m = manifest();
+    assert!(!m.has(AssetKey::Dance));
+    let mut s = Scheduler::new(m, Facing::East);
+    s.set_fps_caps(30.0, 5.0);
+    for _ in 0..200 {
+        if let Some(f) = s.advance(DT, State::Idle, Facing::East, Some(AssetKey::Dance)) {
+            assert_ne!(f.key, AssetKey::Dance, "无 dance 行的包不该产出 Dance 帧");
+        }
+    }
+}

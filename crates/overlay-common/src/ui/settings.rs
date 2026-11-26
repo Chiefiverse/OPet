@@ -39,6 +39,13 @@ pub struct FileUi<'a> {
     pub motion: Option<&'a str>,
 }
 
+/// `[audio]` 那一层递给链的字符串（与 `FileUi` 同族理由：串字段是编译过的错，串参数是运行时错）。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct FileAudio<'a> {
+    pub volume: Option<&'a str>,
+    pub muted: Option<&'a str>,
+}
+
 /// 一次启动算出来的生效值集合，**连同它们各自的来源**。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -46,6 +53,8 @@ pub struct Settings {
     pub lang_from: ValueSource,
     pub motion: Motion,
     pub motion_from: ValueSource,
+    pub volume: u8,
+    pub volume_from: ValueSource,
     /// 文件/环境变量里的值认不出来时的说明（**调用方必须打印**；见模块头的两条路）。
     pub notices: Vec<String>,
 }
@@ -57,7 +66,9 @@ impl Settings {
     pub fn resolve(
         cli_lang: Option<&str>,
         cli_motion: Option<&str>,
+        cli_volume: Option<&str>,
         file: FileUi<'_>,
+        file_audio: FileAudio<'_>,
         env_lang: Option<&str>,
     ) -> Result<Self, String> {
         let mut notices: Vec<String> = Vec::new();
@@ -104,11 +115,15 @@ impl Settings {
             }
         }
 
+        let (volume, volume_from) = resolve_volume(cli_volume, file_audio, &mut notices)?;
+
         Ok(Self {
             lang,
             lang_from,
             motion,
             motion_from,
+            volume,
+            volume_from,
             notices,
         })
     }
@@ -116,12 +131,14 @@ impl Settings {
     /// 一行生效值摘要（启动时打印；验收 §6-4 读的就是这一行）。
     pub fn summary(&self) -> String {
         format!(
-            "ui: lang = {}（{}，自名 {}）｜ motion = {}（{}）",
+            "ui: lang = {}（{}，自名 {}）｜ motion = {}（{}）｜ volume = {}%（{}）",
             self.lang.code(),
             self.lang_from.as_str(),
             self.lang.self_name(),
             self.motion.code(),
             self.motion_from.as_str(),
+            self.volume,
+            self.volume_from.as_str(),
         )
     }
 
@@ -162,6 +179,51 @@ fn resolve_motion(
         };
     }
     Ok((Motion::DEFAULT, ValueSource::Default))
+}
+
+pub const VOLUME_DEFAULT: u8 = 80;
+
+/// `volume` = CLI → 文件 → 默认三档（同 `motion` 无环境变量级）。
+/// 接受 `0..=100` 纯数字或 `off`（= 0）。`muted = "true"` 等价于 volume = 0。
+fn resolve_volume(
+    cli: Option<&str>,
+    file_audio: FileAudio<'_>,
+    notices: &mut Vec<String>,
+) -> Result<(u8, ValueSource), String> {
+    if let Some(v) = cli {
+        let parsed = parse_volume(v);
+        return match parsed {
+            Some(n) => Ok((n, ValueSource::Cli)),
+            None => Err(unknown_volume(v)),
+        };
+    }
+    if let Some(raw) = file_audio.volume {
+        return match parse_volume(raw) {
+            Some(n) => Ok((n, ValueSource::ConfigFile)),
+            None => {
+                notices.push(format!(
+                    "config.toml 里 [audio] volume = {raw:?} 认不出来（只支持 0–100 或 off）⇒ 用默认 {VOLUME_DEFAULT}"
+                ));
+                Ok((VOLUME_DEFAULT, ValueSource::Default))
+            }
+        };
+    }
+    if file_audio.muted == Some("true") {
+        return Ok((0, ValueSource::ConfigFile));
+    }
+    Ok((VOLUME_DEFAULT, ValueSource::Default))
+}
+
+fn parse_volume(raw: &str) -> Option<u8> {
+    let v = raw.trim();
+    if v.eq_ignore_ascii_case("off") {
+        return Some(0);
+    }
+    v.parse::<u8>().ok().filter(|n| *n <= 100)
+}
+
+pub fn unknown_volume(v: &str) -> String {
+    format!("--volume 的值 {v:?} 认不出来（只支持 0–100 整数或 off）")
 }
 
 /// 生效值是从哪一层来的。**必须随值一起打印**：否则用户无法区分"我配的生效了"和
@@ -279,10 +341,14 @@ pub fn unknown_motion(v: &str) -> String {
     format!("--motion 的值 {v:?} 认不出来（只支持 {}）", motion_codes())
 }
 
-/// `--lang` / `--motion` 的**预检**，给各家 `cli` 的参数解析用：参数写错要在解析阶段
+/// `--lang` / `--motion` / `--volume` 的**预检**，给各家 `cli` 的参数解析用：参数写错要在解析阶段
 /// 就退出，而不是等客户端连上显示服务、建好 surface 之后。
-/// 合法与否只问 [`Lang::parse`] / [`Motion::parse`] 这一处，不在 CLI 再抄一张支持表。
-pub fn validate_cli(lang: Option<&str>, motion: Option<&str>) -> Result<(), String> {
+/// 合法与否只问 [`Lang::parse`] / [`Motion::parse`] / [`parse_volume`] 这一处，不在 CLI 再抄一张支持表。
+pub fn validate_cli(
+    lang: Option<&str>,
+    motion: Option<&str>,
+    volume: Option<&str>,
+) -> Result<(), String> {
     if let Some(v) = lang {
         if Lang::parse(v).is_none() {
             return Err(unknown_lang(v));
@@ -291,6 +357,11 @@ pub fn validate_cli(lang: Option<&str>, motion: Option<&str>) -> Result<(), Stri
     if let Some(v) = motion {
         if Motion::parse(v).is_none() {
             return Err(unknown_motion(v));
+        }
+    }
+    if let Some(v) = volume {
+        if parse_volume(v).is_none() {
+            return Err(unknown_volume(v));
         }
     }
     Ok(())
@@ -304,22 +375,37 @@ mod tests {
         FileUi { lang, motion }
     }
 
+    fn no_audio() -> FileAudio<'static> {
+        FileAudio {
+            volume: None,
+            muted: None,
+        }
+    }
+
     /// 优先级链逐层各测一次。**每一层都要同时给出"值"和"来源"**，只比值的话第 1 层和第 4 层
     /// 都落在 `zh` 上，测试会绿得什么都没验。
     #[test]
     fn cli_beats_file_beats_env_beats_default() {
         let f = file(Some("en"), None);
 
-        let s = Settings::resolve(Some("ja"), None, f, Some("ko_KR")).unwrap();
+        let s = Settings::resolve(Some("ja"), None, None, f, no_audio(), Some("ko_KR")).unwrap();
         assert_eq!((s.lang, s.lang_from), (Lang::Ja, ValueSource::Cli));
 
-        let s = Settings::resolve(None, None, f, Some("ko_KR")).unwrap();
+        let s = Settings::resolve(None, None, None, f, no_audio(), Some("ko_KR")).unwrap();
         assert_eq!((s.lang, s.lang_from), (Lang::En, ValueSource::ConfigFile));
 
-        let s = Settings::resolve(None, None, file(None, None), Some("ja_JP.UTF-8")).unwrap();
+        let s = Settings::resolve(
+            None,
+            None,
+            None,
+            file(None, None),
+            no_audio(),
+            Some("ja_JP.UTF-8"),
+        )
+        .unwrap();
         assert_eq!((s.lang, s.lang_from), (Lang::Ja, ValueSource::EnvVar));
 
-        let s = Settings::resolve(None, None, file(None, None), None).unwrap();
+        let s = Settings::resolve(None, None, None, file(None, None), no_audio(), None).unwrap();
         assert_eq!(
             (s.lang, s.lang_from),
             (Lang::DEFAULT, ValueSource::Default),
@@ -331,7 +417,15 @@ mod tests {
     /// 文件里的坏值：**出声 + 按链条往下**，不是退出、也不是静默当默认。
     #[test]
     fn unrecognized_file_value_is_announced_then_falls_through() {
-        let s = Settings::resolve(None, None, file(Some("fr"), None), Some("ko")).unwrap();
+        let s = Settings::resolve(
+            None,
+            None,
+            None,
+            file(Some("fr"), None),
+            no_audio(),
+            Some("ko"),
+        )
+        .unwrap();
         assert_eq!(
             (s.lang, s.lang_from),
             (Lang::Ko, ValueSource::EnvVar),
@@ -354,7 +448,8 @@ mod tests {
     #[test]
     fn an_unrecognized_env_tag_is_announced_not_swallowed() {
         for tag in ["C", "POSIX", "fr_FR.UTF-8", "zh_TW"] {
-            let s = Settings::resolve(None, None, file(None, None), Some(tag)).unwrap();
+            let s = Settings::resolve(None, None, None, file(None, None), no_audio(), Some(tag))
+                .unwrap();
             // `zh_TW` 落简体是**明写的限制**（本轮只有简体），但认得出来所以不算坏值
             if tag == "zh_TW" {
                 assert_eq!(s.lang, Lang::Zh, "{tag} 应当认得");
@@ -375,20 +470,23 @@ mod tests {
     /// 命令行给错必须是 `Err`（沿用历史 P2 的规矩：显式说错了就别猜）。
     #[test]
     fn bad_cli_values_are_errors_not_fallbacks() {
-        let e = Settings::resolve(Some("fr"), None, file(None, None), None).unwrap_err();
+        let e = Settings::resolve(Some("fr"), None, None, file(None, None), no_audio(), None)
+            .unwrap_err();
         assert!(
             e.contains("--lang") && e.contains("fr") && e.contains("zh/en/ja/ko"),
             "{e}"
         );
 
-        let e = Settings::resolve(None, Some("nope"), file(None, None), None).unwrap_err();
+        let e = Settings::resolve(None, Some("nope"), None, file(None, None), no_audio(), None)
+            .unwrap_err();
         assert!(
             e.contains("--motion") && e.contains("nope") && e.contains("full/reduce/off"),
             "{e}"
         );
 
         // 而文件里同样的坏值**不**是错误（不能让一条坏文件拦住宠物启动）
-        let s = Settings::resolve(None, None, file(None, Some("nope")), None).unwrap();
+        let s = Settings::resolve(None, None, None, file(None, Some("nope")), no_audio(), None)
+            .unwrap();
         assert_eq!(
             (s.motion, s.motion_from),
             (Motion::DEFAULT, ValueSource::Default)
@@ -401,7 +499,9 @@ mod tests {
         let s = Settings::resolve(
             None,
             Some("off"),
+            None,
             file(Some("en"), Some("reduce")),
+            no_audio(),
             Some("fr"),
         )
         .unwrap();
@@ -411,7 +511,15 @@ mod tests {
         assert!(s.notices.is_empty(), "{:?}", s.notices);
 
         // 环境变量不参与 motion：`LANG` 是语言标签，不是动画档
-        let s = Settings::resolve(None, None, file(None, None), Some("ja_JP.UTF-8")).unwrap();
+        let s = Settings::resolve(
+            None,
+            None,
+            None,
+            file(None, None),
+            no_audio(),
+            Some("ja_JP.UTF-8"),
+        )
+        .unwrap();
         assert_eq!(
             (s.motion, s.motion_from),
             (Motion::Full, ValueSource::Default)
@@ -429,13 +537,29 @@ mod tests {
     /// `summary` 会把"来源"这一列悄悄删掉，用户就分不清生效值是从哪层来的了。
     #[test]
     fn summary_names_both_values_and_their_sources() {
-        let s = Settings::resolve(Some("en"), Some("reduce"), file(None, None), None).unwrap();
+        let s = Settings::resolve(
+            Some("en"),
+            Some("reduce"),
+            None,
+            file(None, None),
+            no_audio(),
+            None,
+        )
+        .unwrap();
         let line = s.summary();
         for needle in ["lang = en", "命令行参数", "motion = reduce", "English"] {
             assert!(line.contains(needle), "摘要缺 {needle}：{line}");
         }
         // 配置文件来源要说得出是 config.toml（用户判优先级链就看这一列）
-        let s = Settings::resolve(None, None, file(Some("ko"), Some("off")), None).unwrap();
+        let s = Settings::resolve(
+            None,
+            None,
+            None,
+            file(Some("ko"), Some("off")),
+            no_audio(),
+            None,
+        )
+        .unwrap();
         let line = s.summary();
         assert!(
             line.contains("config.toml") && line.contains("한국어"),
@@ -443,12 +567,93 @@ mod tests {
         );
         // 点行那一档说的只是"这一路的来源"，**不替文件担保**（写回可能失败，见各家
         // `App::persist_ui_key`）
-        let mut s = Settings::resolve(None, None, file(Some("ko"), None), None).unwrap();
+        let mut s =
+            Settings::resolve(None, None, None, file(Some("ko"), None), no_audio(), None).unwrap();
         s.lang_from = ValueSource::MenuClick;
         assert!(
             !s.summary().contains("不持久") && s.summary().contains("当场切换"),
             "{}",
             s.summary()
+        );
+    }
+
+    /// PAID-EDITION §3.5-d：音量走同一条优先级链。
+    #[test]
+    fn volume_resolves_through_the_same_ladder_as_motion() {
+        // CLI 最高
+        let s = Settings::resolve(
+            None,
+            None,
+            Some("50"),
+            file(None, None),
+            FileAudio {
+                volume: Some("80"),
+                muted: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!((s.volume, s.volume_from), (50, ValueSource::Cli));
+
+        // 文件层
+        let s = Settings::resolve(
+            None,
+            None,
+            None,
+            file(None, None),
+            FileAudio {
+                volume: Some("30"),
+                muted: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!((s.volume, s.volume_from), (30, ValueSource::ConfigFile));
+
+        // muted=true 等价 volume=0
+        let s = Settings::resolve(
+            None,
+            None,
+            None,
+            file(None, None),
+            FileAudio {
+                volume: None,
+                muted: Some("true"),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!((s.volume, s.volume_from), (0, ValueSource::ConfigFile));
+
+        // 缺省 = 80
+        let s = Settings::resolve(None, None, None, file(None, None), no_audio(), None).unwrap();
+        assert_eq!((s.volume, s.volume_from), (80, ValueSource::Default));
+    }
+
+    #[test]
+    fn volume_out_of_range_is_a_hard_error_from_cli_and_a_notice_from_file() {
+        let e = Settings::resolve(None, None, Some("200"), file(None, None), no_audio(), None)
+            .unwrap_err();
+        assert!(e.contains("--volume") && e.contains("200"), "{e}");
+
+        let s = Settings::resolve(
+            None,
+            None,
+            None,
+            file(None, None),
+            FileAudio {
+                volume: Some("abc"),
+                muted: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.volume, VOLUME_DEFAULT);
+        assert_eq!(s.volume_from, ValueSource::Default);
+        assert!(
+            s.notices.iter().any(|n| n.contains("abc")),
+            "{:?}",
+            s.notices
         );
     }
 }

@@ -38,6 +38,9 @@ pub enum Command {
     SystemIdle(bool),
     /// 快捷键/IPC 显式唤醒
     Wake,
+    /// 批2 §3.5-a：用户指定的叠加动画（--action-map 路由）。不改状态、不掷骰；
+    /// 睡眠中被点名则走既有 (Sleep→Idle, Wakeup) 边醒。
+    OneShot(AssetKey),
 }
 
 #[derive(Clone, Debug)]
@@ -367,6 +370,13 @@ impl BehaviorMachine {
                 if self.state == State::Sleep {
                     self.goto(State::Idle, Trigger::Wakeup, body, out);
                 }
+                true
+            }
+            Command::OneShot(key) => {
+                if self.state == State::Sleep {
+                    self.goto(State::Idle, Trigger::Wakeup, body, out);
+                }
+                self.one_shot = Some(key);
                 true
             }
         }

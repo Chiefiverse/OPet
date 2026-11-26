@@ -140,6 +140,8 @@ pub struct Options {
     pub lang: Option<String>,
     /// `--motion full|reduce|off`，同上存原始字符串
     pub motion: Option<String>,
+    /// `--volume 0..100`，存原始字符串；解释只在 `Settings::resolve` 一处。
+    pub volume: Option<String>,
     /// `--allow-unowned-accessories`：**开发态豁免** —— 磁盘上有而库存里没有的那几件，
     /// 照样进换装页、照样能穿。默认关（用户 2026-11-05 第 3 问 = 玩家不能穿未拥有）。
     ///
@@ -162,6 +164,8 @@ pub struct Options {
     /// `--ipc-path <P>`：覆盖默认的 `$XDG_RUNTIME_DIR/opet.sock`。存在的理由就是设计书那两句
     /// ——headless 传输测试与"故意起第二只验拒绝"都要一个不撞默认值的路径。
     pub ipc_path: Option<String>,
+    /// `--action-map`：触发→一次性叠加路由（批2 §3.5-a）。
+    pub action_map: overlay_common::action_map::ActionMap,
 }
 
 impl Default for Options {
@@ -180,10 +184,12 @@ impl Default for Options {
             no_cursor: false,
             lang: None,
             motion: None,
+            volume: None,
             allow_unowned_accessories: false,
             allow_unowned_pets: false,
             ipc: false,
             ipc_path: None,
+            action_map: overlay_common::action_map::ActionMap::default(),
         }
     }
 }
@@ -422,6 +428,9 @@ pub struct App {
     /// ⚠️ 它同时是"演示态一个字都不读库"的那道门：闩在 [`Self::restore_worn`] 里先放下，
     /// 条件都写在函数里，别在这里预算。
     restore_pending: bool,
+    /// PAID-EDITION §3.5-d：音频播放器。`None` = 设备不可用或资产无声效表（静默跳过）。
+    audio: Option<crate::audio::AudioPlayer>,
+    prev_sprite: Option<petcore::assets::SpriteFrame>,
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
@@ -432,7 +441,12 @@ pub fn run(opts: Options) -> Result<(), String> {
     eprintln!("ui: 配置 {}", cfg.describe());
     // CLI 那两级开关此刻真的传进来了：`--lang`/`--motion` 给错值 = 报错退出（不是静默变默认），
     // 文件/环境变量给错值 = 出声后跳过那一级的 notice（两条路的区别与理由见 `settings.rs` 模块头）。
-    let settings = settings::from_process(opts.lang.as_deref(), opts.motion.as_deref(), &cfg)?;
+    let settings = settings::from_process(
+        opts.lang.as_deref(),
+        opts.motion.as_deref(),
+        opts.volume.as_deref(),
+        &cfg,
+    )?;
     settings.announce();
 
     // 把本轮生效的语言写回 config，于是"首轮取系统语言、此后取上次退出语言"两条同时成立：
@@ -591,6 +605,13 @@ pub fn run(opts: Options) -> Result<(), String> {
             "ui: --allow-unowned-pets 没起作用也不需要 ⇒ 无 --db = 演示态，库存恒空、一律放行（本体侧不打屏上记号，见 --help）"
         );
     }
+    let manifest_parent = opts.manifest.as_ref().map(|m| {
+        std::path::Path::new(m)
+            .parent()
+            .unwrap_or(std::path::Path::new(""))
+            .to_path_buf()
+    });
+    let manifest_volume = settings.volume;
     let mut app = App {
         conn,
         registry_state: RegistryState::new(&globals),
@@ -650,7 +671,10 @@ pub fn run(opts: Options) -> Result<(), String> {
         restore_pending: true,
         last_press: None,
         pointer_world: Vec2::ZERO,
+        audio: manifest_parent.and_then(|dir| crate::audio::AudioPlayer::new(dir, manifest_volume)),
+        prev_sprite: None,
     };
+
     // §3.12：控制面的门**必须在进事件环之前过**。bind 失败（含"撞见活体监听者"那一支）=
     // 这里 `?` 提前返回 Err ⇒ 进程非零退出、surface 一个都没映射 —— 宁可不起宠物，
     // 也不起一只"给了 --ipc 而控制面不存在"的含糊档（假开关那一族）。
@@ -3351,6 +3375,9 @@ impl App {
         }
         if let Some(sim) = self.sim.as_mut() {
             sim.send(Command::DoubleTap);
+            if let Some(k) = self.opts.action_map.menu.filter(|k| self.manifest.has(*k)) {
+                sim.send(Command::OneShot(k));
+            }
         }
     }
 
@@ -3589,7 +3616,12 @@ impl App {
                     self.test_rect_frame();
                 }
             } else if let Some(sim) = self.sim.as_mut() {
-                let (_, intent) = sim.step();
+                let (transitions, intent) = sim.step();
+                if let Some(ref audio) = self.audio {
+                    let cur = intent.sprite.as_ref();
+                    audio.play_for_tick(&transitions, cur, self.prev_sprite.as_ref());
+                }
+                self.prev_sprite = intent.sprite;
                 self.present(&intent);
             }
         }
@@ -4412,6 +4444,9 @@ impl App {
             if dbl {
                 sim.send(Command::Unpin);
                 sim.send(Command::DoubleTap);
+                if let Some(k) = self.opts.action_map.dbl.filter(|k| self.manifest.has(*k)) {
+                    sim.send(Command::OneShot(k));
+                }
             } else {
                 sim.send(Command::DragStart);
             }

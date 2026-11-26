@@ -87,6 +87,7 @@
 //! （`--cell` 那一族假开关是本项目登记过的债）。
 
 pub mod app;
+pub mod audio;
 pub mod cli;
 pub mod dress;
 pub mod layout;

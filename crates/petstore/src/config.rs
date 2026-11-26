@@ -43,12 +43,18 @@
 
 use std::path::{Path, PathBuf};
 
-/// 唯一支持的段。其它段（`[render]`/`[audio]`…）**会被读出来并明说本轮不生效**。
+/// 唯一支持的段。其它段（`[render]`…）**会被读出来并明说本轮不生效**。
 pub const SECTION_UI: &str = "ui";
 /// `[ui]` 下的两个键。
 pub const KEY_LANG: &str = "lang";
 pub const KEY_MOTION: &str = "motion";
 pub const UI_KEYS: [&str; 2] = [KEY_LANG, KEY_MOTION];
+
+/// PAID-EDITION §3.5-d：音量与静音。
+pub const SECTION_AUDIO: &str = "audio";
+pub const KEY_VOLUME: &str = "volume";
+pub const KEY_MUTED: &str = "muted";
+pub const AUDIO_KEYS: [&str; 2] = [KEY_VOLUME, KEY_MUTED];
 
 /// 文件这一层的状态。**注意 `Absent` 与 `Unreadable` 不是一回事**：前者是"用户没在用这个
 /// 功能"（不许打印任何东西），后者是"用户在用而且写坏了"（必须出声）。
@@ -84,6 +90,24 @@ impl UiKeys {
         match key {
             KEY_LANG => self.lang = Some(value),
             KEY_MOTION => self.motion = Some(value),
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// `[audio]` 里本轮认识的键（原始字符串，`None` = 没写或被拒绝）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioKeys {
+    pub volume: Option<String>,
+    pub muted: Option<String>,
+}
+
+impl AudioKeys {
+    fn set(&mut self, key: &str, value: String) -> bool {
+        match key {
+            KEY_VOLUME => self.volume = Some(value),
+            KEY_MUTED => self.muted = Some(value),
             _ => return false,
         }
         true
@@ -146,6 +170,7 @@ pub struct Config {
     pub path: PathBuf,
     pub source: ConfigSource,
     pub ui: UiKeys,
+    pub audio: AudioKeys,
     /// 需要出声的条目（已含文件路径与键名/行号）。**调用方必须打印**。
     pub notices: Vec<String>,
 }
@@ -178,11 +203,12 @@ impl Config {
     fn read_at(path: PathBuf) -> Self {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let (ui, notices) = parse(&text, &path);
+                let (ui, audio, notices) = parse(&text, &path);
                 Self {
                     path,
                     source: ConfigSource::File,
                     ui,
+                    audio,
                     notices,
                 }
             }
@@ -191,6 +217,7 @@ impl Config {
                 path,
                 source: ConfigSource::Absent,
                 ui: UiKeys::default(),
+                audio: AudioKeys::default(),
                 notices: Vec::new(),
             },
             Err(e) => {
@@ -199,6 +226,7 @@ impl Config {
                     path,
                     source: ConfigSource::Unreadable,
                     ui: UiKeys::default(),
+                    audio: AudioKeys::default(),
                     notices: vec![notice],
                 }
             }
@@ -383,7 +411,7 @@ fn write_ui_key_at(path: PathBuf, key: &str, value: &str) -> Result<PathBuf, Str
     // **落盘之前**先用我们自己的 reader 判一次（`parse` = reader 的纯函数部分）。放这一步的理由：
     // 一旦 rename 过去再发现读不回来，用户的文件已经被改坏了，那句报错救不回来。
     // 抓的是 `ui = { lang = "zh" }` 这种 **TOML 合法而我们的 reader 不认**的形状。
-    let (preset, _) = parse(&bytes, &path);
+    let (preset, _, _) = parse(&bytes, &path);
     if reads_back(key, &preset).as_deref() != Some(value) {
         return Err(format!(
             "{at}: 将要写出的字节里 `{key}` 读不回 {value:?}（我们的 reader 只认 [{SECTION_UI}] 段下\
@@ -423,13 +451,14 @@ fn write_ui_key_at(path: PathBuf, key: &str, value: &str) -> Result<PathBuf, Str
     Ok(path)
 }
 
-/// 平坦语法：**注释 `#`、`[段]`、`key = "值"`**。返回认到的 `[ui]` 键 + 每一条出声的说明。
+/// 平坦语法：**注释 `#`、`[段]`、`key = "值"`**。返回认到的 `[ui]` + `[audio]` 键 + 每一条出声的说明。
 ///
 /// 刻意不做的事（每条都是因为"做了就等于承诺一个本轮没有的功能"）：多行字符串、转义、
 /// 内联数组、其它段里的键、数值/布尔的原生类型（`fps_active = 30` 这种在 `[render]` 里
 /// 只会得到"本轮不生效"一行）。
-fn parse(text: &str, path: &Path) -> (UiKeys, Vec<String>) {
+fn parse(text: &str, path: &Path) -> (UiKeys, AudioKeys, Vec<String>) {
     let mut ui = UiKeys::default();
+    let mut audio = AudioKeys::default();
     let mut notices: Vec<String> = Vec::new();
     let mut section = String::new();
     let mut seen_in_section: Vec<(String, usize)> = Vec::new();
@@ -458,9 +487,9 @@ fn parse(text: &str, path: &Path) -> (UiKeys, Vec<String>) {
                 ));
                 continue;
             }
-            if name != SECTION_UI {
+            if name != SECTION_UI && name != SECTION_AUDIO {
                 notices.push(format!(
-                    "{at}: [{name}] 段**本轮不生效**（只有 [{SECTION_UI}] 的 {UI_KEYS:?} 会被读）\
+                    "{at}: [{name}] 段**本轮不生效**（只有 [{SECTION_UI}] 的 {UI_KEYS:?} 与 [{SECTION_AUDIO}] 的 {AUDIO_KEYS:?} 会被读）\
                      ⇒ 这个段里的键一律忽略"
                 ));
             }
@@ -483,55 +512,65 @@ fn parse(text: &str, path: &Path) -> (UiKeys, Vec<String>) {
             continue;
         }
 
-        if section != SECTION_UI {
+        if section != SECTION_UI && section != SECTION_AUDIO {
             // `[render]` 这类段：段头那一条已经出过声，键不再重复吵。
             // 但写在**任何段之前**的键必须出声 —— 否则"打错段头 ⇒ 下面的键全被静默吞掉"
             // 正是这一轮要避免的那个假功能形状。
             if section.is_empty() {
                 notices.push(format!(
-                    "{at}: 第 {no} 行的 `{key}` 写在任何 [{SECTION_UI}] 段之前 ⇒ 忽略（键要放在段下）"
+                    "{at}: 第 {no} 行的 `{key}` 写在任何段头之前 ⇒ 忽略（键要放在 [{SECTION_UI}] 或 [{SECTION_AUDIO}] 段下）"
                 ));
             }
             continue;
         }
 
-        if !UI_KEYS.contains(&key.as_str()) {
+        let known_keys: &[&str] = if section == SECTION_UI {
+            &UI_KEYS
+        } else {
+            &AUDIO_KEYS
+        };
+        if !known_keys.contains(&key.as_str()) {
             notices.push(format!(
-                "{at}: [{SECTION_UI}] 不认这个键 `{key}`（本轮只有 {UI_KEYS:?}）⇒ 忽略"
+                "{at}: [{section}] 不认这个键 `{key}`（本轮只有 {known_keys:?}）⇒ 忽略"
             ));
             continue;
         }
         if let Some((_, prev)) = seen_in_section.iter().find(|(k, _)| *k == key) {
             notices.push(format!(
-                "{at}: 第 {no} 行重复了 [{SECTION_UI}] 的 `{key}`（第 {prev} 行也写了）⇒ 以后一条为准"
+                "{at}: 第 {no} 行重复了 [{section}] 的 `{key}`（第 {prev} 行也写了）⇒ 以后一条为准"
             ));
         }
         let value = match unquote(raw_value.trim()) {
             Ok(v) => v,
             Err(why) => {
                 notices.push(format!(
-                    "{at}: [{SECTION_UI}] 的 `{key}` 在第 {no} 行写法不对（{why}）⇒ 按未设置处理"
+                    "{at}: [{section}] 的 `{key}` 在第 {no} 行写法不对（{why}）⇒ 按未设置处理"
                 ));
                 continue;
             }
         };
         if value.trim().is_empty() {
             notices.push(format!(
-                "{at}: [{SECTION_UI}] 的 `{key}` 在第 {no} 行是空值 ⇒ 按未设置处理"
+                "{at}: [{section}] 的 `{key}` 在第 {no} 行是空值 ⇒ 按未设置处理"
             ));
             continue;
         }
         // 认到的键**故意不打印**（生效值与来源由 `overlay_common::ui::settings` 那一条摘要出）；
         // 这里只记行数，用来点名重复键打架的两行。
-        if !ui.set(&key, value) {
+        let accepted = if section == SECTION_UI {
+            ui.set(&key, value)
+        } else {
+            audio.set(&key, value)
+        };
+        if !accepted {
             notices.push(format!(
-                "{at}: 内部错误：`{key}` 在 `UI_KEYS` 里却没有 setter ⇒ 请报 issue"
+                "{at}: 内部错误：`{key}` 在段 `{section}` 的键表里却没有 setter ⇒ 请报 issue"
             ));
         }
         seen_in_section.push((key, no));
     }
 
-    (ui, notices)
+    (ui, audio, notices)
 }
 
 /// 只认 `"…"` 一种写法。给出错信息时把用户写的原样带回去，别只说"格式错"。
@@ -878,14 +917,15 @@ motion = \"
     }
 
     /// §1.1：`[render] fps_active` 本轮**不接**，但也不许静默忽略 —— 那是 D14 反对的假功能。
+    /// `[audio]` 段已转正（PAID-EDITION §3.5-d），不再出现在"本轮不生效"名单里。
     #[test]
     fn unsupported_sections_are_announced_and_their_keys_ignored() {
         let cfg = write_and_read(
             "\
 [render]
 fps_active = 30
-[audio]
-volume = \"80\"
+[input]
+deadzone = \"10\"
 [ui]
 lang = \"ja\"
 ",
@@ -893,7 +933,7 @@ lang = \"ja\"
         let text = lines(&cfg.notices);
         assert!(text.contains("本轮不生效"), "没说不生效就是假功能：{text}");
         assert!(
-            text.contains("render") && text.contains("audio"),
+            text.contains("render") && text.contains("input"),
             "两个段都要点名：{text}"
         );
         assert_eq!(cfg.notices.len(), 2, "一段一句，别为每个键重复吵：{text}");
@@ -903,6 +943,25 @@ lang = \"ja\"
             "不认识段不影响认识段（不能一坏俱坏）"
         );
         assert_eq!(cfg.ui.motion, None);
+    }
+
+    /// PAID-EDITION §3.5-d：`[audio]` 段已转正 = volume/muted 读得到，不出"不生效"那一句。
+    #[test]
+    fn audio_keys_are_read_and_not_announced_dead() {
+        let cfg = write_and_read(
+            "\
+[audio]
+volume = \"60\"
+muted = \"true\"
+",
+        );
+        let text = lines(&cfg.notices);
+        assert!(
+            !text.contains("本轮不生效"),
+            "[audio] 已转正，不该出现在不生效名单里：{text}"
+        );
+        assert_eq!(cfg.audio.volume.as_deref(), Some("60"));
+        assert_eq!(cfg.audio.muted.as_deref(), Some("true"));
     }
 
     /// 读不出来（这里是"路径上是个目录"）与不存在必须区分开，而且都要有各自的口径。

@@ -116,6 +116,37 @@ overlay-wayland = { path = "crates/overlay-wayland" }
 # 图集解码。**版本收在 workspace 一处**的理由与 overlay-common 的立身之本同一条：
 # 编解码器换一版 = 换一份解码字节 = 各平台屏上的像素漂移，而没有任何门禁会替你说"两边不同了"。
 image-webp = "0.2.4"
+# 本项目**第四次**真加依赖（PAID-EDITION §3.5-d 音频基建 / §5.1-3 翻向后的落地）。
+# ⚠️ **只有 overlay-win32 链它**：Linux 侧真机实测 rodio→cpal→pipewire-alsa 路径样本不流动
+# （PipeWire sink-input 在册、100% 音量、非 corked，而屏上无声；同一文件 paplay 大声）
+# ⇒ `overlay-wayland/src/audio.rs` 改走 **paplay 子进程**（失败退 pw-play），零 Rust 音频依赖；
+# Windows 侧 rodio/WASAPI 正常，保留。**不进 petcore / overlay-common**
+# （D12/D13：内核不碰设备、共用层不链平台 FFI——rodio→cpal→alsa-sys/windows 在传递图里）。
+# D8 allowlist 逐条核过（`cargo tree -e normal -p overlay-win32 --target x86_64-pc-windows-gnu`，
+# 88 个 crate，每个都 `grep '^license' Cargo.toml`）。结果：
+#   标准位（BSD/MIT/Apache-2.0/ISC）：rodio "MIT OR Apache-2.0" · cpal "Apache-2.0"
+#     alsa "Apache-2.0/MIT" · alsa-sys "MIT" · windows 0.62 "MIT OR Apache-2.0"
+#     dasp_sample "MIT OR Apache-2.0" · encoding_rs "(Apache-2.0 OR MIT) AND BSD-3-Clause"
+#     num-traits/num-bigint/num-integer/num-rational "MIT OR Apache-2.0"
+#     lazy_static/arrayvec/bitflags/autocfg/rustversion/scopeguard/walkdir "MIT"/"Apache-2.0"
+#   LGPL-3（已在册）：无新条目。
+#   **MPL-2.0（新增 allowlist 项）**：symphonia 家族六枚——
+#     symphonia · symphonia-core · symphonia-codec-vorbis · symphonia-format-ogg
+#     symphonia-metadata · symphonia-utils-xiph，全 = "MPL-2.0"（Cargo.toml 声明，
+#     目录内无 LICENSE 文件，许可证原文见 https://mozilla.org/MPL/2.0/）。
+#     ⇒ **MPL-2.0 入 allowlist 的论证**：文件级 copyleft（弱于 LGPL-3 的库级、更弱于已在册的
+#     AGPL-3 项目主体），我们不改其源 ⇒ 义务仅 §3.3"告知源码获取途径"；与专有 EULA 的 `.petpack`
+#     资产无传染（不同作品、不共享文件）；分发 `.exe` 时附一行 NOTICE（归 M8 发布面）。
+#   GPL-2-only（排除项）：**零**。
+#   GPL-3/Apache-2.0 dual：无新条目（项目主体已是 AGPL-3）。
+# 特性选择 = `default-features = false, features = ["vorbis", "playback"]`：
+#   · `playback` = 真出声（带进 cpal），不开则只有解码无输出 = 假功能。
+#   · `vorbis` = OGG/Vorbis 解码（经 symphonia），是 §5.1-3 拍板"仅本地预录 ogg"唯一需要的格式。
+#   · 不开 `mp3`/`flac`/`wav`/`aac`/`mp4`/`recording`/`noise`/`dither`/`tracing` = 最小面。
+#   · 不开 `default`（0.23 的 default = 全格式 + dither + noise，链多 13 个 crate 且含 minimp3）。
+# **钉死版本**的理由同 image-webp 那条：解码器换版 = 同一份 .ogg 的 PCM 输出可能变（重采样
+# 或 dither 实现细节），而"开机第一声"那格只有人耳判。
+rodio = { version = "0.23", default-features = false, features = ["vorbis", "playback"] }
 
 [profile.release]
 opt-level = 3

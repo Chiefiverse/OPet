@@ -4,6 +4,7 @@
 use crate::app::{self, Options};
 use crate::probe;
 use crate::settings;
+use overlay_common::action_map::ActionMap;
 
 pub const USAGE: &str = "\
 opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 同参数）
@@ -28,6 +29,8 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
                      off = 整个跳过扩散（只减提交、不增）；两档都不动 dwell 与稀有度色带，
                      也**完全不碰本体动画**（宠物该走还是走）。
                      判据②「闪烁可关」就是这一条 —— 前庭敏感是硬需求，优先于音效
+  --volume N         音效音量 0–100（整数）或 off（= 0）。生效链同 --motion：
+                     CLI > config.toml [audio] > 缺省 80。0 = 静音（设备仍可初始化、只是不出声）。
   --ipc              开控制套接字（§3.12）：NDJSON 一行一请求、方法白名单八条、每条都汇入
                      既有点位的同一条路径。**默认关**（并发对照轮要干净基线 / 零外联最小面 /
                      插件入口显式传）。撞活体 socket ⇒ 拒绝启动，不与它抢控制面。
@@ -36,6 +39,11 @@ opet overlay [--probe | --seconds N] …（独立二进制 opet-overlay-wayland 
                      缺那个变量时只能显式给这一条（鉴权全靠 socket 文件 0600，世界可写
                      目录里的固定路径会把「仅该用户」的论证换成「赌没人占」）。
                      单独给这条而没给 --ipc ⇒ 报错，不静默忽略（--db= 空值同族红线）。
+  --action-map SPEC  触发→一次性叠加动画路由（批2 §3.5-a）。逗号分隔的 key=value 对。
+                     合法触发名：`dbl`（双击臂）、`menu`（抽卡/菜单路径）。
+                     合法值：AssetKey 的 non-looping 变体名（idle / walk / run / jump / climb /
+                     react / dance …）。例：`dbl=dance,menu=dance`。
+                     缺省 = 空（两通道都不路由额外动画 ⇒ 旧行为不变）。
 
 配件（换装）：命令行**没有**开关，只有屏上那三行（换一件 / 穿上 / 脱下）。
   库里有什么由启动时扫目录得出并逐件打进 stderr。库的位置只由环境决定：
@@ -88,6 +96,7 @@ pub struct Args {
     /// 解释（大小写/子标签/优先级链）更不在这里 —— 那是 `settings` 唯一的一份口径。
     pub lang: Option<String>,
     pub motion: Option<String>,
+    pub volume: Option<String>,
     /// 开发态豁免：未拥有的配件也进换装页。`--db` 没给时不生效（演示态本来就放行）。
     pub allow_unowned_accessories: bool,
     /// 开发态豁免：未拥有的宠物也能换。**与上面那条分开**是拍板④：那条的屏上记号（帽子页的
@@ -98,6 +107,8 @@ pub struct Args {
     /// `--ipc-path`：套接字路径的显式覆盖；`None` = `$XDG_RUNTIME_DIR/opet.sock`
     /// （解析归 `crate::ipc::resolve_path`，这里只是把原始值带下去，不在 CLI 算第二遍）。
     pub ipc_path: Option<String>,
+    /// `--action-map`：触发→一次性叠加动画的路由（批2 §3.5-a）。
+    pub action_map: Option<String>,
 }
 
 impl Args {
@@ -107,7 +118,11 @@ impl Args {
         // 这一族最早是 `--seconds -5` 与 `--db=` 那两条立下的规矩：宁可退出，也不留一个
         // "看起来开了档但其实没用上"的会话。
         // 合法值表只有 `settings` 一份（CLI 不抄第二份，否则加第五种语言时这里必然滞后）。
-        settings::validate_cli(self.lang.as_deref(), self.motion.as_deref())?;
+        settings::validate_cli(
+            self.lang.as_deref(),
+            self.motion.as_deref(),
+            self.volume.as_deref(),
+        )?;
         if !self.test_rect && self.manifest.is_none() {
             return Err(
                 "没给 --manifest 就没有像素可画。要么给清单，要么用 --test-rect 只验 surface。\n\
@@ -160,6 +175,12 @@ impl Args {
                 "给了 --ipc-path 而没给 --ipc ⇒ 套接字不会开；要控制面就两条一起给".to_string(),
             );
         }
+        let am = match self.action_map.as_deref() {
+            Some(s) => {
+                overlay_common::action_map::parse(s).map_err(|e| format!("--action-map: {e}"))?
+            }
+            None => ActionMap::default(),
+        };
         // 配件不再从这里进来（`--accessory` 已删，用户 2026-11-02 原话"配件不是应该由菜单选择吗，
         // 这也不合理"）。⇒ 这一层没有任何配件相关的分支可写：**库里少一件、坏一件都不会让进程
         // 在这里拒绝启动**，那是 `app::discover_accessories` 的 stderr。留下的唯一形状是
@@ -180,10 +201,12 @@ impl Args {
             no_cursor: self.no_cursor,
             lang: self.lang.clone(),
             motion: self.motion.clone(),
+            volume: self.volume.clone(),
             allow_unowned_accessories: self.allow_unowned_accessories,
             allow_unowned_pets: self.allow_unowned_pets,
             ipc: self.ipc,
             ipc_path: self.ipc_path.clone(),
+            action_map: am,
         })
     }
 }
@@ -232,6 +255,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--db" => a.db = Some(next_val(&mut i)?),
             "--lang" => a.lang = Some(next_val(&mut i)?),
             "--motion" => a.motion = Some(next_val(&mut i)?),
+            "--volume" => a.volume = Some(next_val(&mut i)?),
             "--probe" => a.probe = true,
             "--test-rect" => a.test_rect = true,
             "--no-cursor" => a.no_cursor = true,
@@ -239,6 +263,7 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--allow-unowned-pets" => a.allow_unowned_pets = true,
             "--ipc" => a.ipc = true,
             "--ipc-path" => a.ipc_path = Some(next_val(&mut i)?),
+            "--action-map" => a.action_map = Some(next_val(&mut i)?),
             other => return Err(format!("未知参数: {other}")),
         }
         i += 1;
@@ -271,7 +296,7 @@ pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
         // 探测本身不吃语言/动画档，但**不能因此放过打错的值**：`--probe --lang=jap` 静默成功
         // 就等于告诉用户"这个码是对的"，而他下次真起 overlay 时看到的仍是默认档。
         // `options()` 在探测路径上会因"没给 manifest"先炸，所以这里单独预检一次。
-        settings::validate_cli(parsed.lang.as_deref(), parsed.motion.as_deref())?;
+        settings::validate_cli(parsed.lang.as_deref(), parsed.motion.as_deref(), None)?;
         let report = probe::probe();
         print!("{}", probe::format_report(&report));
         return Ok(Outcome::Probed(probe_ok(&report)));
@@ -282,6 +307,7 @@ pub fn dispatch(args: &[String]) -> Result<Outcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use petcore::behavior::AssetKey;
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -668,5 +694,28 @@ mod tests {
             dispatch(&v(&["--probe", "--lang=en", "--motion=reduce"])),
             Ok(Outcome::Probed(_))
         ));
+    }
+
+    #[test]
+    fn the_action_map_reaches_the_options_verbatim() {
+        let opts = parse(&v(&["--test-rect", "--action-map", "dbl=dance,menu=react"]))
+            .unwrap()
+            .options()
+            .unwrap();
+        assert_eq!(opts.action_map.dbl, Some(AssetKey::Dance));
+        assert_eq!(opts.action_map.menu, Some(AssetKey::React));
+        // 不给 ⇒ 空
+        let none = parse(&v(&["--test-rect"])).unwrap().options().unwrap();
+        assert_eq!(none.action_map, ActionMap::default());
+    }
+
+    #[test]
+    fn bad_action_map_is_an_error_and_never_a_silent_default() {
+        for bad in ["bogus=dance", "dbl=walk", "dbl=dance2", ""] {
+            let res = parse(&v(&["--test-rect", "--action-map", bad]))
+                .unwrap()
+                .options();
+            assert!(res.is_err(), "\"{bad}\" should be rejected");
+        }
     }
 }

@@ -30,8 +30,8 @@
 use petstore::config::Config;
 
 pub use overlay_common::settings::{
-    FileUi, Motion, Settings, ValueSource, lang_codes, motion_codes, unknown_lang, unknown_motion,
-    validate_cli,
+    FileAudio, FileUi, Motion, Settings, VOLUME_DEFAULT, ValueSource, lang_codes, motion_codes,
+    unknown_lang, unknown_motion, unknown_volume, validate_cli,
 };
 
 /// 从真实进程环境取 `LC_ALL` → `LANG` + 从已读好的配置里取 `[ui]` 那两行，再走共用层的
@@ -42,11 +42,19 @@ pub use overlay_common::settings::{
 pub fn from_process(
     cli_lang: Option<&str>,
     cli_motion: Option<&str>,
+    cli_volume: Option<&str>,
     cfg: &Config,
 ) -> Result<Settings, String> {
     let grab = |k| std::env::var(k).ok().filter(|v| !v.is_empty());
     let env_lang = grab("LC_ALL").or_else(|| grab("LANG"));
-    Settings::resolve(cli_lang, cli_motion, file_ui(cfg), env_lang.as_deref())
+    Settings::resolve(
+        cli_lang,
+        cli_motion,
+        cli_volume,
+        file_ui(cfg),
+        file_audio(cfg),
+        env_lang.as_deref(),
+    )
 }
 
 /// 把配置里那一层搬进链的入口（就是 [`from_process`] 里那一句搬运）。测例单独用它是因为
@@ -56,6 +64,13 @@ fn file_ui(cfg: &Config) -> FileUi<'_> {
     FileUi {
         lang: cfg.ui.lang.as_deref(),
         motion: cfg.ui.motion.as_deref(),
+    }
+}
+
+fn file_audio(cfg: &Config) -> FileAudio<'_> {
+    FileAudio {
+        volume: cfg.audio.volume.as_deref(),
+        muted: cfg.audio.muted.as_deref(),
     }
 }
 
@@ -101,7 +116,15 @@ mod tests {
                 read_back().path,
                 "{lang:?} 的落点不是 Windows reader 看的那个文件"
             );
-            let s = Settings::resolve(None, None, file_ui(&read_back()), None).unwrap();
+            let s = Settings::resolve(
+                None,
+                None,
+                None,
+                file_ui(&read_back()),
+                FileAudio::default(),
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 (s.lang, s.lang_from),
                 (lang, ValueSource::ConfigFile),
@@ -117,7 +140,15 @@ mod tests {
                 motion.code(),
             )
             .unwrap_or_else(|e| panic!("写动画码 {:?} 该成功：{e}", motion.code()));
-            let s = Settings::resolve(None, None, file_ui(&read_back()), None).unwrap();
+            let s = Settings::resolve(
+                None,
+                None,
+                None,
+                file_ui(&read_back()),
+                FileAudio::default(),
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 (s.motion, s.motion_from),
                 (motion, ValueSource::ConfigFile),
@@ -191,10 +222,12 @@ mod tests {
         let bad = Settings::resolve(
             None,
             None,
+            None,
             FileUi {
                 lang: Some("klingon"),
                 motion: None,
             },
+            FileAudio::default(),
             None,
         )
         .expect("文件层坏值不该让链失败");

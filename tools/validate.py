@@ -305,6 +305,42 @@ def main():
     else:
         rep.add("polygon.json 存在", "缺失", "必须存在", False)
 
+    # 15. sounds.json 引用检查（有则验，无 = 静默通过）。
+    sounds_path = os.path.join(d, "sounds.json")
+    if os.path.exists(sounds_path):
+        sounds = load_json(sounds_path)
+        refs = list(sounds.get("transitions", {}).values())
+        for entries in sounds.get("beats", {}).values():
+            refs.extend(e["sound"] for e in entries)
+        missing_sounds = [r for r in refs if not os.path.exists(os.path.join(d, r))]
+        bad_ext = [r for r in refs if not r.endswith(".ogg")]
+        oversize = [r for r in refs if os.path.exists(os.path.join(d, r)) and os.path.getsize(os.path.join(d, r)) > 2 * 1048576]
+        total_sound = sum(os.path.getsize(os.path.join(d, r)) for r in refs if os.path.exists(os.path.join(d, r)))
+        rep.add(
+            "sounds.json 引用文件存在",
+            "%d 条引用 / %d 缺" % (len(refs), len(missing_sounds)),
+            "0 缺",
+            not missing_sounds,
+            "; ".join(missing_sounds[:3]),
+        )
+        rep.add(
+            "sounds.json 扩展名 .ogg",
+            "%d 条非 .ogg" % len(bad_ext),
+            "0 条",
+            not bad_ext,
+            "; ".join(bad_ext[:3]),
+        )
+        rep.add(
+            "单文件 < 2 MB / 目录 < 16 MB",
+            "最大 %.1f MB / 合计 %.1f MB" % (
+                max((os.path.getsize(os.path.join(d, r)) / 1048576 for r in refs if os.path.exists(os.path.join(d, r))), default=0),
+                total_sound / 1048576,
+            ),
+            "单 <2 MB, 总 <16 MB",
+            not oversize and total_sound <= 16 * 1048576,
+            "; ".join(oversize[:3]),
+        )
+
     # 体积与内存。4 MiB 那道闸的归属 = **逐文件**（分段存放时并集没有意义：装载方是一张一张
     # 读进来的，而 §3.5 那条预算说的就是"一个文件不许把内存吃穿"）。
     sizes = [(f, os.path.getsize(p)) for (f, _, _), p in zip(segs, paths)]

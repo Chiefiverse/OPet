@@ -501,6 +501,7 @@ def main():
     ap = argparse.ArgumentParser(description="OPet 图集打包")
     ap.add_argument("--pet", default="", help="本体宠物 slug（不带 --accessory 那一档）")
     ap.add_argument("--frames", default="", help="帧目录（默认 <产物目录>/frames）")
+    ap.add_argument("--sounds-dir", default="", help="音效 .ogg 目录（默认 = 帧目录）；有 .ogg 则产 sounds.json")
     ap.add_argument("--out", default="", help="产物目录")
     ap.add_argument("--accessory", default="", help="配件 slug；给了它就走配件那一档")
     ap.add_argument("--slot", default="", help="配件挂点，六值之一: " + " / ".join(ACCESSORY_SLOTS))
@@ -751,6 +752,29 @@ def main():
         fh.write("\n")
     with open(os.path.join(out_dir, "polygon.json"), "w", encoding="utf-8") as fh:
         json.dump(poly, fh, ensure_ascii=False)
+
+    # sounds.json: 若音效目录有 .ogg 文件则产出（无 = 不产出，向后兼容）。
+    sounds_dir = args.sounds_dir or frames_dir
+    if sounds_dir and os.path.isdir(sounds_dir):
+        oggs = sorted(f for f in os.listdir(sounds_dir) if f.endswith(".ogg"))
+        if oggs:
+            transitions = {}
+            for ogg in oggs:
+                stem = ogg[:-4]
+                key = stem[0].upper() + stem[1:] if stem else stem
+                transitions[key] = ogg
+            sounds = {"transitions": transitions, "beats": {}}
+            sounds_out = os.path.join(out_dir, "sounds.json")
+            for o in oggs:
+                src = os.path.join(sounds_dir, o)
+                dst = os.path.join(out_dir, o)
+                if src != dst:
+                    import shutil
+                    shutil.copy2(src, dst)
+            with open(sounds_out, "w", encoding="utf-8") as fh:
+                json.dump(sounds, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            print("PACK sounds.json: %d 条 → %s" % (len(oggs), out_dir))
 
     # 逐张报字节数：4 MiB 那道闸的归属是**文件**，不是并集（同 tools/validate.py 的口径）。
     sizes = [(f, os.path.getsize(os.path.join(out_dir, f))) for f, _, _ in segs]
